@@ -121,6 +121,9 @@ class Engine:
         self.chains = []
         self.errors = []
         self._cur_chain = ''
+        # 收到过多少次 TaskChainStart。start() 用它判断「AsstStart 返回 false
+        # 之后新任务到底有没有被接上」（见 start 的注释）。
+        self._chain_starts = 0
         self.connected = False
 
     # ---------------------------------------------------------- 绑定
@@ -237,6 +240,7 @@ class Engine:
             return None
         if msg == MSG_TASK_START:
             self._cur_chain = chain
+            self._chain_starts += 1
             return {'t': t, 'kind': 'chain_start', 'chain': chain,
                     'text': '开始：%s' % _chain_cn(chain)}
         if msg == MSG_TASK_COMPLETED:
@@ -256,15 +260,33 @@ class Engine:
                                 'why': why})
             self.errors.append('%s%s' % (_chain_cn(chain),
                                          '：%s' % why if why else ''))
+            # why 要带上：run_core 靠它说出「哪一关翻车、为什么」
+            # （2026-11-19 用户要求：作业翻车时日志要看得出是哪关）
             return {'t': t, 'kind': 'chain_failed', 'chain': chain,
-                    'text': '失败：%s' % _chain_cn(chain)}
+                    'why': why, 'text': '失败：%s' % _chain_cn(chain)}
         if msg == MSG_SUBTASK_START:
-            return {'t': t, 'kind': 'node', 'chain': chain, 'sub': sub}
+            # ``subtask`` 是插件类名（ProcessTask / BattleProcessTask），不是
+            # 用户看得懂的阶段；真正的 pipeline 名在 ``first[0]``，形如
+            # ``Copilot@WaitUntilEndOfAction`` / ``OperProgress@EliteUp``
+            first = data.get('first') or []
+            node = ''
+            if isinstance(first, list) and first:
+                node = str(first[0] or '')
+            if not node:
+                node = str((data.get('details') or {}).get('task') or sub or '')
+            if node and '@' not in node and chain:
+                node = '%s@%s' % (chain, node)
+            return {'t': t, 'kind': 'node', 'chain': chain, 'sub': node}
         if msg == MSG_SUBTASK_EXTRA:
-            # 掉落 / 关卡识别 / 抄作业换关 / 理智，这几类对用户有意义
+            # 掉落 / 关卡识别 / 抄作业换关 / 理智 / 战斗动作 / 培养结果，
+            # 这几类对「现在在干什么」有意义。2026-11-18 补 CopilotAction 与
+            # 培养两条：以前只有换作业和掉落，一场战斗 3 分钟日志里一个字
+            # 都没有，用户报「自动战斗没有日志」。
             if what in ('StageDrops', 'CopilotListLoadTaskFileSuccess',
                         'BattleFormation', 'StageInfo',
-                        'SanityBeforeStage', 'FightTimes'):
+                        'SanityBeforeStage', 'FightTimes', 'CopilotAction',
+                        'ExceededLimit', 'OperProgressDetail',
+                        'OperProgressSummary'):
                 return {'t': t, 'kind': 'extra', 'what': what,
                         'data': data.get('details') or {}}
             return None
@@ -311,9 +333,45 @@ class Engine:
                               % (task_type, json.dumps(params or {}, ensure_ascii=False)[:200]))
         return tid
 
-    def start(self):
+    def start(self, settle=15.0):
+        """开始跑队列；返回 False 表示 MaaCore 真的没接
+
+        ``AsstStart`` 返回 false 有两种完全不同的处境，以前混在一起判，
+        结果「任务明明跑起来了，日志却报 AsstStart 返回失败」
+        （2026-11-19 用户实测，三次培养全中）：
+
+        a) **上一批还在收尾**：``AllTasksCompleted`` 是在工作线程退出前发的，
+           这时 ``AsstRunning`` 还是 true，MaaCore 打一行 ``Start | block``
+           就把 ``AsstStart`` 挡了。可它自己还活着、会继续消费队列 ——
+           我们刚 append 的那条照样在几十毫秒后开跑。asst.log 实证：
+           ``00:25:09.674 Start | block`` → ``00:25:09.776 TaskChainStart``。
+           判据：**新任务链开始了**（``self._chain_starts`` 增加）。
+        b) **真的没接**：工作线程已经退干净（``running`` 变 false），队列里那
+           一条没人取。这时才需要重试一次 ``AsstStart``。
+
+        以前只处理 b)：等 running 变 false 再重试。碰上 a) 时 running 一直
+        true（任务正在跑），等满 ``settle`` 秒后当失败抛错——用户看到的
+        「X RuntimeError: AsstStart 返回失败」就是这么来的，任务其实在跑。
+        """
         if not self._handle:
             raise EngineError('还没 open()')
+        self._done.clear()
+        if self._lib.AsstStart(self._handle):
+            return True
+        mark = self._chain_starts
+        deadline = time.time() + max(0.0, settle)
+        while time.time() < deadline:
+            if self._chain_starts > mark:
+                return True                 # a)：新任务链已经开跑
+            if not self.running():
+                break                       # b)：退干净了，重试
+            time.sleep(0.1)
+        if self._chain_starts > mark:
+            return True
+        if self.running():
+            # 还在跑但没看到新链：交给 _wait_run 的心跳/重排兜底，
+            # 不在这里判死（误判一次就是一整轮白跑）
+            return True
         self._done.clear()
         return bool(self._lib.AsstStart(self._handle))
 
@@ -374,13 +432,31 @@ class Engine:
             return False
 
     def wait(self, timeout=None, poll=1.0):
-        """等全部任务结束。返回 True=跑完，False=超时/被停"""
+        """等全部任务结束。返回 True=跑完，False=超时/被停
+
+        「running 变 False」只有在**见过 running=True** 之后才算停：AsstStart
+        是异步生效的，刚 start 完的头几百毫秒 AsstRunning 还是 False——以前
+        在这里直接 ``return self._done.is_set()``，把「还没开始跑」当成
+        「已经跑完」，``_wait_run`` 两层立刻返回，run_core 就收尾 close，把刚
+        排进队列的任务当场杀掉（2026-11-18 用户实测：培养干员 append 完
+        start 后同一毫秒 Assistant 就被析构，任务报错但 OperProgress 一步
+        都没跑）。没见到 running 的宽限给 15 秒，超过还没跑起来才认输。
+        """
         deadline = time.time() + timeout if timeout else None
+        seen_running = False
+        quiet_since = None
         while True:
             if self._done.is_set():
                 return True
-            if not self.running():
-                # 已经在跑但程序说停了：可能是 stop() 或异常退出
+            if self.running():
+                seen_running = True
+                quiet_since = None
+            elif seen_running:
+                # 跑过之后程序说停了：stop() 或异常退出
+                return self._done.is_set()
+            elif quiet_since is None:
+                quiet_since = time.time()
+            elif time.time() - quiet_since > 15:
                 return self._done.is_set()
             if deadline and time.time() > deadline:
                 return False
@@ -432,6 +508,7 @@ _CHAIN_CN = {
     'Custom': '小工具',
     'Depot': '仓库识别',
     'OperBox': '干员识别',
+    'OperProgress': '干员培养',
     'CloseDown': '关闭游戏',
 }
 

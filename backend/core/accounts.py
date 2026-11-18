@@ -32,6 +32,11 @@ def _load(path):
         return None
 
 
+def _dict(v):
+    """取子段：不是 dict（字符串/数组/null）一律当空对象，别让 `or {}` 骗过去"""
+    return v if isinstance(v, dict) else {}
+
+
 def list_accounts():
     out = []
     d = _accounts_dir()
@@ -43,9 +48,16 @@ def list_accounts():
         if name in updater.NON_ACCOUNT_JSON:      # 同层的全局文件，不是账号
             continue
         snap = _load(os.path.join(d, name))
-        if not snap or not (snap.get('account') or {}).get('uid'):
+        # account 段必须真的是对象：config/ 下还有我们自己的全局文件
+        # （train-plan.json 的 account 是**文件名字符串**），`or {}` 挡不住
+        # 字符串，.get 直接把整个账号列表炸掉——所有 skill 一起挂
+        # （2026-11-19 01:24 用户实测：培养暂停落盘 train-plan.json 之后，
+        # 连「开始唤醒」「自动战斗」都报 'str' object has no attribute 'get'）
+        a = snap.get('account') if snap else None
+        if not isinstance(a, dict) or not a.get('uid'):
             continue
-        a, s = snap.get('account') or {}, snap.get('stats') or {}
+        s = snap.get('stats')
+        s = s if isinstance(s, dict) else {}
         out.append({
             'file': name,
             'uid': str(a.get('uid')),
@@ -57,15 +69,15 @@ def list_accounts():
             'serverId': a.get('serverId') or '',   # 终末地签到要 gameId_roleId_serverId 三件套
             'level': a.get('level'),
             # 有没有可用的森空岛 token：抽卡统计/签到都要它，MAA 导入的账号没有
-            'hasToken': bool((snap.get('skd') or {}).get('data')),
+            'hasToken': bool(_dict(snap.get('skd')).get('data')),
             'secretary': a.get('secretary') or {},
-            'maaProfile': (snap.get('maa') or {}).get('profile') or '',
+            'maaProfile': _dict(snap.get('maa')).get('profile') or '',
             # MAA 切号名：官服是手机号掩码（181****5505），B 服是游戏内用户名。
             # 存下来就不用每次挂机都问一遍——这是唯一必须问用户的字段，
             # 猜错的表现是切号死循环（MAA 找不到账号名，重试到超时）。
-            'maaAccountName': (snap.get('maa') or {}).get('accountName') or '',
-            'maaDir': (snap.get('maa') or {}).get('dir') or '',
-            'syncedAt': (snap.get('sync') or {}).get('syncedAt'),
+            'maaAccountName': _dict(snap.get('maa')).get('accountName') or '',
+            'maaDir': _dict(snap.get('maa')).get('dir') or '',
+            'syncedAt': _dict(snap.get('sync')).get('syncedAt'),
             # 关卡进度摘要（主线还差几关、活动几个区、剿灭几张没满）；
             # 明细在 account_detail 里，列表页只放这几个数字
             'progress': progress.summary(snap.get('progress')),
@@ -336,6 +348,50 @@ def token_for(file: str) -> str:
         return vault.unprotect(base64.b64decode(skd.get('data'))).decode('utf-8')
     except Exception:
         return ''
+
+
+def token_state(file: str) -> dict:
+    """设置页「账号管理」用：这个账号的 token 到底有没有、能不能解
+
+    与 :func:`token_for` 的区别是**分得清三种状态**：没存过 / 存了但解不开
+    （换电脑、换 Windows 用户）/ 解开了。界面要按这三种给不同的话术，
+    「没 token」和「token 坏了」混成一句会让人以为重新登录一遍就行——
+    前者要粘 token，后者才是重新登录。
+    """
+    try:
+        snap = get_account(file)
+    except Exception as e:
+        return {'has': False, 'token': '', 'broken': False, 'error': str(e)}
+    skd = snap.get('skd') or {}
+    if not isinstance(skd, dict) or not skd.get('data'):
+        return {'has': False, 'token': '', 'broken': False, 'error': ''}
+    try:
+        token = vault.unprotect(base64.b64decode(skd.get('data'))).decode('utf-8')
+    except Exception:
+        return {'has': True, 'token': '', 'broken': True,
+                'error': '本机解不开这份密文（换电脑 / 换 Windows 用户后会这样），重新粘贴一次 token 即可'}
+    return {'has': True, 'token': token, 'broken': False, 'error': ''}
+
+
+def set_token(file: str, token: str) -> dict:
+    """把新的森空岛 token 加密写进账号文件（token 失效后重新粘贴用）
+
+    只动 ``skd`` 段，练度 / 进度 / MAA 绑定一律原样保留——用户是来换凭证的，
+    不是来重新同步账号的。调用方负责先验 token 与 uid 是否对得上。
+    """
+    token = (token or '').strip()
+    if not token:
+        raise ValueError('token 不能为空')
+    data = base64.b64encode(vault.protect(token.encode('utf-8'))).decode('ascii')
+    meta = {'alias': '', 'addedAt': updater.now_iso(), 'data': data}
+
+    def mut(snap):
+        old = snap.get('skd') if isinstance(snap.get('skd'), dict) else {}
+        meta['alias'] = old.get('alias') or ''
+        snap['skd'] = dict(meta)
+
+    update(file, mut)
+    return meta
 
 
 # 启动自检把读不开的条目原因存这里，main 起来后写进 app.log

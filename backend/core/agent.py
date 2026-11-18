@@ -91,12 +91,54 @@ class LLMError(RuntimeError):
     pass
 
 
+def _sanitize(messages):
+    """让每条 tool 消息都能对上前面的 assistant.tool_calls，坏掉的丢掉
+
+    用户 2026-11-19 02:59 连着三次「还是失败了」都是同一个 400：
+    ``Messages with role 'tool' must be a response to a preceding message
+    with 'tool_calls'``。原因是历史里出现了两种断链：
+
+    - ``_trim`` 按条数裁剪，切点正好落在「assistant.tool_calls」和它的 tool
+      结果中间，历史开头变成一条孤儿 tool；
+    - 工具要用户确认时助手先回了 tool_calls，用户点「取消」/直接说下一句，
+      那条 tool_call 永远没有响应。
+
+    断一次就**每轮都断**（坏历史一直留在 s.messages 里），所以「老是存在
+    这种报错」。发送前统一修一遍：孤儿 tool 丢弃，缺响应的 tool_call 补一句
+    占位，保证序列永远合法。
+    """
+    out, pending = [], []
+    for m in messages or []:
+        role = m.get('role')
+        if role == 'tool':
+            cid = m.get('tool_call_id') or ''
+            if cid in pending:
+                pending.remove(cid)
+                out.append(m)
+            continue                        # 对不上的孤儿 tool 直接丢
+        if pending:
+            for cid in pending:
+                out.append({'role': 'tool', 'tool_call_id': cid,
+                            'content': '（这一步没有执行完）'})
+            pending = []
+        out.append(m)
+        if role == 'assistant':
+            for tc in (m.get('tool_calls') or []):
+                cid = tc.get('id') or ''
+                if cid:
+                    pending.append(cid)
+    for cid in pending:
+        out.append({'role': 'tool', 'tool_call_id': cid,
+                    'content': '（这一步没有执行完）'})
+    return out
+
+
 def _payload(messages, tools=None, stream=True):
     st = settings.load().get('agent') or {}
     model = st.get('model') or ''
     if not model:
         raise LLMError('还没设置模型名（设置 → 内置助手）')
-    body = {'model': model, 'messages': messages, 'temperature': 0.2,
+    body = {'model': model, 'messages': _sanitize(messages), 'temperature': 0.2,
             'stream': stream}
     # 不给 max_tokens 时用中转站默认值（常见 512/1024）：回复长一点就被
     # 硬截断在句中，前端看着像「话没说完」（2026-11-17 用户反馈）。
@@ -145,6 +187,11 @@ def _explain_http(e, text):
             404: 'Base URL 或模型名不对（找不到这个接口/模型）',
             429: '触发了限流或余额不足', 400: '请求被拒绝（模型名可能写错，'
                                           '或该模型不支持工具调用）'}
+    low = (text or '').lower()
+    if code == 400 and 'tool' in low and 'role' in low:
+        # 专属解释：不是模型不支持工具调用，是历史里的工具调用记录断链了
+        # （发送前已由 _sanitize 修好），再说一次就能继续
+        return '上下文里的工具调用记录断了（这条已自动修复），把刚才那句再说一遍就行'
     msg = head.get(code) or ('HTTP %s' % code if code else '连不上服务')
     snippet = (text or '').strip().replace('\n', ' ')[:200]
     return '%s%s' % (msg, ('：' + snippet) if snippet else '')
@@ -333,10 +380,12 @@ TOOLS = [
            'accountName': {'type': 'string',
                            'description': '切号名；不给就唤醒当前账号'}}),
     _tool('skill_navigate',
-          '把游戏导航到指定活动（老活动走曲谱，当期活动走区域列表；EX / S / MO 关会自动切到活动地图里的对应分区）。'
+          '把游戏导航到指定活动（老活动走曲谱，当期活动走终端页的活动提示条；'
+          'EX / S / MO 关会自动切到活动地图里的对应分区）。'
           'stage 可以传**中文活动名（推荐，如「孤星」「愚人号」）**、关卡号'
-          '（MN-1 / TL-5 / XX-EX-1）或活动 id（act25side），内部会自己换成真实'
-          '关卡代号。**别自己凭记忆把中文名换算成代号**（孤星是 CW，不是 SV）。'
+          '（MN-1 / TL-5 / XX-EX-1）、活动 id（act25side），也可以直接传'
+          '「最新活动 / 当期活动」。内部会自己换成真实关卡代号。'
+          '**别自己凭记忆把中文名换算成代号**（孤星是 CW，不是 SV）。'
           '返回 taskId。',
           {'stage': _STAGE,
            'activity': {'type': 'string',
@@ -357,8 +406,18 @@ TOOLS = [
           '**默认不唤醒不导航**——界面在哪就从哪直接开打；'
           '用户还在主界面 / 游戏没开时要先 skill_navigate 或 skill_wakeup，'
           '或传 wakeup=true 走全套。**调用前先跟用户确认要打哪些关**。'
+          '**每关只打要打的那一档**：EX 关默认只打突袭；普通还没通关、要一次'
+          '打通就写 stages=["SV-EX-1@both"]；只刷材料写 @normal 或 raid="normal"。'
+          '**用户点名某份作业（「用 41624」「换成令的单核」）时必须用 ops 传 '
+          'copilotId**，光说"已经换了"没用——不传 ops 就会重新搜索挑回同一份。'
+          '每关会自动准备 2~3 份备选作业：某一关打不过就换下一份重挂这一关，'
+          '已经成功的关不会重打，日志逐关写「✔ 成功 / ✘ 翻车」。'
           '返回 taskId。',
-          {'stages': {'type': 'array', 'items': {'type': 'string'}},
+          {'stages': {'type': 'array', 'items': {'type': 'string'},
+                      'description': '关卡代号，可加 @ 后缀逐关指定难度：'
+                                     '"SV-EX-1@raid" 只打突袭（默认）、'
+                                     '"SV-EX-1@both" 普通+突袭、'
+                                     '"SV-EX-1@normal" 只打普通。不带后缀走 raid 参数'},
            'mode': {'type': 'string', 'enum': ['copy', 'fight']},
            'wakeup': {'type': 'boolean',
                       'description': 'true=连唤醒+导航一起跑（默认 false 直跑）'},
@@ -366,6 +425,26 @@ TOOLS = [
                           'description': 'true=基础关的前置也一起补。默认只自动补 '
                                          'EX/S/MO 的前置；mode=fight 纯刷关默认一关'
                                          '都不补（刷材料时补上就是白烧理智）'},
+           'raid': {'type': 'string', 'enum': ['auto', 'both', 'normal'],
+                    'description': '没写 @ 后缀的关怎么打：auto（默认）=有突袭'
+                                   '作业就只打突袭；both=普通+突袭都打（普通还没'
+                                   '通关时用）；normal=只打普通（刷材料）。主线'
+                                   '磨难/险地不是突袭，不受这个参数影响'},
+           'ops': {'type': 'array',
+                   'description': '指定用哪一份作业（用户点名「用 41624 那份」'
+                                  '「换成令的单核」时**必须**传，否则每次都重新'
+                                  '搜索、挑回评分最高的同一份，用户会看到「换了'
+                                  '作业没生效」）。copilotId 从 find_ops 拿',
+                   'items': {'type': 'object',
+                             'properties': {
+                                 'stage': {'type': 'string',
+                                           'description': '关卡代号'},
+                                 'copilotId': {'type': 'integer',
+                                               'description': '作业 id'},
+                                 'raid': {'type': 'string',
+                                          'enum': ['raid', 'normal', 'both'],
+                                          'description': '这关打哪档，默认 raid'}},
+                             'required': ['stage', 'copilotId']}},
            'account': _ACC}, ['stages']),
     _tool('skill_weekly',
           '**周目编排（一站式）**：把一个活动从头打到尾——ST 剧情关自动过、'
@@ -378,6 +457,69 @@ TOOLS = [
     _tool('skill_signin',
           '森空岛签到（账号给了只签这个号，不给签全部）。返回 taskId。',
           {'account': _ACC}),
+    _tool('skill_train',
+          '培养干员（MAA 的「干员培养」）：升精英化 / 技能基础等级 / 专精，'
+          '可以一次排多个干员。operators 每项写 {name, elite, skillLevel, mastery}：'
+          'elite 填 1/2（升到精一 / 精二），skillLevel 填 2~7，mastery 是**绝对专精'
+          '等级**的 3 元数组（[0,3,0] = 技能2 专三；技能2 已经是专三就不用写）。'
+          '**动手前先跟用户确认名单和每个干员的练度目标**。默认先「开始唤醒」；'
+          'switchAccount=true 才切号（用户说不用切号就传 false）。'
+          '材料不足会暂停并报缺什么，之后用 resume=true 接着做。返回 taskId。',
+          {'operators': {
+              'type': 'array',
+              'description': '要培养的干员列表，按顺序做',
+              'items': {
+                  'type': 'object',
+                  'properties': {
+                      'name': {'type': 'string', 'description': '干员名（中文名）'},
+                      'elite': {'type': 'integer',
+                                'description': '目标精英化 1 或 2；不升就不写'},
+                      'skillLevel': {'type': 'integer',
+                                     'description': '目标技能基础等级 2~7；不升就不写'},
+                      'mastery': {'type': 'array', 'items': {'type': 'integer'},
+                                  'description': '[技能1,技能2,技能3] 的专精等级 0~3，'
+                                                 '如 [0,3,0] = 二技能专三'},
+                  },
+                  'required': ['name'],
+              }},
+           'operator': {'type': 'string', 'description': '只培养一个干员时的简写'},
+           'elite': {'type': 'integer', 'description': '简写模式的目标精英化（1/2）'},
+           'skillLevel': {'type': 'integer', 'description': '简写模式的目标技能等级（2~7）'},
+           'mastery': {'type': 'array', 'items': {'type': 'integer'},
+                       'description': '简写模式的专精目标，如 [0,3,0]'},
+           'account': _ACC,
+           'accountName': {'type': 'string',
+                           'description': '切号名（官服=手机号后 4 位）。'
+                                          '账号已绑定尾号（list_accounts 的 '
+                                          'accountName 非空）时不用传，程序会自己用'},
+           'switchAccount': {'type': 'boolean',
+                             'description': 'false=只唤醒、不切号（用户说不用换号时传）'},
+           'wakeup': {'type': 'boolean',
+                      'description': 'false=不唤醒，直接从当前界面开始（游戏得开着）'},
+           'resume': {'type': 'boolean',
+                      'description': 'true=接着上次没做完的培养计划'}},
+          ['operators']),
+    _tool('skill_sweep',
+          '**一键扫图**：把一个活动按「普通关 → EX 普通 → EX 突袭 → S 关」'
+          '逐段挂完。段与段之间会自己重新导航（EX / S 是活动地图里不同的分区，'
+          '不导航 MAA 认不出关卡名）。每关打不过会自动换一份作业重挂这一关，'
+          '已经成功的关不会重打，日志里逐关播报「✔ 战斗成功 / ✘ 翻车」。'
+          '用户说「把这个活动从头打到尾」「EX 和 S 都帮我清了」时用它。'
+          '**调用前先跟用户确认：哪个活动、哪个号、要不要打突袭**。返回 taskId。',
+          {'stage': _STAGE,
+           'account': _ACC,
+           'tiers': {'type': 'array', 'items': {'type': 'string'},
+                     'description': '要扫哪几段，默认 base/ex/s；只想清 EX 和 S '
+                                    '就传 ["ex","s"]'},
+           'raid': {'type': 'string', 'enum': ['both', 'raid', 'normal'],
+                    'description': 'EX 段怎么打：both（默认）=先普通、再导航过去'
+                                   '打突袭；raid=只打突袭；normal=只打普通'},
+           'wakeup': {'type': 'boolean',
+                      'description': '默认 true（先唤醒到主界面）；游戏已经开着'
+                                     '并停在关卡列表时传 false'},
+           'accountName': {'type': 'string',
+                           'description': '切号名（官服=手机号后 4 位）'}},
+          ['stage']),
 ]
 
 
@@ -441,6 +583,10 @@ def _tool_list_accounts(args):
             'channel': c.get('channelName') or '',
             'level': c.get('level'),
             'maaProfile': c.get('maaProfile') or '',
+            # 已绑定的切号名（手机尾号）必须给出来：用户 2026-11-18 报
+            # 「设置里配过尾号，助手每次还问」——列表里带出来，模型就不用
+            # 再开口问；只有这里是空的才轮到问用户。
+            'accountName': c.get('maaAccountName') or '',
             # 字段名对齐 progress.summary()：mainRemaining / activityLeft /
             # activityStages 才是真名（曾经写成 mainLeft / activityZones，
             # 结果每个账号都返回 null，模型只能挨个再问一遍 account_progress）
@@ -452,16 +598,31 @@ def _tool_list_accounts(args):
             'activityStages': p.get('activityStages'),
         })
     return {'accounts': out, 'count': len(out),
-            'hint': '要挂多账号时，先问用户每个账号的手机号后 4 位'
-                    '（如 5505；B 服问游戏内用户名）'}
+            'hint': 'accountName 就是已绑定的切号名（手机尾号）：**非空的直接按它跑，'
+                    '不要再问用户**；只有为空的账号才问「手机号后 4 位」'
+                    '（B 服问游戏内用户名）'}
 
 
 def _tool_list_activities(args):
     n = max(1, min(40, int(args.get('limit') or 12)))
     rows = resources.activity_list(n) or []
-    return {'activities': [{'name': r.get('name'), 'prefix': r.get('prefix'),
-                            'stages': r.get('count') or r.get('stages')}
-                           for r in rows]}
+    out = {'activities': [{'name': r.get('name'), 'prefix': r.get('prefix'),
+                           'stages': r.get('count') or r.get('stages')}
+                          for r in rows]}
+    # 当期活动（我们写过导航的那几个，带有效期）：用户说「最新活动」时用
+    # 这里的 prefix，别自己猜代号（2026-11-19 用户要求）
+    try:
+        from . import eventnav
+        cur = eventnav.active()
+        if cur:
+            out['current'] = cur
+            out['currentHint'] = ('current 是**当期还在有效期**的活动（我们写过'
+                                  '导航），用户说「最新活动 / 当期活动」就用它的 '
+                                  'stage（如 TL-1），EX / S 关分别是 TL-EX-1 / '
+                                  'TL-S-1')
+    except Exception:
+        pass
+    return out
 
 
 def _tool_search_stages(args):
@@ -769,14 +930,15 @@ def _check_account_name(nm, channel):
 def _roster(want_files, names, maa_dir):
     """把「哪些账号 + 各自的切号名」理出来
 
-    切号名的来源，按可信度排：
+    切号名的来源，只有两个可信的：
     1. 用户这次显式给的 ``names``（还会回写账号文件，下次不用再问）
-    2. 账号文件里存过的 ``maa.accountName``
-    3. 账号绑定的 MAA 档案（``maa.profile``）里的 AccountName
-    4. 拿昵称去比 MAA 档案的 AccountName —— **只对 B 服**，官服绝不做这一步
+    2. 账号文件里存过的 ``maa.accountName``（上次给的 / 设置页填的）
 
-    猜错的代价很大：官服传昵称会让 MAA 在账号列表里死找，4 分钟才超时，
-    然后在"登录"这一步就把整轮挂机废掉。宁可多问一句。
+    **不从用户的 MAA 配置档案里猜**（2026-11-18 用户口径：agent 模式不碰
+    用户的 MAA 配置）：以前会拿 ``maa.profile`` 档案里的 AccountName、甚至
+    拿昵称去比对档案名来凑切号名——程序里两个游戏账号对 MAA 里五个尾号
+    档案，档案名和 AccountName 根本说不清谁是谁，错配的代价是官服传错号
+    MAA 在账号列表里死找 4 分钟超时，整轮挂机死在「登录」。宁可多问一句。
     """
     cands = multiacct.candidates()
     if want_files:
@@ -784,37 +946,6 @@ def _roster(want_files, names, maa_dir):
         cands = [c for c in cands if c['file'] in keep or c['name'] in keep]
     if not cands:
         return [], [], '没有可挂的明日方舟账号'
-
-    try:
-        existing = maa.profiles(maa_dir).get('profiles') or []
-    except Exception:
-        existing = []
-    by_profile = {pf.get('name'): pf for pf in existing}
-    by_acc = {}
-    for pf in existing:
-        an = (pf.get('accountName') or '').strip()
-        if an:
-            by_acc.setdefault(an, pf)
-
-    def _from_profile(c):
-        nm = ''
-        pf = by_profile.get(c.get('maaProfile') or '')
-        if pf:
-            nm, _ = _check_account_name(pf.get('accountName'), c.get('channel'))
-        if nm:
-            return nm
-        if _is_official(c.get('channel')):
-            return ''
-        nick = (c.get('nickName') or '').strip()
-        for key in (nick, nick.split('#')[0].strip(), (c.get('name') or '').strip()):
-            if not key:
-                continue
-            hit = by_acc.get(key)
-            if hit:
-                nm, _ = _check_account_name(hit.get('accountName'), c.get('channel'))
-                if nm:
-                    return nm
-        return ''
 
     rows, missing = [], []
     for c in cands:
@@ -834,9 +965,6 @@ def _roster(want_files, names, maa_dir):
                     accounts.save_maa_meta(c['file'], {'accountName': nm})
                 except Exception:
                     pass
-        if not nm:
-            nm = _from_profile(c)
-            source = 'profile'
         if not nm:
             official = _is_official(c.get('channel'))
             ask = ('手机号后 4 位是多少？给这四位就行（如 5505）——'
@@ -1099,7 +1227,8 @@ def _precheck_fight(args):
     """
     from . import stageplan
     from . import skills as sk
-    stages = [s for s in (args.get('stages') or []) if s]
+    # stages 可能带 @raid/@both 后缀（逐关指定难度），预检只认纯关卡代号
+    stages, _wants = sk._parse_stages(args.get('stages'))
     if not stages:
         return None
     file = ''
@@ -1125,6 +1254,39 @@ def _precheck_fight(args):
             'blocked': rep['blocked'], 'rep': rep}
 
 
+def _train_what(args):
+    """培养干员的确认卡文案：谁、每个升到什么样
+
+    用户看到的必须是「泥岩（精二 / 技能7 / 技能2专3）」这种，而不是一串
+    JSON —— 确认卡点下去就开跑，看错一个数就是几百理智白花。
+    """
+    from . import skills as sk
+    try:
+        rows = sk._train_rows(args)
+    except Exception:
+        rows = []
+    if not rows:
+        return '上次没做完的培养计划（resume）' if args.get('resume') else ''
+    bits = []
+    for r in rows:
+        target = []
+        e = sk._to_int(r.get('elite'))
+        if e:
+            target.append('精%s' % ('二' if e == 2 else '一'))
+        sl = sk._to_int(r.get('skillLevel'))
+        if sl:
+            target.append('技能%d' % sl)
+        try:
+            arr = sk._norm_mastery(r.get('mastery')) or []
+        except Exception:
+            arr = []
+        for i, lv in enumerate(list(arr)[:3]):
+            if lv:
+                target.append('技能%d专%d' % (i + 1, lv))
+        bits.append('%s（%s）' % (r['name'], ' / '.join(target) or '目标没写'))
+    return '、'.join(bits)
+
+
 def _skill_via_guard(name, args, session):
     """fight / skip_story / weekly 共用：先摆确认卡，点了才跑后台任务
 
@@ -1145,9 +1307,13 @@ def _skill_via_guard(name, args, session):
         return out
     args = dict(args)
     desc = {'fight': '自动战斗', 'skip_story': '过剧情关',
-            'weekly': '周目编排'}.get(name, name)
-    raw = args.get('stages') or args.get('stage') or ''
-    what = '、'.join(raw) if isinstance(raw, (list, tuple)) else str(raw)
+            'weekly': '周目编排', 'train': '培养干员',
+            'sweep': '一键扫图'}.get(name, name)
+    if name == 'train':
+        what = _train_what(args)
+    else:
+        raw = args.get('stages') or args.get('stage') or ''
+        what = '、'.join(raw) if isinstance(raw, (list, tuple)) else str(raw)
     note = ''
     if name == 'fight' and not args.get('_prechecked'):
         chk = _precheck_fight(args)
@@ -1186,6 +1352,14 @@ def _tool_skill_weekly(args, session=None):
     return _skill_via_guard('weekly', args, session)
 
 
+def _tool_skill_train(args, session=None):
+    return _skill_via_guard('train', args, session)
+
+
+def _tool_skill_sweep(args, session=None):
+    return _skill_via_guard('sweep', args, session)
+
+
 _HANDLERS = {
     'list_accounts': _tool_list_accounts,
     'list_activities': _tool_list_activities,
@@ -1212,6 +1386,8 @@ _WRITE_HANDLERS = {
     'skill_fight': _tool_skill_fight,
     'skill_skip_story': _tool_skill_skip_story,
     'skill_weekly': _tool_skill_weekly,
+    'skill_train': _tool_skill_train,
+    'skill_sweep': _tool_skill_sweep,
 }
 
 
@@ -1325,7 +1501,9 @@ startup recruit infrast fight copilot mall award reclamation roguelike
 ## 常见对话怎么做
 
 **「帮我把所有账号挂上 TL-5」**
-1. list_accounts
+1. list_accounts —— **先看 accountName（已绑定的手机尾号）**：非空的账号
+   直接沿用，**绝对不要再问一遍**（用户 2026-11-18 报过这个：设置里配过
+   尾号，助手还在问）
 2. build_run（accounts=[]、mode=copy、keyword=TL-5）
 3. 返回 need_info 时：**一次性把所有缺的账号列出来问**。官服只问
    「手机号后 4 位」（如 5505），B 服问游戏内用户名。
@@ -1350,16 +1528,20 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 **「停下来」** → stop_run
 
 ## 挂关 skill（2026-11-17 新增）：把流程拆开一步一步来
-
-六个 skill，各自独立跑后台、失败单独停：
+八个 skill，各自独立跑后台、失败单独停：
 - skill_wakeup：唤醒游戏到主界面（可按尾号切号）
 - skill_navigate：导航到活动（老活动 / 当期 / EX 都行）。stage 优先传**中文
   活动名**（「孤星」），代号/活动 id 也行——内部统一换，别自己换算
 - skill_skip_story：过剧情关（ST 关自动点开 + 跳剧情）
 - skill_fight：自动战斗（编队 / 借助战 / 吃理智药）。**默认不唤醒不导航**，
-  界面在哪就从哪直接开打；要全套（唤醒+导航）得用户明说或传 wakeup=true
+  界面在哪就从哪直接开打；要全套（唤醒+导航）得用户明说或传 wakeup=true。
+  **打不过会自动换一份作业重挂这一关**（已成功的关不重打），日志逐关播报
 - skill_signin：森空岛签到
 - skill_weekly：**周目编排**——ST 剧情自动过、主线按序批量打、EX 收尾
+- skill_train：**培养干员**——升精英化 / 技能等级 / 专精，可一次排多个
+- skill_sweep：**一键扫图**——普通关 → EX 普通 → EX 突袭 → S 关，逐段重新
+  导航 + 挂机。用户说「这个活动从头打到尾」「EX 和 S 都清了」就用它，
+  比 skill_weekly 更适合「只要战斗、不要剧情编排」的场景
 
 **什么时候用 skill 而不是 build_run**：
 - 用户要「从唤醒开始，剧情关也帮我过，一口气打完」→ skill_weekly。
@@ -1369,7 +1551,21 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - 游戏没开、卡登录页 → skill_wakeup
 - **单独打一组关**（界面已在关卡列表 / 用户自己导航好了）→ skill_fight，
   不要再补导航；游戏没开或还在主界面才需要先 skill_wakeup / skill_navigate
+- **把一个活动的普通关、EX（含突袭）、S 全清一遍** → skill_sweep。它自己
+  分段导航、每关失败换作业重挂，不用一段段手动调 skill_navigate + skill_fight
 - 签到 → skill_signin
+- **培养干员**（升精二 / 技能 7 / 专精几技能）→ skill_train
+
+**「帮我把泥岩精二、二技能专三」**
+1. 先跟用户确认：哪个号、哪些干员、各自练度目标（别说「帮你练一下」就开跑）
+2. skill_train（operators=[{name:"泥岩", elite:2, skillLevel:7, mastery:[0,3,0]}]）
+3. 用户说「不用切号」就传 switchAccount=false；说「已经开着了」可传 wakeup=false
+4. 中途材料不足会**暂停**并写明缺什么：把缺的材料和「补齐后说继续培养」告诉用户
+5. 用户补完材料说「继续」→ skill_train（resume=true），不要让他重报练度
+
+**「现在打到哪了 / 在干什么」**
+任务日志里已经有 MAA 的实时进度（换作业 / 编队 / 部署 / 开技能 / 掉落 /
+理智 / 培养结果 / 卡在第几步），直接念最近几条给用户，别让他自己盯 MAA 窗口。
 
 skill 返回 taskId 后**不要傻等**：告诉用户已在后台跑，失败会停在哪一步
 并写进日志。任务失败时主动提醒用户卡在哪个 skill、哪一关、什么原因。
@@ -1407,10 +1603,40 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
 - 中文活动名 → 代号走 search_stages；连活动名都拿不准就先 list_activities
   （返回正式名 + 代号前缀）让用户挑
 - 写 MAA 之前必须让用户看到「给谁、跑哪些任务、挂哪几关」，等他确认
-- skill_fight / skill_skip_story / skill_weekly 同样要先确认再跑（工具会自动摆确认卡）
+- skill_fight / skill_skip_story / skill_weekly / skill_train 同样要先确认再跑
+  （工具会自动摆确认卡）
 - 多账号缺切号名时，明确说「这个信息森空岛拿不到，得你告诉我」；
-  官服只要**手机号后 4 位**（如 5505），不要要求用户拼星号
+  官服只要**手机号后 4 位**（如 5505），不要要求用户拼星号。
+  **问之前先看 list_accounts 的 accountName**：非空就是已经绑好的，
+  直接用，别重复问（用户设置里配过的东西，助手再问一遍很烦）
 - 多账号是**串行**的（一个模拟器同时只能登一个号），一个跑完自动切下一个
+- **模拟器不用你操心**：每个 skill 开跑前会自动确认模拟器在不在、没开就替用户
+  启动（路径从 MAA 配置里读）。任务报「环境没准备好」时，把日志那句话原样转给
+  用户让他手动开，别自己反复重试、也别去改 MAA 的连接设置
+- **突袭不是磨难**：EX/活动关的「突袭」和主线的「磨难/险地」是两回事（用户
+  2026-11-19 明确）。**默认每关只打真正要打的那一档**：EX 关有突袭作业就只打
+  突袭，不再先打一遍普通（用户实测抱怨过「说好只排突袭，结果又从头挂普通
+  EX-1」）。普通还没通关、要一次打通时，把那一关写成 ``SV-EX-1@both``。
+  同一次计划里可以逐关分开写：``["SV-EX-1@raid", "SV-EX-6@both"]``。
+  只刷材料写 ``@normal`` 或 raid=normal。磨难/险地是主线独立难度，不用后缀。
+  **不要**跟用户说「突袭打不了」——作业站有突袭作业就能排。
+- **换作业要真的换**：用户说「用 41624 那份」「换成令的单核」时，先 find_ops
+  拿到 copilotId，再调 skill_fight 时用 ops=[{stage, copilotId}] 钉住。只把
+  文案改成"已换"是没用的——不传 ops 就会重新搜索，排序又挑回原来那份。
+- **翻车会自动重挂，不用你重排**：skill_fight / skill_sweep 每关都备了
+  2~3 份作业，某关打不过会换下一份自动重挂这一关，**已经成功的关不会重打**。
+  重挂前程序会自己点一下结算页把界面带回关卡列表（用户 2026-11-19 实测：
+  失败后必须点一下才回得到关卡界面，**不需要重新唤醒/登录**）。
+  日志里会出现「✘ X 翻车：原因」「换作业重挂：X #a → #b」「✔ X 战斗成功」，
+  照实转述换了哪几关、最后成没成；不要自己说"我再重跑一遍"。
+- **关卡名单只能用用户点名的那些**（2026-11-19 用户实测吃亏）：用户说
+  「SV-EX-1 到 SV-EX-6」就排这 6 关，**不许改编号、不许跳掉一关再往后补
+  一关凑数**（那次实际排成 SV-EX-2 ~ SV-EX-7，白烧一轮理智）。跳过要说明
+  「EX-1 我按你说的跳过了」，不要偷偷把 EX-7 加进来。
+- **「最新活动 / 当期活动」**：先 list_activities，看返回的 ``current``（带
+  ``until`` 有效期和 stage 代号）——直接用它，EX 关是 ``前缀-EX-1``、S 关是
+  ``前缀-S-1``。current 为空（活动都过期了）就如实说「当期活动还没标定导航，
+  把截图和步骤发我」。
 - 不确定能配什么就先调 maa_capabilities，别猜
 - 回答用中文，简洁，别写长篇。不要输出 JSON 给用户看。
 - 涉及具体操作时，最后告诉用户去界面上哪看结果（跑机面板 / 左侧账号栏）
@@ -1534,15 +1760,29 @@ def confirm(sid):
 def cancel(sid):
     s = session(sid, create=False)
     if s:
+        # 取消时那个 tool_call 还没有响应：补一条，否则历史断了，下一句话
+        # 一发出去就被服务端 400 拒（用户 2026-11-19 连吃三次的根因之一）
+        call = s.pending_call
+        if call:
+            s.messages.append({'role': 'tool',
+                               'tool_call_id': call.get('id') or '',
+                               'content': '（用户取消了这一步）'})
         s.pending = None
+        s.pending_call = None
         s.push('say', text='（已取消）')
     return {'ok': True}
 
 
 def _trim(s):
     if len(s.messages) > KEEP_MESSAGES:
-        # 保留第一条 user 和最近若干条，避免上下文无限长
-        s.messages = s.messages[:1] + s.messages[-(KEEP_MESSAGES - 1):]
+        # 保留第一条 user 和最近若干条，避免上下文无限长。**切点不能落在
+        # 工具调用中间**：只按条数切会留下以 role=tool 开头的半截历史，
+        # 服务端直接 400（`tool` 前面必须有一条带 tool_calls 的 assistant）。
+        head = s.messages[:1]
+        tail = list(s.messages[-(KEEP_MESSAGES - 1):])
+        while tail and tail[0].get('role') == 'tool':
+            tail.pop(0)
+        s.messages = head + tail
 
 
 def _say_stream(s):
@@ -1593,8 +1833,17 @@ def _loop(s):
             s.messages.append({'role': 'assistant', 'content': content or '',
                                'tool_calls': calls})
             stop = False
-            for call in calls:
+            for i, call in enumerate(calls):
                 stop = _do_call(s, call) or stop
+                if stop:
+                    # 这批里排在后面的调用不会执行：补占位 tool 消息。少了它们，
+                    # 历史里 assistant.tool_calls 就缺响应，下一轮请求直接 400
+                    for rest in calls[i + 1:]:
+                        s.messages.append({
+                            'role': 'tool',
+                            'tool_call_id': rest.get('id') or '',
+                            'content': '（上一步在等用户确认，这一步没有执行）'})
+                    break
             if stop:
                 break
         else:
@@ -1619,7 +1868,11 @@ def _do_call(s, call):
     except ValueError:
         args = {}
     s.push('tool', name=name, args=args)
-    res = run_tool(name, args, s)
+    try:
+        res = run_tool(name, args, s)
+    except Exception as e:              # noqa: BLE001 工具抛异常也必须回一条 tool
+        # 不回的话 assistant.tool_calls 缺响应，下一轮请求被服务端 400 拒掉
+        res = {'error': '%s: %s' % (type(e).__name__, e)}
     if isinstance(res, dict) and res.get('need_confirm'):
         s.pending_call = call
         s.push('need_confirm', text=res.get('summary') or '',
@@ -1633,6 +1886,16 @@ def _do_call(s, call):
 
 
 def _run_pending(s):
+    call0 = s.pending_call or {'id': 'confirm'}
+
+    def reply(text, res=None):
+        s.messages.append({'role': 'tool',
+                           'tool_call_id': call0.get('id') or '',
+                           'content': text})
+        if res is not None:
+            s.push('tool_result', name=(s.pending or {}).get('action') or 'confirm',
+                   text=json.dumps(res, ensure_ascii=False)[:1200])
+
     try:
         pend = s.pending or {}
         action, args = pend.get('action'), pend.get('args') or {}
@@ -1640,6 +1903,9 @@ def _run_pending(s):
         fn = _WRITE_HANDLERS.get(action)
         if not fn:
             s.push('error', text='不认识的操作：%s' % action)
+            reply('不认识的操作：%s' % action)
+            s.pending = s.pending_call = None
+            s.running = False
             return
         # 这一步是用户点过确认的，绕过闸门直接执行
         old = settings.load().get('agent', {}).get('autoApply')
@@ -1651,15 +1917,14 @@ def _run_pending(s):
             settings.save({'agent': dict(settings.load().get('agent') or {},
                                          autoApply=bool(old))})
         s.pending = None
-        call = s.pending_call or {'id': 'confirm', 'function': {'name': action}}
         s.pending_call = None
-        s.messages.append({'role': 'tool', 'tool_call_id': call.get('id') or '',
-                           'content': json.dumps(res, ensure_ascii=False)[:6000]})
-        s.push('tool_result', name=action,
-               text=json.dumps(res, ensure_ascii=False)[:1200])
+        reply(json.dumps(res, ensure_ascii=False)[:6000], res)
         _loop(s)
     except Exception as e:
+        # 执行失败也要回 tool：否则 assistant.tool_calls 悬空，下一轮 400
         s.error = '%s: %s' % (type(e).__name__, e)
+        reply(s.error)
+        s.pending = s.pending_call = None
         s.push('error', text=s.error)
         s.running = False
 
