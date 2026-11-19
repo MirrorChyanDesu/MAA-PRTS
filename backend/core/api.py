@@ -7,8 +7,9 @@ import os
 import traceback
 import urllib.parse
 
-from . import (accounts, appupdate, copilot, gacha, maa, operbox, packsync,
-               paradox, resources, settings, signin, sklogin, tasks, version)
+from . import (accounts, agent, appupdate, asstlog, copilot, gacha, maa,
+               maaplan, multiacct, operbox, packsync, paradox, resources,
+               settings, signin, skills, sklogin, tasks, updater, version, watch)
 
 WEB = settings.static_dir()
 
@@ -61,6 +62,8 @@ def bootstrap(_q, _body):
             'accounts': settings.accounts_dir(),
             'tokens': settings.tokens_file(),
             'config': settings.CONFIG_DIR,
+            'logs': settings.DEBUG_DIR,
+            'appLog': settings.LOG_PATH,
         },
         'pack': resources.pack_info(),
         'gamedata': version.check(acts),
@@ -92,6 +95,24 @@ def _maa_dir_for(file):
         except Exception:
             pass
     return settings.load()['maaDir']
+
+
+def _maa_dir_any(file=None):
+    """比 _maa_dir_for 多兜一层：全局没设就用「上次账号」绑定的那个
+
+    只读接口（观测、档案列表）在用户没配全局默认、只给账号绑了目录时
+    也要能工作——不然新用户一打开助手/状态条全是空的。
+    """
+    d = _maa_dir_for(file)
+    if d:
+        return d
+    for cand in (settings.load().get('lastAccount'), None):
+        if cand is None:
+            break
+        d = _maa_dir_for(cand)
+        if d:
+            return d
+    return ''
 
 
 def _settings_view(st, accs):
@@ -135,7 +156,96 @@ def api_account_maa(_q, body):
         patch['dir'] = settings._norm_dir(patch.get('dir') or '')
         if patch['dir']:
             settings.remember_maa_dir(patch['dir'])
+    if 'accountName' in patch:
+        # 切号名统一走 acctname：用户给「5505」「181 5505」「181****5505」
+        # 都能吃下，官服填了昵称则当场拦下——这一格填错的代价是 MAA 在
+        # 账号列表里死找、4 分钟超时后整轮挂机废掉。
+        # 留空是合法状态（还没填 / 想清掉），不能当成「填错」拦下。
+        from . import acctname
+        raw = (patch.get('accountName') or '').strip()
+        if raw:
+            snap = accounts.get_account(body['file'])
+            channel = (snap.get('account') or {}).get('channelName') or ''
+            name, why = acctname.check(raw, channel)
+            if why:
+                raise ValueError('切号名不对：%s' % why)
+            patch['accountName'] = name
+        else:
+            patch['accountName'] = ''
     return {'maa': accounts.save_maa_meta(body['file'], patch)}
+
+
+def api_account_token(_q, body):
+    """设置 → 账号管理：读某个账号的 token（明文，仅在本地窗口里展示）
+
+    明文只走「本机 HTTP + 桌面窗口」这条链路，不落日志、不进 bootstrap。
+    界面默认只显示尾 4 位，用户点「显示」才把明文填进输入框。
+    """
+    body = body or {}
+    file = _account_for(body.get('file'))
+    st = accounts.token_state(file)
+    return {
+        'file': file,
+        'has': st['has'],
+        'broken': st['broken'],
+        'error': st['error'],
+        'token': st['token'],
+        'mask': updater.mask(st['token']) if st['token'] else '',
+    }
+
+
+def api_account_token_check(_q, body):
+    """token 还能不能用（换 grant 校验）；返回 ok / 原因
+
+    只有「确认失效」才让界面解锁修改框：网络不通、森空岛抽风都返回
+    ok=None（未知），不然一断网就把所有账号的 token 都变成可改状态。
+    """
+    body = body or {}
+    file = _account_for(body.get('file'))
+    token = accounts.token_for(file)
+    if not token:
+        st = accounts.token_state(file)
+        return {'ok': False, 'error': st['error'] or '这个账号没有存 token'}
+    ok, why = sklogin.verify_token(token)
+    return {'ok': bool(ok), 'error': '' if ok else (why or 'token 已失效')}
+
+
+def api_account_token_set(_q, body):
+    """换 token：先验证 + 核对 uid，确认是同一个号再写回账号文件
+
+    不核 uid 的话，用户粘错一个别的号的 token 会静默把凭证换掉——下次
+    同步直接多出一个账号、原账号还是失效状态，很难查。
+    """
+    body = body or {}
+    file = _account_for(body.get('file'))
+    token = (body.get('token') or '').strip()
+    if not token:
+        raise ValueError('token 不能为空')
+    snap = accounts.get_account(file)
+    mine = str((snap.get('account') or {}).get('uid') or '')
+    game = (snap.get('account') or {}).get('game') or 'arknights'
+    try:
+        from . import skland
+        sk = skland.Skland(token)
+        uids = {str(b.get('uid')) for b in sk.bindings() if not b.get('isDelete')}
+    except Exception as e:
+        msg = str(e)
+        if any(code in msg for code in ('400', '401', '403')):
+            msg = '这个 token 无效或已过期（森空岛拒绝了它）'
+        raise ValueError('token 验证失败：%s' % msg)
+    if game == 'endfield':
+        # 终末地没有 arknights binding：角色 id / 账号 uid 任一能对上就算同一个号
+        try:
+            for r in gacha.endfield_roles(token):
+                uids.add(str(r.get('uid')))
+                uids.add(str(r.get('roleId')))
+        except Exception:
+            pass
+    if mine and mine not in uids:
+        raise ValueError('这个 token 绑的不是当前账号（uid %s 不在它的角色列表里），'
+                         '要加新号请用左上角「添加账号」' % mine)
+    accounts.set_token(file, token)
+    return {'file': file, 'mask': updater.mask(token), 'ok': True}
 
 
 def api_account_pref(_q, body):
@@ -479,6 +589,181 @@ def api_task(q, _body):
     return t
 
 
+# ---------------------------------------------------------------- 观测（M2/M3）
+def api_watch_status(q, _body):
+    """MAA 现在跑到哪了。没开监控也能给个实时读数（前端一打开就要显示）"""
+    d = q.get('maaDir') or _maa_dir_any(q.get('file'))
+    return watch.snapshot(d)
+
+
+def api_watch_start(_q, body):
+    body = body or {}
+    d = body.get('maaDir') or _maa_dir_any(body.get('file'))
+    w = watch.start(d, profile=body.get('profile'),
+                    auto_resume=body.get('autoResume', True),
+                    on_log=(lambda m: None))
+    return {'watching': w.alive(), 'maaDir': d,
+            'autoResume': w.auto_resume}
+
+
+def api_watch_stop(_q, body):
+    body = body or {}
+    d = body.get('maaDir') or _maa_dir_any(body.get('file'))
+    return {'stopped': watch.stop(d)}
+
+
+def api_runs(q, _body):
+    """最近几次跑机记录：跑了哪几关、哪关没跑完（看历史日志，不动实时游标）"""
+    d = q.get('maaDir') or _maa_dir_any(q.get('file'))
+    return {'runs': asstlog.failures(d, limit=int(q.get('limit') or 30))}
+
+
+def api_profiles(q, _body):
+    """MAA 有哪些配置档案、各自绑的账号名（多账号的底座）"""
+    return maa.profiles(q.get('maaDir') or _maa_dir_any(q.get('file')))
+
+
+# ---------------------------------------------------------------- 多账号
+def api_multi_candidates(_q, _body):
+    """左侧能挂机的账号（只含明日方舟，终末地不掺和）"""
+    return {'accounts': multiacct.candidates()}
+
+
+def api_multi_plan(_q, body):
+    body = body or {}
+    return multiacct.plan({
+        'accounts': body.get('accounts') or [],
+        'names': body.get('names') or {},
+        'keyword': body.get('keyword') or '',
+        'kind': body.get('kind') or '',
+        'limitStages': body.get('limitStages') or 8,
+        'maaDir': _maa_dir_any(body.get('file')),
+        'mode': body.get('mode') or '',
+    })
+
+
+def api_multi_apply(_q, body):
+    body = body or {}
+    plan_data = body.get('plan') or {}
+    rows = [a for a in (plan_data.get('accounts') or []) if a.get('ops')]
+    if not rows:
+        raise ValueError('方案是空的（没有可执行的作业）')
+    d = _maa_dir_any(body.get('file'))
+    plan_data['maaDir'] = d
+    tid = tasks.create('多账号挂机（%d 个账号）' % len(rows))
+    start = body.get('start', True)
+    tl = plan_data.get('tasks') or (
+        ['startup', 'copilot', 'mall', 'award'] if start else ['startup'])
+
+    def go():
+        try:
+            if not start:
+                # 只把档案配好、作业落盘，不开跑
+                res = multiacct.apply(plan_data, tid)
+                tasks.finish(tid, result=res)
+                return
+            # 跑：直连 MaaCore（GUI 的任务队列不认 Copilot，写配置跑不起来）
+            res = maaplan.run_plan(rows, {
+                'tasks': tl,
+                'stages': plan_data.get('fightStages') or [],
+                'copilot': {'formation': bool(plan_data.get('formation', True))},
+                'maaDir': d,
+            }, tid)
+            tasks.finish(tid, result=res)
+        except Exception as e:
+            import traceback as _tb
+            tasks.finish(tid, error='%s: %s' % (type(e).__name__, e),
+                         result={'traceback': _tb.format_exc()})
+    import threading as _th
+    _th.Thread(target=go, daemon=True, name='multi-apply').start()
+    return {'taskId': tid}
+
+
+# ---------------------------------------------------------------- 任务编排
+def api_maa_capabilities(q, _body):
+    """这台 MAA 能配哪些任务 + 预设（前端配置面板的选项来源）"""
+    return maaplan.capabilities(q.get('maaDir') or _maa_dir_any(q.get('file')))
+
+
+def api_maa_profile(q, _body):
+    """看某个档案现在配了什么"""
+    return maaplan.describe(q.get('profile'),
+                            q.get('maaDir') or _maa_dir_any(q.get('file')))
+
+
+def api_maa_build(_q, body):
+    """按 spec 建一份 PRTS- 档案（不启动），返回档案名
+
+    想直接开跑用 ``/api/multi/apply``（直连 MaaCore）；这个接口只写配置，
+    给「先在 MAA 里看看配得对不对」用。
+    """
+    body = body or {}
+    spec = dict(body)
+    spec['maaDir'] = _maa_dir_any(body.get('file'))
+    return maaplan.ensure_profile(spec, spec['maaDir'])
+
+
+# ---------------------------------------------------------------- 内置助手（M4）
+def api_agent_status(_q, _body):
+    return agent.status()
+
+
+def api_agent_config(_q, body):
+    """读 / 写助手配置。apiKey 只进不出——回给前端的是 hasKey 布尔值"""
+    body = body or {}
+    if body:
+        return agent.save_config(body)
+    return agent.config()
+
+
+def api_chat(_q, body):
+    body = body or {}
+    return agent.chat(body.get('session'), body.get('text'))
+
+
+def api_chat_poll(q, _body):
+    s = agent.session(q.get('session'), create=False)
+    if not s:
+        return {'id': '', 'events': [], 'next': 0, 'running': False}
+    return s.view(q.get('since') or 0)
+
+
+def api_chat_confirm(_q, body):
+    body = body or {}
+    return agent.confirm(body.get('session'))
+
+
+def api_chat_cancel(_q, body):
+    body = body or {}
+    return agent.cancel(body.get('session'))
+
+
+def api_chat_reset(_q, body):
+    body = body or {}
+    return agent.reset(body.get('session')) or {}
+
+
+def api_skill_run(_q, body):
+    """跑一个 skill（唤醒/导航/战斗/剧情/签到/周目），返回 taskId"""
+    body = body or {}
+    tid = skills.run_skill((body.get('skill') or '').strip(), body.get('params') or {})
+    return {'taskId': tid}
+
+
+def api_skill_list(_q, _body):
+    return {'skills': [{'name': k, 'desc': v[0]} for k, v in sorted(skills.SKILLS.items())]}
+
+
+def api_skill_try(_q, body):
+    """联调测试：让大模型解析一句话，看它选哪个 skill、参数对不对
+
+    body: {text, skill?, run?}  skill 留空 = 全工具任选；run=true 直接跑
+    """
+    body = body or {}
+    return agent.try_skill(body.get('text') or '', body.get('skill') or '',
+                           bool(body.get('run')))
+
+
 def api_export(_q, body):
     """导出作业站「本地导入」用的干员 JSON"""
     body = body or {}
@@ -515,6 +800,9 @@ ROUTES = {
     '/api/accounts': api_accounts,
     '/api/account': api_account,
     '/api/account/maa': api_account_maa,
+    '/api/account/token': api_account_token,
+    '/api/account/token/check': api_account_token_check,
+    '/api/account/token/set': api_account_token_set,
     '/api/account/pref': api_account_pref,
     '/api/account/remove': api_account_remove,
     '/api/account/refresh': api_refresh,
@@ -554,4 +842,30 @@ ROUTES = {
     '/api/gacha': api_gacha,
     '/api/gacha/sync': api_gacha_sync,
     '/api/signin/run': api_signin_run,
+    # 观测层（M2/M3）
+    '/api/watch/status': api_watch_status,
+    '/api/watch/start': api_watch_start,
+    '/api/watch/stop': api_watch_stop,
+    '/api/runs': api_runs,
+    '/api/maa/profiles': api_profiles,
+    # 多账号
+    '/api/multi/candidates': api_multi_candidates,
+    '/api/multi/plan': api_multi_plan,
+    '/api/multi/apply': api_multi_apply,
+    # 任务编排（一键长草 / 抄作业 / 小活动）
+    '/api/maa/capabilities': api_maa_capabilities,
+    '/api/maa/profile': api_maa_profile,
+    '/api/maa/build': api_maa_build,
+    # 内置助手（M4）
+    '/api/agent/status': api_agent_status,
+    '/api/agent/config': api_agent_config,
+    '/api/chat': api_chat,
+    '/api/chat/poll': api_chat_poll,
+    '/api/chat/confirm': api_chat_confirm,
+    '/api/chat/cancel': api_chat_cancel,
+    '/api/chat/reset': api_chat_reset,
+    # 挂关 skill 化（唤醒/导航/战斗/剧情/签到/周目编排）
+    '/api/skill/run': api_skill_run,
+    '/api/skill/list': api_skill_list,
+    '/api/skill/try': api_skill_try,
 }

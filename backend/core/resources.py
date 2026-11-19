@@ -61,10 +61,24 @@ def pack_info() -> dict:
     }
 
 
-def _stages():
+def _stages(include_story=False):
+    """关卡行；默认不含剧情关
+
+    剧情关（story=True，资源包里 208 条）有剧情没战斗，作业站永远没有作业，
+    所以搜索、下一关、结果行一律用默认视图。需要它的地方显式传 True：
+
+      - 进度核对：森空岛 activity.zones 的 totalStage 把剧情关算在内，
+        不含就永远对不上口径
+      - 搜索提示：让用户看见「这一段里有 2 个剧情关」，挂机会在这里停顿
+      - 代号精确命中：9-1 / 10-1 / EG-3 / TL-ST-1 这些代号只属于剧情关，
+        默认视图里查不到，用户搜了会落空（见 resolve 的 mode='story'）
+
+    两种视图各缓存一份，互不影响。
+    """
+    key = 'stages_all' if include_story else 'stages'
     with _lock:
-        if 'stages' in _cache:
-            return _cache['stages']
+        if key in _cache:
+            return _cache[key]
         p = pack()
         zones = p.get('zones') or {}
         acts = p.get('activities') or {}
@@ -88,9 +102,11 @@ def _stages():
             # #s 险地（15+ 章）在作业站是独立的 stage_name，单独成行。
             if sid.endswith('#f#'):
                 continue
-            # 剧情关不进搜索，也不参与活动展开（以前每个活动都多出几行
-            # 「共 0 份 / 打不了」，用户点了也永远没作业）
-            if _is_story(st):
+            # 剧情关默认不进搜索，也不参与活动展开（以前每个活动都多出几行
+            # 「共 0 份 / 打不了」，用户点了也永远没作业）。要它的地方传
+            # include_story=True，行上带 story 标记供上层区分
+            story = _is_story(st)
+            if story and not include_story:
                 continue
             zid = st.get('zone') or ''
             if sid.endswith('#s'):
@@ -117,10 +133,116 @@ def _stages():
                 'difficulty': diff,
                 'difficultyCN': diff_cn,
                 'danger': '',
+                'story': story,
             })
         rows.sort(key=lambda r: (r['stageId'], r['code']))
-        _cache['stages'] = rows
+        _cache[key] = rows
         return rows
+
+
+def story_of(stage_id) -> bool:
+    """这个 stageId 是不是剧情关（带 #f# / #s 后缀也认）"""
+    return str(stage_id or '').split('#')[0] in _story_ids()
+
+
+# 活动分区代号 → stageId 的命名规则：TL-S-4 → act55side_s04、TL-EX-4 → act55side_ex04
+_INFER_RE = re.compile(r'^([A-Za-z][A-Za-z0-9]{0,11})-(EX|HX|MO|S|F)-?(\d{1,2})$')
+_infer_cache = {}
+
+
+def infer_stage(code):
+    """资源包里没有的关卡代号 → 按同活动前缀推断真实 stageId
+
+    当期活动新开的 EX / S 分区经常还没进上游资源包（2026-11-19 的
+    TL-S-1~S-4：包里只有 TL-1~TL-10）。缺这一行时 ``copilot.search`` 只能
+    走「全文搜第一条的 stage_name」兜底，把 TL-S-4 认成 act55side_s02——
+    挂 S-4 却抄 S-2 的作业、突袭行也拿不到（用户实测口径：「说的和实际给我
+    选择的关不一样」「不会选突袭」）。
+
+    推断靠同活动基础关：TL-1 的 stageId 是 act55side_01 → 前缀 act55side，
+    S-4 就是 act55side_s04。作业站对 ``levelKeyword`` 认这个 id，取回来还会
+    用 stage_name 二次校验，猜错也只会是「这关没作业」，不会挂错关。
+
+    查不到返回 None（上层照旧报「搜不到」）。
+    """
+    key = str(code or '').strip().upper()
+    if not key:
+        return None
+    with _lock:
+        if key in _infer_cache:
+            return _infer_cache[key]
+    row = None
+    m = _INFER_RE.match(key)
+    if m:
+        pre, kind, num = m.group(1).upper(), m.group(2).upper(), int(m.group(3))
+        # 同活动的基础关：优先第 1 关（TL-1 → act55side_01），没有再退到任意
+        # 一个「前缀-数字」的关（有的活动没有 1 号关）
+        base = ''
+        ref = None
+        for s in _stages(True):
+            if (s.get('code') or '').upper() == '%s-1' % pre:
+                ref = s
+                break
+        if ref is None:
+            for s in _stages(True):
+                c = (s.get('code') or '').upper()
+                if c.startswith(pre + '-') and c[len(pre) + 1:].isdigit():
+                    ref = s
+                    break
+        if ref is not None:
+            base = str(ref.get('stageId') or '').rsplit('_', 1)[0]
+        if base:
+            row = {
+                'stageId': '%s_%s%02d' % (base, kind.lower(), num),
+                'code': key, 'name': '',
+                'zoneId': ref.get('zoneId') or '',
+                'zoneName': ref.get('zoneName') or '',
+                'zoneType': ref.get('zoneType') or 'ACTIVITY',
+                'activity': ref.get('activity') or '',
+                # EX / HX / MO / S 都有突袭难度；F（火蓝之心第二区）没有
+                'raid': kind in ('EX', 'HX', 'MO', 'S'),
+                'difficulty': 'normal', 'difficultyCN': '',
+                'danger': '', 'story': False, 'inferred': True,
+            }
+    with _lock:
+        _infer_cache[key] = row
+    return row
+
+
+def stage_detail(stage_id):
+    """按 stageId 取一行（含剧情关）；查不到返回 None"""
+    sid = str(stage_id or '').split('#')[0]
+    if not sid:
+        return None
+    for s in _stages(True):
+        if s['stageId'] == sid:
+            return s
+    return None
+
+
+def zone_activity() -> dict:
+    """zoneId → 活动正式名（没有活动名就用 zone 名）
+
+    森空岛的 activity[].actReplicaId 是 act13d2 这种 zone 前缀，跟我们 stage id
+    的前缀（a001 / act55side）对不上，所以活动名只能从 zone 反查。
+    """
+    with _lock:
+        if 'zone_act' not in _cache:
+            m = {}
+            for s in _stages(True):
+                zid = s['zoneId']
+                if zid and zid not in m and (s['activity'] or s['zoneName']):
+                    m[zid] = s['activity'] or s['zoneName']
+            _cache['zone_act'] = m
+        return _cache['zone_act']
+
+
+def _story_ids():
+    with _lock:
+        if 'story_ids' not in _cache:
+            _cache['story_ids'] = {st['id'] for st in (pack().get('stages') or [])
+                                   if _is_story(st)}
+        return _cache['story_ids']
 
 
 def _norm(s):
@@ -141,7 +263,7 @@ def _chapter_no(code):
 def resolve(keyword: str) -> dict:
     """把用户输入解析成关卡列表
 
-    返回 {mode:'stage'|'activity'|'unknown', title, keyword, stages:[...]}
+    返回 {mode:'stage'|'story'|'activity'|'unknown', title, keyword, stages:[...]}
     支持：TL-10 / act55side_10 / TR- / act55side / 中文关卡名 / 中文活动名
     """
     kw = (keyword or '').strip()
@@ -168,6 +290,29 @@ def resolve(keyword: str) -> dict:
     if hit:
         return {'mode': 'stage', 'title': hit[0]['code'] + ' ' + hit[0]['name'],
                 'keyword': kw, 'stages': hit[:1]}
+
+    # 2.6 资源包里还没有的分区（当期活动的 EX / S 常常后于资源包上线）：
+    #     TL-S-4 → act55side_s04。**必须排在「前缀展开」和「全文搜兜底」
+    #     前面**，否则会被当成未知代号随便抓一条作业的 stage_name 顶上，
+    #     挂 S-4 实际抄 S-2 的作业（2026-11-19 用户实测）
+    inf = infer_stage(kw)
+    if inf:
+        return {'mode': 'stage',
+                'title': '%s %s' % (kw.upper(), inf.get('zoneName') or ''),
+                'keyword': kw, 'stages': [inf]}
+
+    # 2.5 剧情关精确命中。9-1 / EG-3 / TL-ST-1 这类代号只属于剧情关，默认
+    #     视图里没有，用户搜了会落空。但 12-1 这种既是剧情关代号、又是章节
+    #     前缀（12-10 ~ 12-19 都以它开头），所以只在「没有任何战斗关代号以
+    #     它开头」时才当纯剧情代号，否则交给后面的系列展开
+    if not any(s['code'].lower().startswith(low) for s in stages):
+        hit = [s for s in _stages(True)
+               if s['story'] and (s['code'].lower() == low
+                                  or s['stageId'].lower() == low)]
+        if hit:
+            return {'mode': 'story',
+                    'title': (hit[0]['code'] + ' ' + hit[0]['name']).strip(),
+                    'keyword': kw, 'stages': hit[:1]}
 
     # 3. 纯章节号（0 / 2 / 12 / 15-）→ 这一章的全部关卡：普通关、剧情关、
     #    S 支线关、TR 教学关，按游戏里的推图顺序返回（2-1 → S2-1 → 2-2 →
@@ -647,6 +792,50 @@ def next_stage(stage):
                 'difficulty': nxt.get('difficulty') or 'normal',
                 'difficultyCN': nxt.get('difficultyCN') or ''}
     return None
+
+
+def stages_after(stage_id, difficulty=None):
+    """同章 / 同活动里排在它之后的战斗关，按推图顺序
+
+    给「还差哪几关」用：森空岛只告诉你推到哪个点（status.mainStageProgress），
+    剩下的要从我们自己的流程树往后取。剧情关天然不在序列里（默认视图），
+    难度变体按 difficulty 过滤——不传就跟着传入那一行自己的难度走。
+    """
+    sid = str(stage_id or '').split('#')[0]
+    cur = _flow().get(_base_sid(sid))
+    if not cur:
+        return []
+    rank, idx = cur[0], cur[1]
+    if difficulty is None:
+        row = next((s for s in _stages(True) if s['stageId'] == sid), None)
+        difficulty = (row or {}).get('difficulty')
+    out = []
+    for s in _stages():
+        if difficulty and (s.get('difficulty') or 'normal') != difficulty:
+            continue
+        k = _flow().get(_base_sid(s['stageId']))
+        if not k or k[0] != rank or k[1] <= idx:
+            continue
+        out.append((k[1], _nat_key(s['stageId']), s))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [s for _, _, s in out]
+
+
+def stories_between(stages) -> list:
+    """给定一组关卡（某次搜索的结果），返回同活动 / 同章的剧情关
+
+    只用于结果区提示「这一段里还有 N 个剧情关」——让用户提前知道挂到那里
+    会停，而不是等着它莫名卡住。不参与作业搜索，也不进结果行。
+    """
+    if not stages:
+        return []
+    buckets = {_placement(s['stageId'])[0] for s in stages if s.get('stageId')}
+    if not buckets:
+        return []
+    out = [s for s in _stages(True)
+           if s['story'] and _placement(s['stageId'])[0] in buckets]
+    out.sort(key=lambda r: flow_key(r['stageId'])[:2])
+    return out
 
 
 def _act_name(stage_id: str, rows=None) -> str:

@@ -134,11 +134,14 @@ function modal(html, opts = {}) {
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
   mask.innerHTML = '<div class="modal">' + html + '</div>';
+  if (opts.cls) mask.firstElementChild.classList.add(opts.cls);   // 设置那种宽对话框用
   $('#modal-root').appendChild(mask);
   const close = () => {
     mask.style.transition = '.14s ease';
     mask.style.opacity = '0';
     setTimeout(() => mask.remove(), 140);
+    // 关窗回调（设置页用它刷新列表 / 条数；点遮罩、点按钮都算一次）
+    if (opts.onClose) { try { opts.onClose(); } catch (e) { } }
   };
   mask.addEventListener('click', e => { if (e.target === mask) close(); });
   mask.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
@@ -184,11 +187,13 @@ async function boot() {
     renderQuick();
     renderMaaState();
     fillBasketProfiles();
+    // 助手配置（设置弹窗与聊天面板都要用；拿不到不影响主流程）
+    api('/api/agent/status').then(d => { S.agent = d; chatInit(); }).catch(() => { });
     if (S.current) await selectAccount(S.current, true);
     // ?mod=gacha 直接打开抽卡统计（做快捷方式用，和 ?q=TL-10 一样）
     // 其余情况模块显隐由 selectAccount → applyModuleAvailability 决定，别重复渲染
     const mod0 = new URLSearchParams(location.search).get('mod');
-    if (mod0 === 'gacha' || mod0 === 'signin') setModule(mod0);
+    if (mod0 === 'gacha' || mod0 === 'signin' || mod0 === 'chat') setModule(mod0);
     startPing();
     // 资源包后台自动更新：晚几秒，别和首屏渲染抢网络
     setTimeout(packAutoSync, 2500);
@@ -350,8 +355,9 @@ function bindAccountOrder(box) {
 }
 
 /* 删除账号：卡片 hover 出 ✕，点后二次确认。删就是删——账号文件直接
-   删除，不留备份（要找回只能重新同步）。 */
-async function deleteAccount(file) {
+   删除，不留备份（要找回只能重新同步）。
+   onDone：设置页要拿它刷新自己那份账号列表，主界面传不传都一样。 */
+async function deleteAccount(file, onDone) {
   const a = S.accounts.find(x => x.file === file);
   if (!a) return;
   const game = gameOf(a);
@@ -383,6 +389,7 @@ async function deleteAccount(file) {
             }
           }
           renderAccounts();
+          if (onDone) onDone();
           toast(`已删除「${a.nickName || file}」`);
         } catch (e) {
           yes.disabled = false;
@@ -776,6 +783,9 @@ function renderAppDot() {
   const u = S.appUpdate || {};
   const has = !!(u.ok && u.hasUpdate);
   if (dot) dot.hidden = !has;
+  // 设置里「版本更新」那一页也要点一个：只有外面齿轮上的红点时，用户点进来
+  // 面对六页签根本不知道该看哪一页。设置没开时这行什么也选不到，无害。
+  $$('[data-tab-dot="update"]').forEach(d => { d.hidden = !has; });
   if (btn) btn.title = has ? `设置（新版本 ${u.tag || u.latest} 可用）` : '设置';
 }
 
@@ -1361,6 +1371,20 @@ function bindOpCards(root, ops, variant) {
   });
 }
 
+// 结果区顶部的剧情关提示：这一段里还有几个剧情关，挂到那里会停。
+// MAA 的关卡导航是「关卡列表内右滑找关卡名」的局部搜索，一旦停在剧情界面
+// 就不认识任何按钮，只能等重试耗尽然后整队终止——提前说比让用户猜有用
+function storyTipHtml(d) {
+  const list = d.stories || [];
+  if (!list.length) return '';
+  const codes = list.map(s => s.code).filter(Boolean);
+  return `<div class="story-tip">
+    <span class="badge story">剧情</span>
+    <span>本段还有 ${list.length} 个剧情关${codes.length ? '：' + codes.map(esc).join('、') : ''}</span>
+    <em>挂机会停在这里，需要手动继续</em>
+  </div>`;
+}
+
 function renderResult(d) {
   // 顺手学作者 id → 昵称：作者黑名单弹窗显示名字靠这个缓存
   (d.stages || []).forEach(s => {
@@ -1369,10 +1393,22 @@ function renderResult(d) {
     });
   });
   const box = $('#results');
+  // 剧情关：只有剧情没有战斗，作业站上永远没有作业。给一张说明卡，顺带
+  // 告诉用户首次通关送一颗源石（以前这类关被整条过滤，搜 9-1 会落空）
+  if (d.mode === 'story' && d.story) {
+    const s = d.story;
+    box.innerHTML = `<div class="empty-state story-card">
+      <h3>${esc(s.code || '')} ${esc(s.name || '')}<em class="badge story">剧情</em></h3>
+      <p>这一关只有剧情、没有战斗，作业站上没有作业可抄。</p>
+      <p class="story-note">首次观看送 <b>1 颗源石</b>。挂机队列经过这里会停顿，需要点一下跳过。</p>
+    </div>`;
+    return;
+  }
   if (!d.stages || !d.stages.length) {
     box.innerHTML = '<div class="empty-state"><h3>没有结果</h3><p>换个关卡代号试试，例如 TL-10 或 act55side</p></div>';
     return;
   }
+  const tip = storyTipHtml(d);
 
   if (d.stages.length === 1) {
     const s = d.stages[0];
@@ -1392,10 +1428,10 @@ function renderResult(d) {
         </div>
       </div>`;
     if (!ops.length) {
-      box.innerHTML = head + '<div class="empty-state"><h3>这个关卡还没有作业</h3><p>作业站上暂时没人上传，换个关卡吧</p></div>';
+      box.innerHTML = tip + head + '<div class="empty-state"><h3>这个关卡还没有作业</h3><p>作业站上暂时没人上传，换个关卡吧</p></div>';
       return;
     }
-    box.innerHTML = head + '<div class="ops-grid">' +
+    box.innerHTML = tip + head + '<div class="ops-grid">' +
       ops.map((op, i) => opCard(op, {
         best: i === 0 && op.mode !== 'blocked' && op.mode !== 'train',
         inBasket: inBasket(op.id, s.stage.variant),
@@ -1483,7 +1519,7 @@ function renderResult(d) {
       </div>`;
   }).join('');
 
-  box.innerHTML = head + '<div class="stage-list">' + rows + '</div>';
+  box.innerHTML = tip + head + '<div class="stage-list">' + rows + '</div>';
 
   const allOps = [];
   d.stages.forEach(s => (s.ops || []).forEach(o => allOps.push(o)));
@@ -1961,6 +1997,8 @@ function pollTask(tid, root, sel) {
     const box = root ? $(sel || '#task-log', root) : null;
     const tick = async () => {
       if (done) return;
+      // 承载日志的弹窗被关掉了就别再空转（任务本身在后台跑，不用我们管）
+      if (root && root.isConnected === false) { done = true; return; }
       try {
         const t = await api('/api/task?id=' + tid + '&since=' + since);
         since = t.logCount || since;
@@ -2545,84 +2583,519 @@ async function pickFolder(inputEl) {
   else if (r && r.error) toast('选择失败：' + r.error, 'err');
 }
 
+/* ------------------------------------------------------------ 设置
+   2026-11-18：一列到底改成「左侧 tab + 右侧内容」。
+   原来账号 / MAA / 版本 / 助手 / 目录 / 黑名单全堆在一个 520px 的弹窗里，
+   一滚就不知道上面还有什么，二级弹窗套二级弹窗（助手、黑名单）也难找。
+   现在按「管什么」拆成 6 页，每页自己滚；页内改动即时保存，不再有跨页的
+   一个大「保存」——改了 MAA 又切到版本页，很容易把前一次保存漏掉。 */
+
+const SET_ICONS = {
+  accounts: '<path d="M8 8.1a2.55 2.55 0 1 0 0-5.1 2.55 2.55 0 0 0 0 5.1Z"/>'
+    + '<path d="M3.2 13.4c0-2.05 2.15-3.35 4.8-3.35s4.8 1.3 4.8 3.35"/>',
+  maa: '<rect x="2.4" y="4.4" width="11.2" height="8.6" rx="1.4"/>'
+    + '<path d="M5.2 7.3 6.9 9 5.2 10.7M8.5 10.7h2.2"/>',
+  update: '<path d="M13.1 8a5.1 5.1 0 1 1-1.55-3.63"/><path d="M13.3 2.7v3.6H9.7"/>',
+  agent: '<path d="M8 2.6 9.35 5.9 12.6 7.25 9.35 8.6 8 11.9 6.65 8.6 3.4 7.25 6.65 5.9Z"/>'
+    + '<path d="M12.4 11.2v2.2M11.3 12.3h2.2"/>',
+  data: '<ellipse cx="8" cy="4.5" rx="5" ry="1.9"/>'
+    + '<path d="M3 4.5v6.9c0 1.05 2.24 1.9 5 1.9s5-.85 5-1.9V4.5"/>'
+    + '<path d="M3 8c0 1.05 2.24 1.9 5 1.9s5-.85 5-1.9"/>',
+  blacklist: '<circle cx="8" cy="8" r="5.2"/><path d="M4.35 11.65 11.65 4.35"/>',
+};
+
+function setIcon(k) {
+  return `<svg class="si" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+    stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">${
+    SET_ICONS[k] || ''}</svg>`;
+}
+
+function fmtSync(t) {
+  return t ? String(t).replace('T', ' ').slice(0, 16) : '—';
+}
+
+const SET_TABS = [
+  ['accounts', '账号管理'],
+  ['maa', 'MAA 路径'],
+  ['update', '版本更新'],
+  ['agent', '助手设置'],
+  ['data', '数据与日志'],
+  ['blacklist', '黑名单'],
+];
+
 function openSettings() {
   const s = S.settings;
+  const p = S.paths || {};
+  const pk = S.pack || {};
+  const gd = S.gamedata || {};
+  const counts = pk.counts || {};
+  // 目录按钮一律渲染：桌面窗口里能直接打开，浏览器预览里点了给一句提示
+  // （早先是 nativeApi 存在才渲染，结果网页里这一栏看着像缺了按钮）
+  const openBtn = (which, label) =>
+    `<button class="btn-plain mini" data-open="${which}">${label}</button>`;
   // 代理拆成 地址+端口 两框回填；没配过给地址预填本机默认，端口空=直连
   const pv = String(s.proxy || '').trim();
   const pm = pv.match(/^(.*?):(\d+)$/);
   const proxyHost = pm ? pm[1] : 'http://127.0.0.1';
   const proxyPort = pm ? pm[2] : '';
-  const p = S.paths || {};
-  const pk = S.pack || {};
-  const gd = S.gamedata || {};
-  const counts = pk.counts || {};
-  const n = nativeApi();
-  const openBtn = (which, label) => n
-    ? `<button class="btn-plain mini" data-open="${which}">${label}</button>` : '';
+
+  const acctRows = () => (S.accounts || []).map(a => {
+    const st = a.stats || {};
+    const ef = (a.game || 'arknights') === 'endfield';
+    const ch = (a.nickName || '?').replace(/[#＃].*$/, '').slice(0, 1);
+    const cls = st.sixStarCount >= 120 ? 'r6' : (st.sixStarCount >= 60 ? 'r5' : '');
+    const chName = a.channelName || '官服';
+    const chCls = /bilibili/i.test(chName) ? ' bili' : (/^官服/.test(chName) ? ' official' : '');
+    return `
+    <div class="set-card set-acct" data-file="${esc(a.file)}">
+      <div class="set-acct-top">
+        <span class="avatar ${cls}">${esc(ch)}</span>
+        <div class="set-acct-id">
+          <div class="set-acct-name">${esc(a.nickName)}
+            <span class="acct-ch${chCls}">${esc(chName)}</span>
+            ${ef ? '<i class="acct-tag">终末地</i>' : ''}</div>
+          <div class="set-acct-meta">UID ${esc(a.uid || '—')} · ${
+            ef ? 'Lv' + esc(a.level || '?') : `${st.charCount || 0}/${st.charTotal || 440} 干员`
+          } · 同步于 ${esc(fmtSync(a.syncedAt))}</div>
+        </div>
+        <button class="btn-plain mini set-danger" data-act="del">删除账号</button>
+      </div>
+      <div class="set-token">
+        <div class="set-token-head"><span>森空岛 token</span>
+          <em class="set-token-state" data-state>读取中…</em></div>
+        <div class="path-row">
+          <input type="text" data-token readonly spellcheck="false" autocomplete="off">
+          <button class="btn-plain mini" data-act="reveal" disabled>显示</button>
+          <button class="btn-plain mini" data-act="check" disabled>验证</button>
+          <button class="btn-plain mini" data-act="edit" disabled>修改</button>
+          <button class="btn-plain mini" data-act="save" hidden>保存</button>
+          <button class="btn-plain mini" data-act="cancel" hidden>取消</button>
+        </div>
+        <div class="set-tip" data-tip></div>
+      </div>
+    </div>`;
+  }).join('') || '<div class="onb-hint">还没有账号。用左上角「添加账号」粘一个森空岛 token，或直接从 MAA 导入。</div>';
+
+  const maaRows = () => (S.accounts || []).map(a => `
+    <div class="set-card set-maarow" data-file="${esc(a.file)}">
+      <div class="set-maarow-head">
+        <b>${esc(a.nickName)}</b>
+        <span class="set-muted">${esc(a.channelName || '官服')}</span>
+        ${a.maaProfile ? `<span class="set-chip">档案 ${esc(a.maaProfile)}</span>` : ''}
+      </div>
+      <label class="field"><span>切号名（手机号后 4 位；agent 启动这个账号时写进 MAA「开始唤醒」的就是它）</span>
+        <input type="text" data-f="accountName" value="${esc(a.maaAccountName || '')}"
+               placeholder="后 4 位，如 5505" spellcheck="false" autocomplete="off"></label>
+      <label class="field"><span>这个账号的 MAA 路径（留空 = 用上面的默认目录）</span>
+        <div class="path-row">
+          <input type="text" data-f="dir" value="${esc(a.maaDir || '')}" placeholder="${esc(s.maaDir || '沿用默认目录')}">
+          <button class="btn-plain mini" data-act="pick">浏览</button>
+          <button class="btn-plain mini" data-act="probe">检测</button>
+          <button class="btn-plain mini" data-act="profiles">读档案</button>
+        </div></label>
+      <div class="set-maarow-foot">
+        <span class="onb-hint" data-state></span>
+        <button class="btn-solid mini" data-act="save">保存</button>
+      </div>
+    </div>`).join('') || '<div class="onb-hint">还没有账号。</div>';
+
+  // 条数要读活的 S.settings：子弹窗里增删后 saveSettings 会换掉整个对象，
+  // 拿打开设置那一刻的引用（s）去数会一直停在旧值
+  const blOf = () => {
+    const cur = S.settings || {};
+    return {
+      char: (cur.charBlacklist || []).length,
+      author: (cur.authorBlacklist || []).length,
+      op: (cur.opBlacklist || []).length,
+    };
+  };
+  const bl = blOf();
+
   modal(`
-    <h3>设置</h3>
-    <div class="sub">改动立即生效。账号数据与配置都保存在本机项目目录里，不会上传。</div>
-    <label class="field"><span>默认 MAA 根目录（包含 MAA.exe；账号没单独指定就用它）</span>
-      <div class="path-row">
-        <input type="text" id="set-maa" value="${esc(s.maaDir || '')}">
-        <button class="btn-plain mini" data-pick="set-maa">浏览</button>
-        <button class="btn-plain mini" id="set-probe">检测</button>
-      </div></label>
-    <div class="onb-hint" id="set-maa-state">${
-      S.maa && S.maa.exeExists ? '✓ MAA.exe 已找到' : '✗ 尚未检测到 MAA.exe'}</div>
-    <label class="check-row" style="margin-bottom:14px">
-      <input type="checkbox" id="set-autostart" ${s.autoStartMaa ? 'checked' : ''}>
-      <span>写完作业后自动启动 MAA</span>
-    </label>
-    <label class="check-row" style="margin-bottom:14px">
-      <input type="checkbox" id="set-autopack" ${s.autoUpdatePack === false ? '' : 'checked'}>
-      <span>启动后自动更新游戏资源（新关卡 / 新干员 / 新活动）</span>
-    </label>
-    <label class="check-row" style="margin-bottom:14px">
-      <input type="checkbox" id="set-autocheck" ${s.autoCheckAppUpdate === false ? '' : 'checked'}>
-      <span>启动后检查程序新版本（6 小时最多一次，只提醒，装不装由你定）</span>
-    </label>
+    <div class="set-shell">
+      <aside class="set-side">
+        <div class="set-side-title">设置</div>
+        ${SET_TABS.map(([id, name], i) => `
+          <button class="set-tab${i === 0 ? ' active' : ''}" data-tab="${id}">
+            ${setIcon(id)}<span>${name}</span><span class="set-tab-tail">${
+              id === 'update'
+                ? '<i class="set-tab-dot" data-tab-dot="update" hidden></i>' : ''
+            }<em class="set-tab-n" data-tab-n="${id}"></em></span>
+          </button>`).join('')}
+        <div class="set-side-foot">改动即时生效<br>数据都留在本机</div>
+      </aside>
+      <section class="set-body">
+        <div class="set-panes">
 
-    <div class="bl-entry-row">
-      <button class="btn-plain" id="set-bl-char">干员黑名单</button>
-      <button class="btn-plain" id="set-bl-op">作业黑名单</button>
-      <button class="btn-plain" id="set-bl-author">作者黑名单</button>
-    </div>
+          <div class="set-pane active" data-pane="accounts">
+            <div class="set-head">
+              <h3>账号管理</h3>
+              <p><b>token</b> 是森空岛的账号凭证，签到、抽卡统计、后台同步都靠它——加密存在本机账号文件里
+                （Windows DPAPI，仅本机当前用户可解），不会上传。默认只读，只有「验证」确认失效后才解锁修改。
+                删除账号会连练度快照一起删掉，不可恢复。</p>
+            </div>
+            <div class="set-acct-list" id="set-acct-list">${acctRows()}</div>
+          </div>
 
-    <div class="path-list">
-      <div class="path-item"><span>账号数据</span><code>${esc(p.accounts || '')}</code>${openBtn('accounts', '打开')}</div>
-      <div class="path-item"><span>配置与日志</span><code>${esc(p.config || '')}</code>${openBtn('config', '打开')}</div>
-      <div class="path-item"><span>游戏资源</span><code id="set-pack-msg">v${esc(gd.version || pk.version || '?')} · ${counts.chars || 0} 干员 · ${counts.stages || 0} 关卡</code>
-        <button class="btn-plain mini" id="set-pack-check">检查更新</button></div>
-      <div class="path-item"><span>程序版本</span><code id="set-app-msg">MAA-PRTS ${esc(
-        gd.app || (S.appInfo && S.appInfo.version) || '')}${appVerSuffix()}</code>
-        <button class="btn-plain mini" id="set-app-check">${
-          S.appUpdate && S.appUpdate.ok && S.appUpdate.hasUpdate ? '查看新版本' : '检查更新'}</button></div>
-    </div>
+          <div class="set-pane" data-pane="maa">
+            <div class="set-head">
+              <h3>MAA 路径</h3>
+              <p>每个账号可以绑自己的 MAA（包含 <code>MAA.exe</code> 的目录），没绑就用下面的默认目录。
+                <b>切号名</b>是 MAA「开始唤醒 → 账号切换」里要比对的那行：官服填手机号后 4 位（如 <code>5505</code>），
+                B 服填游戏内用户名。填错的代价是 MAA 在账号列表里死找、4 分钟超时后整轮挂机作废。</p>
+            </div>
+            <div class="set-card">
+              <label class="field"><span>默认 MAA 根目录（账号没单独绑定就用它）</span>
+                <div class="path-row">
+                  <input type="text" id="set-maa" value="${esc(s.maaDir || '')}">
+                  <button class="btn-plain mini" data-pick="set-maa">浏览</button>
+                  <button class="btn-plain mini" id="set-probe">检测</button>
+                  <button class="btn-plain mini" id="set-maa-save">保存</button>
+                </div></label>
+              <div class="onb-hint" id="set-maa-state">${
+                S.maa && S.maa.exeExists ? '✓ MAA.exe 已找到' : '✗ 尚未检测到 MAA.exe'}</div>
+              <label class="check-row" style="margin-top:12px">
+                <input type="checkbox" id="set-autostart" ${s.autoStartMaa ? 'checked' : ''}>
+                <span>写完作业后自动启动 MAA</span>
+              </label>
+            </div>
+            <div class="set-sub-title">各账号的绑定</div>
+            <div class="set-maa-list" id="set-maa-list">${maaRows()}</div>
+          </div>
 
-    <label class="field" style="margin-top:14px"><span>网络代理（连不上 GitHub 时才需要；只用于上面两项检查 / 下载更新，端口留空 = 直连）</span>
-      <div class="path-row">
-        <input type="text" id="set-proxy-host" value="${esc(proxyHost)}" placeholder="http://127.0.0.1">
-        <input type="text" id="set-proxy-port" value="${esc(proxyPort)}" placeholder="7890" inputmode="numeric" style="flex:0 0 92px">
-      </div></label>
+          <div class="set-pane" data-pane="update">
+            <div class="set-head">
+              <h3>版本更新</h3>
+              <p>两条链各自独立：<b>游戏资源</b>是关卡 / 干员 / 活动数据（几百 KB，随程序发版更新），
+                <b>程序本体</b>是 MAA-PRTS 自己（从 GitHub Releases 取，有新版本只提醒，装不装你说了算）。</p>
+            </div>
+            <div class="set-card">
+              <div class="set-ver">
+                <div class="set-ver-id">
+                  <b>游戏资源</b>
+                  <code id="set-pack-msg">v${esc(gd.version || pk.version || '?')} · ${
+                    counts.chars || 0} 干员 · ${counts.stages || 0} 关卡</code>
+                </div>
+                <button class="btn-plain mini" id="set-pack-check">检查更新</button>
+              </div>
+              <div class="set-ver">
+                <div class="set-ver-id">
+                  <b>程序版本</b>
+                  <code id="set-app-msg">MAA-PRTS ${esc(
+                    gd.app || (S.appInfo && S.appInfo.version) || '')}${appVerSuffix()}</code>
+                </div>
+                <button class="btn-plain mini" id="set-app-check">${
+                  S.appUpdate && S.appUpdate.ok && S.appUpdate.hasUpdate ? '查看新版本' : '检查更新'}</button>
+              </div>
+              <label class="check-row" style="margin-top:14px">
+                <input type="checkbox" id="set-autopack" ${s.autoUpdatePack === false ? '' : 'checked'}>
+                <span>启动后自动更新游戏资源（新关卡 / 新干员 / 新活动）</span>
+              </label>
+              <label class="check-row" style="margin-top:10px">
+                <input type="checkbox" id="set-autocheck" ${s.autoCheckAppUpdate === false ? '' : 'checked'}>
+                <span>启动后检查程序新版本（6 小时最多一次，只提醒）</span>
+              </label>
+            </div>
+            <div class="set-sub-title">网络代理</div>
+            <div class="set-card">
+              <div class="set-tip" style="margin-bottom:10px">只在连不上 GitHub 时才需要。仅用于上面两条检查 / 下载链路；
+                端口留空 = 直连。改完点「保存并测试」，不可用也会保存（更新时会自动直连回退）。</div>
+              <div class="path-row">
+                <input type="text" id="set-proxy-host" value="${esc(proxyHost)}" placeholder="http://127.0.0.1">
+                <input type="text" id="set-proxy-port" value="${esc(proxyPort)}" placeholder="7890"
+                       inputmode="numeric" style="flex:0 0 92px">
+                <button class="btn-plain mini" id="set-proxy-save">保存并测试</button>
+              </div>
+            </div>
+          </div>
 
-    <div class="modal-foot">
-      <button class="btn-plain" data-close>取消</button>
-      <button class="btn-solid" id="btn-save-set">保存</button>
+          <div class="set-pane" data-pane="agent">
+            <div class="set-head">
+              <h3>助手设置</h3>
+              <p>内置助手用 OpenAI 兼容协议，DeepSeek / 通义 / Kimi / 中转站 / 本地 Ollama 都能填。
+                API Key 用 Windows DPAPI 加密存在本机，换电脑解不开、也不会上传。配好之后在顶部「助手」标签页里对话。</p>
+            </div>
+            <div class="set-card">
+              <label class="field"><span>Base URL（ai 的接口地址）</span>
+                <input type="text" id="set-ag-url" placeholder="https://api.deepseek.com/v1" spellcheck="false"></label>
+              <label class="field"><span>模型名</span>
+                <input type="text" id="set-ag-model" placeholder="deepseek-chat" spellcheck="false"></label>
+              <label class="field"><span>API Key</span>
+                <div class="path-row">
+                  <input type="password" id="set-ag-key" value="" autocomplete="off" spellcheck="false">
+                  <button class="btn-plain mini" id="set-ag-clear" disabled>清除</button>
+                </div></label>
+              <label class="check-row">
+                <input type="checkbox" id="set-ag-auto">
+                <span>写 MAA 时不再问我，直接执行（关掉更安全：每次写入前都弹确认）</span>
+              </label>
+              <div class="set-maarow-foot">
+                <span class="onb-hint" id="set-ag-state"></span>
+                <button class="btn-solid mini" id="set-ag-save">保存</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="set-pane" data-pane="data">
+            <div class="set-head">
+              <h3>数据与日志</h3>
+              <p>账号快照、配置、日志都在本机，删程序不会带走；想备份就整目录拷走。
+                日志是纯文本，报问题时把 <code>app.log</code> 发过来最有用。</p>
+            </div>
+            <div class="set-card">
+              <div class="path-list" style="border-top:none;padding-top:0">
+                <div class="path-item"><span>账号数据</span><code>${esc(p.accounts || '')}</code>${openBtn('accounts', '打开')}</div>
+                <div class="path-item"><span>配置目录</span><code>${esc(p.config || '')}</code>${openBtn('config', '打开')}</div>
+                <div class="path-item"><span>日志目录</span><code>${esc(p.logs || '')}</code>${openBtn('logs', '打开')}</div>
+                <div class="path-item"><span>运行根目录</span><code>${esc(p.root || '')}</code>${openBtn('root', '打开')}</div>
+              </div>
+              <div class="set-tip" style="margin-top:12px">账号数据与配置在同一个目录（每个账号一个 json，
+                同目录还有 <code>settings.json</code> 与 <code>navcache.json</code>）。token 密文就在各自账号 json 的
+                <code>skd</code> 段里，和账号绑定——拷到别的电脑解不开是正常的。</div>
+            </div>
+          </div>
+
+          <div class="set-pane" data-pane="blacklist">
+            <div class="set-head">
+              <h3>黑名单</h3>
+              <p>黑名单只影响<b>显示与推荐</b>：被拉黑的干员 / 作者 / 作业不会出现在搜索结果里，
+                账号数据、练度比对结论都不受影响。三类互不相干，按需要各管各的。</p>
+            </div>
+            <div class="set-bls">
+              <div class="set-card set-bl">
+                <div class="set-bl-main">
+                  <b>干员黑名单 <span class="set-chip" data-bl-count="char">${bl.char}</span></b>
+                  <div class="set-tip">屏蔽某个干员（或它的某几个技能）参与的作业：搜索与详情里不再显示，
+                    但比对结论不变。适合「没练 / 不想用」的干员。</div>
+                </div>
+                <button class="btn-plain mini" data-bl="char">管理</button>
+              </div>
+              <div class="set-card set-bl">
+                <div class="set-bl-main">
+                  <b>作者黑名单 <span class="set-chip" data-bl-count="author">${bl.author}</span></b>
+                  <div class="set-tip">按作业站作者屏蔽：这个作者发的所有作业都不再出现。
+                    适合「路线不合口味 / 老是要求高练度」的作者。</div>
+                </div>
+                <button class="btn-plain mini" data-bl="author">管理</button>
+              </div>
+              <div class="set-card set-bl">
+                <div class="set-bl-main">
+                  <b>作业黑名单 <span class="set-chip" data-bl-count="op">${bl.op}</span></b>
+                  <div class="set-tip">按 MAA 代码（<code>maa://12345</code>）屏蔽单个作业，
+                    软件级、不跟账号走。作业详情里点「拉黑作业」也会加到这儿。</div>
+                </div>
+                <button class="btn-plain mini" data-bl="op">管理</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+        <div class="set-foot">
+          <span>设置修改后立即生效，没有总的「保存」按钮。</span>
+          <button class="btn-plain" data-close>关闭</button>
+        </div>
+      </section>
     </div>
   `, {
+    cls: 'modal-set',
     onMount(el, close) {
-      $$('[data-pick]', el).forEach(b => b.addEventListener('click', async () => {
-        const input = $('#' + b.dataset.pick, el);
-        await pickFolder(input);
-      }));
-      $$('[data-open]', el).forEach(b => b.addEventListener('click', async () => {
-        const api2 = nativeApi();
-        if (api2 && api2.open_folder) {
-          const r = await api2.open_folder(b.dataset.open);
-          if (r && r.ok === false) toast(r.error || '打开失败', 'err');
+      /* ---------------- 页签 ---------------- */
+      const panes = $$('.set-pane', el);
+      const tabs = $$('.set-tab', el);
+      const show = id => {
+        tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === id));
+        panes.forEach(p2 => p2.classList.toggle('active', p2.dataset.pane === id));
+        if (id === 'accounts') {
+          $$('.set-acct', el).forEach(card => { if (!card.dataset.loaded) fillToken(card); });
         }
-      }));
+        if (id === 'maa') suggestNames();
+        if (id === 'blacklist') paintBlCounts();
+      };
+      tabs.forEach(t => t.addEventListener('click', () => show(t.dataset.tab)));
+
+      // 页签上的小数字：账号数、黑名单总条数——不点进去也知道有没有东西
+      const paintTabN = () => {
+        const an = $('[data-tab-n="accounts"]', el);
+        if (an) an.textContent = (S.accounts || []).length || '';
+        const c = blOf();
+        const bn = $('[data-tab-n="blacklist"]', el);
+        if (bn) bn.textContent = (c.char + c.author + c.op) || '';
+      };
+      paintTabN();
+      // 打开设置的那一刻可能已经查到新版本了（启动 4 秒后查一次），
+      // 红点要立刻亮，不能等下一次轮询
+      renderAppDot();
+
+      /* ---------------- 通用：打开目录 / 选目录 ---------------- */
+      el.addEventListener('click', async e => {
+        const ob = e.target.closest('[data-open]');
+        if (ob) {
+          const api2 = nativeApi();
+          if (api2 && api2.open_folder) {
+            const r = await api2.open_folder(ob.dataset.open);
+            if (r && r.ok === false) toast(r.error || '打开失败', 'err');
+          } else {
+            toast('当前不是桌面窗口，无法打开目录', 'err');
+          }
+          return;
+        }
+        const pk2 = e.target.closest('[data-pick]');
+        if (pk2) {
+          const input = $('#' + pk2.dataset.pick, el);
+          if (input) await pickFolder(input);
+        }
+      });
+
+      /* ---------------- 账号管理：token ---------------- */
+      function setState(card, txt, cls) {
+        const box = $('[data-state]', card);
+        box.textContent = txt || '';
+        box.className = 'set-token-state' + (cls ? ' ' + cls : '');
+      }
+      function setTip(card, txt, cls) {
+        const box = $('[data-tip]', card);
+        box.textContent = txt || '';
+        box.className = 'set-tip' + (cls ? ' ' + cls : '');
+      }
+      // 掩码显示成「••••••oKPE」：后端给的是「…oKPE」，直接摆出来像个
+      // 被截断的字符串，补几个圆点才看得出「这是一段被藏起来的凭证」
+      const masked = m => (m && m.charAt(0) === '…'
+        ? '•'.repeat(16) + m.slice(1) : (m || ''));
+      function paintToken(card, d) {
+        const input = $('[data-token]', card);
+        const edit = $('[data-act="edit"]', card);
+        const rev = $('[data-act="reveal"]', card);
+        const chk = $('[data-act="check"]', card);
+        card.dataset.token = d.token || '';
+        card.dataset.mask = d.mask || '';
+        card.dataset.reveal = '0';
+        input.readOnly = true;
+        input.value = d.has ? (d.mask ? masked(d.mask) : '（密文）') : '';
+        input.placeholder = d.has ? '' : '这个账号没有 token';
+        rev.disabled = !d.token;
+        rev.textContent = '显示';
+        chk.disabled = !d.token;
+        if (!d.has) {
+          setState(card, '没有 token', 'bad');
+          setTip(card, '用 MAA 干员识别导入的账号没有森空岛 token，签到 / 抽卡统计用不了；'
+            + '点「添加」粘一个就行（同一账号练度数据不会被覆盖）。');
+          edit.disabled = false;
+          edit.textContent = '添加';
+        } else if (d.broken) {
+          setState(card, '✗ 密文解不开', 'bad');
+          setTip(card, d.error || '本机解不开这份密文');
+          edit.disabled = false;
+          edit.textContent = '重填';
+        } else {
+          setState(card, '已保存 · ' + (d.mask || ''), '');
+          setTip(card, '默认只读。点「验证」确认还能用；确认失效后才会解锁「修改」。');
+          edit.disabled = true;
+          edit.textContent = '修改';
+        }
+      }
+      async function fillToken(card) {
+        card.dataset.loaded = '0';
+        try {
+          const d = await api('/api/account/token', { file: card.dataset.file });
+          paintToken(card, d);
+          card.dataset.loaded = '1';
+        } catch (e2) {
+          setState(card, '读取失败', 'bad');
+          setTip(card, e2.message, 'bad');
+        }
+      }
+      function enterEdit(card) {
+        const input = $('[data-token]', card);
+        input.readOnly = false;
+        input.value = '';
+        input.placeholder = '粘贴新的森空岛 token';
+        input.focus();
+        ['reveal', 'check', 'edit'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = true; });
+        ['save', 'cancel'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = false; });
+        setState(card, '等待新 token', '');
+        setTip(card, '粘进来点保存：会先验证 token 是否有效、绑的是不是这个号，确认后才写回账号文件。');
+      }
+      function exitEdit(card) {
+        ['reveal', 'check', 'edit'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = false; });
+        ['save', 'cancel'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = true; });
+        fillToken(card);
+      }
+
+      $('#set-acct-list', el).addEventListener('click', async ev => {
+        const card = ev.target.closest('.set-acct');
+        const btn = ev.target.closest('[data-act]');
+        if (!card || !btn) return;
+        const file = card.dataset.file;
+        const act = btn.dataset.act;
+        const input = $('[data-token]', card);
+        if (act === 'reveal') {
+          const on = card.dataset.reveal === '1';
+          card.dataset.reveal = on ? '0' : '1';
+          input.value = on ? masked(card.dataset.mask) : (card.dataset.token || '');
+          btn.textContent = on ? '显示' : '隐藏';
+          return;
+        }
+        if (act === 'edit') { enterEdit(card); return; }
+        if (act === 'cancel') { exitEdit(card); return; }
+        if (act === 'save') {
+          const token = input.value.trim();
+          if (!token) { toast('先粘贴 token', 'warn'); input.focus(); return; }
+          btn.disabled = true;
+          btn.textContent = '验证中…';
+          try {
+            const d = await api('/api/account/token/set', { file, token });
+            ['save', 'cancel'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = true; });
+            ['reveal', 'check', 'edit'].forEach(a2 => { $('[data-act="' + a2 + '"]', card).hidden = false; });
+            paintToken(card, { has: true, token, mask: d.mask, broken: false, error: '' });
+            setState(card, '✓ 已更新 · ' + (d.mask || ''), 'ok');
+            toast('token 已更新');
+          } catch (e2) {
+            toast('保存失败：' + e2.message, 'err', 6000);
+          } finally {
+            btn.disabled = false;
+            btn.textContent = '保存';
+          }
+          return;
+        }
+        if (act === 'check') {
+          btn.disabled = true;
+          const old = btn.textContent;
+          btn.textContent = '验证中…';
+          setState(card, '验证中…（最长十几秒）', '');
+          try {
+            const d = await api('/api/account/token/check', { file });
+            if (d.ok) {
+              setState(card, '✓ 有效', 'ok');
+              setTip(card, 'token 还能用，不用改。');
+            } else {
+              setState(card, '✗ 已失效', 'bad');
+              setTip(card, (d.error || 'token 已失效') + '——点「修改」粘贴新的。', 'bad');
+              const edit = $('[data-act="edit"]', card);
+              edit.disabled = false;
+              edit.textContent = '修改';
+            }
+          } catch (e2) {
+            setState(card, '验证失败（网络？）', 'bad');
+            setTip(card, e2.message + '：没确认失效就不解锁修改，可以稍后再试。', 'bad');
+          } finally {
+            btn.disabled = false;
+            btn.textContent = old;
+          }
+          return;
+        }
+        if (act === 'del') {
+          deleteAccount(file, () => {
+            $('#set-acct-list', el).innerHTML = acctRows();
+            $$('.set-acct', el).forEach(c => fillToken(c));
+            // MAA 那页用的是另一份列表，删号后也得跟着少一行
+            $('#set-maa-list', el).innerHTML = maaRows();
+            paintBlCounts();
+            paintTabN();
+          });
+        }
+      });
+
+      /* ---------------- MAA 路径 ---------------- */
       $('#set-probe', el).addEventListener('click', async () => {
         const box = $('#set-maa-state', el);
         const dir = $('#set-maa', el).value.trim();
@@ -2633,11 +3106,128 @@ function openSettings() {
           box.textContent = r.exeExists
             ? (r.configExists ? `✓ 找到 MAA.exe，配置 ${r.profiles.length} 个` : '✗ 缺 config/gui.new.json')
             : '✗ 这个目录里没有 MAA.exe';
-        } catch (e) {
+        } catch (e2) {
           box.className = 'onb-hint bad';
-          box.textContent = '检测失败：' + e.message;
+          box.textContent = '检测失败：' + e2.message;
         }
       });
+      $('#set-maa-save', el).addEventListener('click', async () => {
+        const dir = $('#set-maa', el).value.trim();
+        const btn = $('#set-maa-save', el);
+        btn.disabled = true;
+        try {
+          const d = await saveSettings({ maaDir: dir });
+          S.settings = d.settings || S.settings;
+          renderMaaState();
+          fillBasketProfiles();
+          toast('默认 MAA 目录已保存');
+        } catch (e2) {
+          toast('保存失败：' + e2.message, 'err');
+        } finally { btn.disabled = false; }
+      });
+      $('#set-autostart', el).addEventListener('change', async ev => {
+        try { await saveSettings({ autoStartMaa: ev.target.checked }); }
+        catch (e2) { ev.target.checked = !ev.target.checked; toast('保存失败：' + e2.message, 'err'); }
+      });
+
+      $('#set-maa-list', el).addEventListener('click', async ev => {
+        const card = ev.target.closest('.set-maarow');
+        const btn = ev.target.closest('[data-act]');
+        if (!card || !btn) return;
+        const file = card.dataset.file;
+        const input = $('[data-f="dir"]', card);
+        const nameInput = $('[data-f="accountName"]', card);
+        const state = $('[data-state]', card);
+        if (btn.dataset.act === 'pick') { await pickFolder(input); return; }
+        if (btn.dataset.act === 'probe' || btn.dataset.act === 'profiles') {
+          const dir = input.value.trim() || (S.settings.maaDir || '');
+          if (!dir) { state.className = 'onb-hint bad'; state.textContent = '先填目录（或设置默认目录）'; return; }
+          state.className = 'onb-hint';
+          state.textContent = '检测中…';
+          try {
+            const r = await api('/api/maa/probe?dir=' + encodeURIComponent(dir));
+            if (!r.exeExists) {
+              state.className = 'onb-hint bad';
+              state.textContent = '✗ 这个目录里没有 MAA.exe';
+              return;
+            }
+            state.className = 'onb-hint ok';
+            state.textContent = `✓ MAA.exe 在，配置 ${r.profiles.length} 个`;
+            if (btn.dataset.act === 'profiles') {
+              const pf = await api('/api/maa/profiles?file=' + encodeURIComponent(file));
+              const rows = pf.profiles || [];
+              const acc = (S.accounts || []).find(x => x.file === file) || {};
+              const hit = rows.find(x => x.name === acc.maaProfile)
+                || rows.find(x => x.name === pf.current)
+                || (rows.length === 1 ? rows[0] : null);
+              if (hit && hit.accountName) {
+                nameInput.value = hit.accountName;
+                state.textContent = `✓ 从档案「${hit.name}」读到切号名 ${hit.accountName}，点保存生效`;
+              } else if (rows.length) {
+                toast('MAA 里有这些档案：' + rows.map(x => `${x.name}（${x.accountName || '空'}）`).join('、')
+                  + '，没敢替你猜，手动填一下切号名', 'warn', 7000);
+                state.textContent = '✓ 读到 ' + rows.length + ' 个档案，切号名请手动确认';
+              } else {
+                state.className = 'onb-hint bad';
+                state.textContent = '这个 MAA 里还没有配置档案';
+              }
+            }
+          } catch (e2) {
+            state.className = 'onb-hint bad';
+            state.textContent = '检测失败：' + e2.message;
+          }
+          return;
+        }
+        if (btn.dataset.act === 'save') {
+          btn.disabled = true;
+          btn.textContent = '保存中…';
+          try {
+            const patch = { dir: input.value.trim(), accountName: nameInput.value.trim() };
+            const r = await api('/api/account/maa', { file, patch });
+            const row = (S.accounts || []).find(x => x.file === file);
+            if (row) {
+              row.maaDir = (r.maa || {}).dir || '';
+              row.maaAccountName = (r.maa || {}).accountName || '';
+            }
+            state.className = 'onb-hint ok';
+            state.textContent = '✓ 已保存';
+            toast('「' + ((row && row.nickName) || '账号') + '」的 MAA 绑定已保存');
+          } catch (e2) {
+            state.className = 'onb-hint bad';
+            state.textContent = '✗ ' + e2.message;
+            toast('保存失败：' + e2.message, 'err', 6000);
+          } finally {
+            btn.disabled = false;
+            btn.textContent = '保存';
+          }
+        }
+      });
+
+      /* ---------------- MAA 绑定：没填切号名时给个提示 ----------------
+         切号名是唯一「必须问用户」的字段，猜错的代价又特别大（MAA 在账号
+         列表里死找、4 分钟超时）。所以不做自动填写，只在 MAA 档案里恰好
+         记着的时候提一句，让用户自己点「读档案」确认。 */
+      async function suggestNames() {
+        for (const card of $$('.set-maarow', el)) {
+          if (card.dataset.sug || $('[data-state]', card).textContent) continue;
+          if ($('[data-f="accountName"]', card).value.trim()) continue;
+          card.dataset.sug = '1';
+          try {
+            const pf = await api('/api/maa/profiles?file=' + encodeURIComponent(card.dataset.file));
+            const rows = pf.profiles || [];
+            const acc = (S.accounts || []).find(x => x.file === card.dataset.file) || {};
+            const hit = rows.find(x => x.name === acc.maaProfile)
+              || rows.find(x => x.name === pf.current);
+            if (hit && hit.accountName) {
+              const st = $('[data-state]', card);
+              st.className = 'onb-hint';
+              st.textContent = `MAA 档案「${hit.name}」里记着切号名 ${hit.accountName}，点「读档案」填入`;
+            }
+          } catch (e2) { /* 没装 MAA / 配置读不到：不打扰 */ }
+        }
+      }
+
+      /* ---------------- 版本更新 ---------------- */
       $('#set-pack-check', el).addEventListener('click', async () => {
         const btn = $('#set-pack-check', el);
         const msg = $('#set-pack-msg', el);
@@ -2647,9 +3237,9 @@ function openSettings() {
           const r = await packCheckNow();
           msg.textContent = r.text;
           toast(r.text, r.ok ? 'ok' : 'err', 4000);
-        } catch (e) {
+        } catch (e2) {
           msg.textContent = '检查失败';
-          toast('检查失败：' + e.message, 'err');
+          toast('检查失败：' + e2.message, 'err');
         } finally {
           btn.disabled = false;
         }
@@ -2675,17 +3265,22 @@ function openSettings() {
             close();
             setTimeout(openUpdateDialog, 160);
           }
-        } catch (e) {
+        } catch (e2) {
           msg.textContent = old;
-          toast('检查失败：' + e.message, 'err');
+          toast('检查失败：' + e2.message, 'err');
         } finally {
           btn.disabled = false;
         }
       });
-      $('#set-bl-char', el).addEventListener('click', () => openBlacklist('char'));
-      $('#set-bl-author', el).addEventListener('click', () => openBlacklist('author'));
-      $('#set-bl-op', el).addEventListener('click', openOpBlacklist);
-      $('#btn-save-set', el).addEventListener('click', async () => {
+      $('#set-autopack', el).addEventListener('change', async ev => {
+        try { await saveSettings({ autoUpdatePack: ev.target.checked }); }
+        catch (e2) { ev.target.checked = !ev.target.checked; toast('保存失败：' + e2.message, 'err'); }
+      });
+      $('#set-autocheck', el).addEventListener('change', async ev => {
+        try { await saveSettings({ autoCheckAppUpdate: ev.target.checked }); }
+        catch (e2) { ev.target.checked = !ev.target.checked; toast('保存失败：' + e2.message, 'err'); }
+      });
+      $('#set-proxy-save', el).addEventListener('click', async () => {
         const host = $('#set-proxy-host', el).value.trim();
         const port = $('#set-proxy-port', el).value.trim();
         if (port && !/^\d{1,5}$/.test(port)) {
@@ -2700,34 +3295,194 @@ function openSettings() {
         }
         // 两个都填了才启用代理；只填地址没填端口 = 直连
         const proxy = port ? ((host || 'http://127.0.0.1') + ':' + port) : '';
+        const btn = $('#set-proxy-save', el);
+        btn.disabled = true;
         try {
-          const d = await api('/api/settings', {
-            maaDir: $('#set-maa', el).value.trim(),
-            autoStartMaa: $('#set-autostart', el).checked,
-            autoUpdatePack: $('#set-autopack', el).checked,
-            autoCheckAppUpdate: $('#set-autocheck', el).checked,
-            proxy,
-          });
-          S.settings = d.settings;
-          S.maa = d.maa;
-          renderMaaState();
-          fillBasketProfiles();
-          close();
-          if (proxy) {
-            // 保存后探测一次真可用性；不可用也已保存——更新链路会自动直连回退
-            try {
-              const r = await api('/api/proxy/probe', { proxy });
-              toast(r.ok ? `代理可用（${r.tcpMs}ms 连上）`
-                : `代理不可用：${r.error}。已保存，更新时自动直连`,
-                r.ok ? 'ok' : 'warn', 5200);
-            } catch (e) { toast('代理已保存，但检测失败：' + e.message, 'warn', 5200); }
-          } else {
-            toast('设置已保存');
+          await saveSettings({ proxy });
+          if (!proxy) { toast('已改为直连'); return; }
+          try {
+            const r = await api('/api/proxy/probe', { proxy });
+            toast(r.ok ? `代理可用（${r.tcpMs}ms 连上）`
+              : `代理不可用：${r.error}。已保存，更新时自动直连`,
+              r.ok ? 'ok' : 'warn', 5200);
+          } catch (e2) {
+            toast('代理已保存，但检测失败：' + e2.message, 'warn', 5200);
           }
-        } catch (e) { toast('保存失败：' + e.message, 'err'); }
+        } catch (e2) {
+          toast('保存失败：' + e2.message, 'err');
+        } finally { btn.disabled = false; }
       });
-    }
+
+      /* ---------------- 助手设置 ---------------- */
+      const ag = S.agent || {};
+      const agState = $('#set-ag-state', el);
+      const paintAgent = d => {
+        agState.className = 'onb-hint ' + (d && d.configured ? 'ok' : 'bad');
+        agState.textContent = !d ? ''
+          : d.configured ? `✓ 已就绪，用 ${d.model}`
+            : (d.hasKey ? '✗ 还差模型名' : '✗ 还差 API Key');
+      };
+      const fillAgent = d => {
+        if (!d) return;
+        $('#set-ag-url', el).value = d.baseUrl || '';
+        $('#set-ag-model', el).value = d.model || '';
+        $('#set-ag-auto', el).checked = !!d.autoApply;
+        $('#set-ag-clear', el).disabled = !d.hasKey;
+        $('#set-ag-key', el).value = '';
+        $('#set-ag-key', el).placeholder = d.hasKey ? '已保存，留空不改' : 'sk-...';
+        paintAgent(d);
+      };
+      (async () => {
+        try {
+          const d = await api('/api/agent/status');
+          S.agent = d;
+          fillAgent(d);
+        } catch (e2) { agState.textContent = '读取状态失败：' + e2.message; }
+      })();
+      $('#set-ag-clear', el).addEventListener('click', async () => {
+        try {
+          await api('/api/agent/config', { apiKey: '' });
+          S.agent = await api('/api/agent/status');
+          fillAgent(S.agent);
+          chatInit();
+          toast('已清除 API Key');
+        } catch (e2) { toast(e2.message, 'err'); }
+      });
+      $('#set-ag-save', el).addEventListener('click', async () => {
+        const url = $('#set-ag-url', el).value.trim();
+        const model = $('#set-ag-model', el).value.trim();
+        const key = $('#set-ag-key', el).value.trim();
+        if (!url) { toast('先填 Base URL', 'warn'); $('#set-ag-url', el).focus(); return; }
+        if (!model) { toast('先填模型名', 'warn'); $('#set-ag-model', el).focus(); return; }
+        const btn = $('#set-ag-save', el);
+        btn.disabled = true;
+        btn.textContent = '保存中…';
+        try {
+          const patch = { baseUrl: url, model, autoApply: $('#set-ag-auto', el).checked };
+          if (key) patch.apiKey = key;
+          await api('/api/agent/config', patch);
+          S.agent = await api('/api/agent/status');
+          fillAgent(S.agent);
+          chatInit();
+          toast(S.agent.configured ? '助手已就绪' : '已保存，但还差 API Key',
+            S.agent.configured ? 'ok' : 'warn');
+        } catch (e2) {
+          toast('保存失败：' + e2.message, 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '保存';
+        }
+      });
+
+      /* ---------------- 黑名单 ---------------- */
+      function paintBlCounts() {
+        const c = blOf();
+        ['char', 'author', 'op'].forEach(k => {
+          const box = $('[data-bl-count="' + k + '"]', el);
+          if (box) box.textContent = c[k];
+        });
+        paintTabN();
+      }
+      el.addEventListener('click', ev => {
+        const b = ev.target.closest('[data-bl]');
+        if (!b) return;
+        const kind = b.dataset.bl;
+        if (kind === 'op') openOpBlacklist(paintBlCounts);
+        else openBlacklist(kind, paintBlCounts);
+      });
+
+      // 默认页就是账号管理：打开先把 token 读出来（读的是本机密文，很快）。
+      // 之前只在切页时触发，结果打开设置看到一排「读取中…」永远不动。
+      $$('.set-acct', el).forEach(c => fillToken(c));
+    },
   });
+}
+
+/* ------------------------------------------------------------ 内置助手连接参数（设置 → 二级弹窗）
+   单独一页的理由：塞进主设置弹窗会把它撑到 900px 以上，API Key 输入框和「保存」
+   全被挤到折叠线以下——用户看到的现象就是「点不到、也没有保存按钮」。
+   另外 API Key 是 password，早先只给 input[type=text] 写了样式，密码框会露出
+   浏览器默认的白底，在深色弹窗里像个空洞。两处都修了。 */
+function openAgentSettings(onSaved) {
+  const ag = S.agent || {};
+  const m = modal(`
+    <h3>内置助手</h3>
+    <div class="sub">OpenAI 兼容协议，DeepSeek / 通义 / Kimi / 中转站 / 本地 Ollama 都能填。
+      API Key 用 Windows DPAPI 加密存在本机，换电脑解不开、也不会上传。</div>
+    <label class="field"><span>Base URL</span>
+      <input type="text" id="ag-url" value="${esc(ag.baseUrl || '')}"
+             placeholder="https://api.deepseek.com/v1"></label>
+    <label class="field"><span>模型名</span>
+      <input type="text" id="ag-model" value="${esc(ag.model || '')}"
+             placeholder="deepseek-chat"></label>
+    <label class="field"><span>API Key${ag.hasKey ? '（已保存，留空表示不改）' : ''}</span>
+      <div class="path-row">
+        <input type="password" id="ag-key" value="" autocomplete="off" spellcheck="false"
+               placeholder="${ag.hasKey ? '已保存，留空不改' : 'sk-...'}">
+        <button class="btn-plain mini" id="ag-clear"
+                ${ag.hasKey ? '' : 'disabled'} title="删掉已保存的 Key">清除</button>
+      </div></label>
+    <label class="check-row">
+      <input type="checkbox" id="ag-auto" ${ag.autoApply ? 'checked' : ''}>
+      <span>写 MAA 时不再问我，直接执行（关掉更安全：每次写入前都弹确认）</span>
+    </label>
+    <div class="onb-hint" id="ag-state" style="margin-top:12px"></div>
+    <div class="modal-foot">
+      <button class="btn-plain" data-close>取消</button>
+      <button class="btn-solid" id="ag-save">保存</button>
+    </div>
+  `, {
+    onMount(el, close) {
+      const state = $('#ag-state', el);
+      const paint = d => {
+        state.className = 'onb-hint ' + (d && d.configured ? 'ok' : 'bad');
+        state.textContent = !d ? ''
+          : d.configured ? `✓ 已就绪，用 ${d.model}`
+            : (d.hasKey ? '✗ 还差模型名' : '✗ 还差 API Key');
+      };
+      paint(ag);
+
+      $('#ag-clear', el).addEventListener('click', async () => {
+        try {
+          await api('/api/agent/config', { apiKey: '' });
+          S.agent = await api('/api/agent/status');
+          $('#ag-key', el).value = '';
+          $('#ag-clear', el).disabled = true;
+          paint(S.agent);
+          chatInit();
+          if (onSaved) onSaved();
+          toast('已清除 API Key');
+        } catch (e) { toast(e.message, 'err'); }
+      });
+
+      $('#ag-save', el).addEventListener('click', async () => {
+        const url = $('#ag-url', el).value.trim();
+        const model = $('#ag-model', el).value.trim();
+        const key = $('#ag-key', el).value.trim();
+        if (!url) { toast('先填 Base URL', 'warn'); $('#ag-url', el).focus(); return; }
+        if (!model) { toast('先填模型名', 'warn'); $('#ag-model', el).focus(); return; }
+        const btn = $('#ag-save', el);
+        btn.disabled = true;
+        btn.textContent = '保存中…';
+        try {
+          const patch = { baseUrl: url, model, autoApply: $('#ag-auto', el).checked };
+          if (key) patch.apiKey = key;
+          await api('/api/agent/config', patch);
+          S.agent = await api('/api/agent/status');
+          chatInit();
+          if (onSaved) onSaved();
+          close();
+          toast(S.agent.configured ? '助手已就绪' : '已保存，但还差 API Key',
+            S.agent.configured ? 'ok' : 'warn');
+        } catch (e) {
+          toast('保存失败：' + e.message, 'err');
+          btn.disabled = false;
+          btn.textContent = '保存';
+        }
+      });
+    },
+  });
+  return m;
 }
 
 /* ------------------------------------------------------------ 黑名单管理（设置 → 二级弹窗）
@@ -2739,7 +3494,7 @@ function openSettings() {
    不勾=整个干员；作者输名字反查（/api/author/suggest），输纯数字直接当 id。
    增删改即时保存；干员黑名单变了立即回刷当前搜索结果（纯显示过滤），
    作者黑名单变了在关闭时重搜一次（过滤在后端）。 */
-function openBlacklist(kind) {
+function openBlacklist(kind, onDone) {
   const isChar = kind === 'char';
   const key = isChar ? 'charBlacklist' : 'authorBlacklist';
   const items = () => {
@@ -2790,6 +3545,7 @@ function openBlacklist(kind) {
     <div class="bl-list" id="bl-list"></div>
     <div class="modal-foot"><button class="btn-plain" id="bl-close">关闭</button></div>
   `, {
+    onClose: onDone,
     onMount(el, close) {
       const render = () => {
         const list = items();
@@ -3045,7 +3801,7 @@ function openBlacklist(kind) {
 /* ------------------------------------------------------------ 作业黑名单（设置 → 二级弹窗）
    条目就是 MAA 代码（maa://12345），软件级、不跟账号走；过滤在后端
    （fetch_ops 出口按代码滤），与作者黑名单一样改完关闭时重搜一次。 */
-function openOpBlacklist() {
+function openOpBlacklist(onDone) {
   let dirty = false;
   modal(`
     <h3>作业黑名单</h3>
@@ -3057,6 +3813,7 @@ function openOpBlacklist() {
     <div class="bl-list" id="obl-list"></div>
     <div class="modal-foot"><button class="btn-plain" id="obl-close">关闭</button></div>
   `, {
+    onClose: onDone,
     onMount(el, close) {
       const render = () => {
         const list = S.settings.opBlacklist || [];
@@ -3123,13 +3880,13 @@ function currentGame() {
 
 function applyModuleAvailability() {
   const ef = currentGame() === 'endfield';
-  // 终末地账号只留抽卡统计：作业获取、森空岛签到两枚 tab 都不显示
+  // 终末地账号只留助手与抽卡统计：作业获取、森空岛签到两枚 tab 都不显示
   // （签到本身支持终末地，全局签到照样会签，只是不给终末地账号开这块界面）
   ['copilot', 'signin'].forEach(m => {
     const b = $('.modtab[data-mod="' + m + '"]');
     if (b) b.hidden = ef;
   });
-  if (ef && S.module !== 'gacha') {
+  if (ef && S.module !== 'gacha' && S.module !== 'chat') {
     S.gachaByGame = true;              // 终末地没有作业获取，只能看抽卡统计（记一笔是被账号逼的）
     setModule('gacha', true);
   } else if (!ef && S.gachaByGame) {
@@ -3141,12 +3898,15 @@ function applyModuleAvailability() {
     renderGacha();
   } else if (S.module === 'signin') {
     renderSignin();                    // 签到面板上的「当前账号」跟着换
+  } else if (S.module === 'chat') {
+    chatInit();                        // 换号后助手面板里的上下文提示要跟着变
   }
 }
 
 function setModule(mod, byGame) {
   if (!byGame) S.gachaByGame = false;   // 用户自己点的模块，之后别被账号切走
-  if (mod !== 'gacha' && currentGame() === 'endfield') mod = 'gacha';
+  // 助手跟游戏无关，终末地账号也能用，别被强行拽回抽卡统计
+  if (mod !== 'gacha' && mod !== 'chat' && currentGame() === 'endfield') mod = 'gacha';
   S.module = mod;
   $$('.modtab').forEach(b => {
     const on = b.dataset.mod === mod && !b.disabled;
@@ -3154,14 +3914,17 @@ function setModule(mod, byGame) {
     b.setAttribute('aria-selected', on ? 'true' : 'false');
   });
   const cp = $('#mod-copilot'), gg = $('#mod-gacha'), sg = $('#mod-signin');
+  const ct = $('#mod-chat');
   if (cp) cp.hidden = mod !== 'copilot';
   if (gg) gg.hidden = mod !== 'gacha';
   if (sg) sg.hidden = mod !== 'signin';
-  // 抽卡统计/签到都用不到右栏作业集：收掉第三列，主区拿满宽度
+  if (ct) ct.hidden = mod !== 'chat';
+  // 抽卡统计/签到/助手都用不到右栏作业集：收掉第三列，主区拿满宽度
   $('#app').classList.toggle('no-basket', mod !== 'copilot');
   if (mod !== 'copilot') toggleBasket(false);
   if (mod === 'gacha') renderGacha();
   if (mod === 'signin') renderSignin();
+  if (mod === 'chat') enterChat(); else leaveChat();
 }
 
 /* ------------------------------------------------------------ 森空岛签到 */
@@ -3574,4 +4337,613 @@ document.addEventListener('DOMContentLoaded', () => {
   bindGlobal();
   renderBasket();
   boot();
+});
+
+/* ============================================================ 内置助手 */
+
+/* 轻量 markdown 渲染：整篇先做 HTML 转义再按行解析，所以不存在标签注入。
+   助手的回复主要是加粗 / 列表 / 表格 / 代码，支持这些就够；
+   星号等原样标记绝不直接透给用户（2026-11-17 用户反馈「不能显示那星号」）。 */
+function mdToHtml(src) {
+  const escd = esc(String(src || ''));
+  const lines = escd.split('\n');
+  let out = '';
+  let inCode = false;
+  let codeBuf = [];
+  let listTag = null;          // 'ul' | 'ol'
+  let paraBuf = [];
+  let tableBuf = null;
+
+  const mdInline = s => s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/__([^_]+)__/g, '<b>$1</b>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<i>$2</i>')
+    .replace(/~~([^~]+)~~/g, '<s>$1</s>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  const closeList = () => { if (listTag) { out += '</' + listTag + '>'; listTag = null; } };
+  const flushPara = () => {
+    if (paraBuf.length) { out += '<p>' + paraBuf.map(mdInline).join('<br>') + '</p>'; paraBuf = []; }
+  };
+  const flushTable = () => {
+    if (!tableBuf) return;
+    const rows = tableBuf; tableBuf = null;
+    const cells = r => r.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(s => s.trim());
+    let head = null, from = 0;
+    if (rows.length >= 2 && /^[\s|:\-]+$/.test(rows[1])) { head = cells(rows[0]); from = 2; }
+    out += '<table class="md-table">';
+    if (head) out += '<thead><tr>' + head.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead>';
+    out += '<tbody>' + rows.slice(from).map(r =>
+      '<tr>' + cells(r).map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
+  };
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (inCode) {
+      if (/^```/.test(line)) { inCode = false; out += '<pre><code>' + codeBuf.join('\n') + '</code></pre>'; codeBuf = []; }
+      else codeBuf.push(line);
+      continue;
+    }
+    if (/^```/.test(line)) { flushPara(); flushTable(); closeList(); inCode = true; continue; }
+    // 表格行：|a|b| 形式，连续收集
+    if (/^\s*\|.*\|\s*$/.test(line)) { flushPara(); closeList(); (tableBuf = tableBuf || []).push(line.trim()); continue; }
+    flushTable();
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      flushPara(); closeList();
+      const lvl = Math.min(4, m[1].length + 1);   // # 用 h2，往下 h3/h4，别压过页面标题
+      out += '<h' + lvl + ' class="md-h">' + mdInline(m[2]) + '</h' + lvl + '>';
+      continue;
+    }
+    if (/^(&gt;|\>)\s?/.test(line)) {
+      flushPara(); closeList();
+      out += '<blockquote>' + mdInline(line.replace(/^(&gt;|\>)\s?/, '')) + '</blockquote>';
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { flushPara(); closeList(); out += '<hr>'; continue; }
+    if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) {
+      flushPara();
+      if (listTag !== 'ul') { closeList(); out += '<ul>'; listTag = 'ul'; }
+      out += '<li>' + mdInline(m[1]) + '</li>';
+      continue;
+    }
+    if ((m = line.match(/^\s*\d+[.、]\s+(.*)$/))) {
+      flushPara();
+      if (listTag !== 'ol') { closeList(); out += '<ol>'; listTag = 'ol'; }
+      out += '<li>' + mdInline(m[1]) + '</li>';
+      continue;
+    }
+    if (!line.trim()) { flushPara(); closeList(); continue; }
+    closeList();
+    paraBuf.push(line);
+  }
+  if (inCode) out += '<pre><code>' + codeBuf.join('\n') + '</code></pre>';
+  flushPara(); flushTable(); closeList();
+  return out;
+}
+
+const CHAT = {
+  session: '',
+  since: 0,
+  timer: null,
+  open: false,
+  sending: false,
+  nodes: new Map(),      // 事件序号 → DOM，流式文本要靠它原地更新
+  sideTasks: new Set(),  // 已在右栏跟踪的任务 taskId，重渲染别重复跟
+  cfg: null,
+};
+
+/* 助手引导卡片：示例问句必须和「现在真能做的事」对得上——早先那几条
+   （「我还差哪些关没打」「推荐养哪些干员」）助手根本没有对应数据源，点了
+   只会兜圈子。下面每一条都对着一个已实现的 skill，点下去就能真跑。 */
+const CHAT_STARTERS = [
+  ['帮我把最新活动 S 关卡挂完',
+   '帮我把最新活动的 S 关卡挂完'],
+  ['帮我把将进酒活动普通关卡挂完',
+   '帮我把将进酒活动的普通关卡挂完'],
+  ['所有账号森空岛签到',
+   '帮我把所有账号的森空岛签到都签了'],
+  ['活动商店清一遍（别买龙门币、固源岩）',
+   '清一下最新活动的商店，黑名单里加龙门币、固源岩、技巧概要、赤金'],
+  ['把泥岩精二，三技能专三',
+   '把泥岩精二，三技能专三，材料不够就停下来告诉我'],
+  ['现在跑到哪了？卡住了吗？',
+   '现在跑到哪了？卡住了吗？'],
+];
+
+function chatEmptyHtml() {
+  return `<div class="chat-beta">
+      <b>测试版</b>
+      <span>助手还在 Beta，功能会变，<b>也真的可能出错</b>。
+        自动战斗、切号这类操作跑起来时，请瞄一眼右边的「任务进度」；
+        跑歪了把日志发出来，我们照着改。</span>
+    </div>
+    <p>现在能做的事（点一条试试）：</p>`
+    + CHAT_STARTERS.map(([label, ask]) =>
+      `<button class="chat-chip" data-ask="${esc(ask)}">${esc(label)}</button>`).join('');
+}
+
+/* 只在空态里补内容：一旦有对话记录，chatRender 会把整块删掉 */
+function paintChatEmpty() {
+  const el = $('#chat-empty');
+  if (el && !el.dataset.painted) {
+    el.dataset.painted = '1';
+    el.innerHTML = chatEmptyHtml();
+    bindChatChips(el);
+  }
+}
+
+function chatScroll(force) {
+  const box = $('#chat-body');
+  if (!box) return;
+  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  if (force || near) box.scrollTop = box.scrollHeight;
+}
+
+/* 右栏执行日志跟随滚动（日志在底部追加，用户往上翻了就不打扰） */
+function chatSideScroll() {
+  const box = $('#chat-side-log');
+  if (!box) return;
+  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  if (near) box.scrollTop = box.scrollHeight;
+}
+
+/* 一条事件怎么显示：user 是气泡；say/error 是 markdown 渲染后的正文
+   （助手回报告常用 **加粗** 和表格，纯文本会把星号漏给用户）；
+   tool/tool_result 回到聊天流（左侧小字一行）。
+   tool_result 带 taskId 时，右栏自动跟踪这个任务的进度日志——
+   原本只有点「看进度」弹窗才能看到的日志，现在直接流到右边。 */
+function chatNode(ev) {
+  const wrap = document.createElement('div');
+  const kind = ev.kind;
+  if (kind === 'user') {
+    wrap.className = 'msg user' + (ev.streaming ? ' streaming' : '');
+    wrap.innerHTML = '<div class="msg-body">' + esc(ev.text || '') + '</div>';
+  } else if (kind === 'say' || kind === 'error') {
+    wrap.className = 'msg ' + kind + (ev.streaming ? ' streaming' : '');
+    wrap.dataset.raw = ev.text || '';
+    wrap.innerHTML = '<div class="msg-body">' + mdToHtml(ev.text || '') + '</div>';
+  } else if (kind === 'tool') {
+    wrap.className = 'msg tool' + (ev.streaming ? ' streaming' : '');
+    wrap.innerHTML = '<span class="t-dot"></span><span class="t-text">'
+      + esc(toolLabel(ev.name, ev.args)) + '</span>';
+  } else if (kind === 'tool_result') {
+    // 报错的那条别用绿点：工具失败在面板上得一眼能看出来
+    const bad = /"error"\s*:/.test(ev.text || '');
+    wrap.className = 'msg tool done' + (bad ? ' bad' : '');
+    const tid = chatTaskId(ev);
+    wrap.innerHTML = '<span class="t-dot"></span><span class="t-text">'
+      + esc(toolResultLabel(ev)) + '</span>'
+      + (tid ? '<button class="t-go">看进度</button>' : '');
+    if (tid) {
+      wrap.querySelector('.t-go').addEventListener('click', () => {
+        chatTaskModal(tid, ev.name);
+      });
+      sideTaskWatch(tid, ev.name);
+    }
+  } else if (kind === 'need_confirm') {
+    wrap.className = 'msg';
+    wrap.innerHTML = '<div class="chat-confirm">'
+      + '<div class="c-title">需要你确认</div>'
+      + '<div class="c-text">' + esc(ev.text || '') + '</div>'
+      + '<div class="c-btns"><button class="go">确认执行</button>'
+      + '<button class="no">取消</button></div></div>';
+    wrap.querySelector('.go').addEventListener('click', confirmChat);
+    wrap.querySelector('.no').addEventListener('click', cancelChat);
+  } else {
+    return null;
+  }
+  wrap.dataset.i = ev.i;
+  return wrap;
+}
+
+const TOOL_NAMES = {
+  list_accounts: '看账号列表',
+  list_activities: '看有哪些活动',
+  search_stages: '核对关卡号',
+  find_ops: '找作业',
+  op_detail: '看作业缺什么',
+  account_progress: '看游戏进度',
+  run_status: '看 MAA 跑到哪了',
+  maa_capabilities: '查 MAA 能配什么',
+  list_profiles: '看配置档案',
+  plan_multi_account: '排多账号方案',
+  build_run: '配任务并开跑',
+  apply_plan: '开跑',
+  add_stages: '挂关卡',
+  stop_run: '停止挂机',
+  // 挂关 skill 化（2026-11-17）
+  skill_wakeup: '唤醒游戏',
+  skill_navigate: '导航活动',
+  skill_skip_story: '过剧情关',
+  skill_fight: '自动战斗',
+  skill_weekly: '周目编排',
+  skill_signin: '森空岛签到',
+};
+
+function toolLabel(name, args) {
+  const base = TOOL_NAMES[name] || ('调用 ' + name);
+  const kw = args && (args.keyword || args.copilot_id || args.plan_id);
+  return kw ? base + '（' + kw + '）' : base;
+}
+
+function toolResultLabel(ev) {
+  const base = TOOL_NAMES[ev.name] || ev.name;
+  let t = ev.text || '';
+  let brief = '';
+  let bad = false;
+  try {
+    const d = JSON.parse(t.length >= 1200 ? t.slice(0, 1200) : t);
+    if (d.error) { brief = d.error; bad = true; }
+    else if (d.count != null) brief = d.count + ' 条';
+    else if (d.summary) brief = d.summary;
+    else if (d.rows) brief = d.rows.length + ' 关';
+    else if (d.accounts) brief = d.accounts.length + ' 个账号';
+    else if (d.explain) brief = d.explain.text || '';
+    else if (d.state) brief = d.state;
+  } catch (e) { /* 截断的 JSON 解析不了，就不带摘要 */ }
+  return base + (brief ? ' · ' + brief : '') + (bad ? ' ✗' : ' ✓');
+}
+
+/* 写入类工具会把活丢给后台任务（写 MAA 要关客户端、重启、跑图，几十秒到几十分钟），
+   返回的是 taskId 而不是结果。面板上原本没地方看这个任务，就在那条记录右侧挂个入口。
+   JSON 可能被截断（后端只传前 1200 字），直接正则捞，别指望 JSON.parse 成功。 */
+function chatTaskId(ev) {
+  const m = (ev.text || '').match(/"taskId"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : '';
+}
+
+/* ---------------- skill 联调测试 ----------------
+   目的：不用聊天、不用摆确认卡，直接把一句话喂给模型，看它选哪个 skill、
+   参数抽得对不对，勾「直接跑」还能立刻动模拟器（例如停在主页测导航）。
+   走 POST /api/skill/try（agent.try_skill）：只挂指定工具 / 全工具任选。 */
+const SKILL_TEST_OPTS = [
+  ['', '全部（让模型自己选）'],
+  ['skill_navigate', '导航到活动 · skill_navigate'],
+  ['skill_wakeup', '唤醒游戏 · skill_wakeup'],
+  ['skill_fight', '自动战斗 · skill_fight'],
+  ['skill_skip_story', '过剧情关 · skill_skip_story'],
+  ['skill_signin', '森空岛签到 · skill_signin'],
+  ['skill_weekly', '周目编排 · skill_weekly'],
+];
+
+function chatSkillTest() {
+  const opts = SKILL_TEST_OPTS.map(([v, t]) =>
+    '<option value="' + esc(v) + '">' + esc(t) + '</option>').join('');
+  const m = modal(`
+    <h3>skill 联调测试</h3>
+    <div class="sub">把一句话交给大模型，看它选哪个 skill、参数抽得对不对。勾「直接跑」会立刻动模拟器。</div>
+    <div class="st-row">
+      <span class="st-label">限定 skill</span>
+      <select id="st-skill">${opts}</select>
+    </div>
+    <div class="st-row">
+      <span class="st-label">说一句话</span>
+      <input id="st-text" type="text" placeholder="例如：我现在停在主页，帮我导航到 MN 界面" />
+    </div>
+    <label class="st-check"><input type="checkbox" id="st-run" /> 直接跑（跳过确认卡）</label>
+    <div class="st-out" id="st-out" hidden></div>
+    <div class="modal-foot">
+      <button class="btn-plain" data-close>关闭</button>
+      <button class="btn-primary" id="st-go">让模型解析</button>
+    </div>
+  `);
+  const go = m.el.querySelector('#st-go');
+  const out = m.el.querySelector('#st-out');
+  const input = m.el.querySelector('#st-text');
+  input.focus();
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); go.click(); }
+  });
+  go.addEventListener('click', async () => {
+    const text = input.value.trim();
+    if (!text) { input.focus(); return; }
+    go.disabled = true;
+    out.hidden = false;
+    out.innerHTML = '<div class="st-dim">问模型中…</div>';
+    try {
+      const r = await api('/api/skill/try', {
+        text: text,
+        skill: m.el.querySelector('#st-skill').value || '',
+        run: m.el.querySelector('#st-run').checked,
+      });
+      let h = '';
+      if (r.picked) {
+        h += '<div class="st-pick">选了 <b>' + esc(r.picked) + '</b>'
+          + (r.matched === false ? ' <span class="st-bad">（不是指定的那个）</span>' : '')
+          + '</div>';
+        h += '<div class="st-dim">参数</div><pre class="st-args">'
+          + esc(JSON.stringify(r.args || {}, null, 2)) + '</pre>';
+      }
+      if (r.said) h += '<div class="st-dim">模型的说明</div><div class="st-said">'
+        + mdToHtml(r.said) + '</div>';
+      if (r.note) h += '<div class="st-note">' + esc(r.note) + '</div>';
+      if (r.taskId) {
+        h += '<div class="st-run-row"><span>taskId ' + esc(r.taskId) + '</span>'
+          + '<button class="t-go" id="st-prog">看进度</button></div>';
+      }
+      out.innerHTML = h;
+      if (r.taskId) {
+        sideTaskWatch(r.taskId, r.picked);
+        const b = out.querySelector('#st-prog');
+        if (b) b.addEventListener('click', () => chatTaskModal(r.taskId, r.picked));
+      }
+    } catch (e) {
+      out.innerHTML = '<div class="st-note">' + esc(String(e.message || e)) + '</div>';
+    } finally {
+      go.disabled = false;
+    }
+  });
+  return m;
+}
+
+function chatTaskModal(tid, name) {
+  const title = TOOL_NAMES[name] || name || '任务';
+  const m = modal(`
+    <h3>${esc(title)} · 进度</h3>
+    <div class="sub">活已经交给后台了，关掉这个窗口不影响它继续跑</div>
+    <div class="log-box chat-task-log" id="task-log"></div>
+    <div class="modal-foot"><button class="btn-plain" data-close>在后台跑</button></div>
+  `);
+  pollTask(tid, m.el).catch(() => { });
+  return m;
+}
+
+/* 右栏跟踪一个后台任务的进度日志：skill / build_run 一启动，日志就流进来，
+   不用再点「看进度」开弹窗（弹窗还在，想单独看大图可以用）。
+   一个任务只跟一遍（Set 挡重渲染重复跟踪）；多个任务并发时日志按到达顺序
+   混排，每段开头有任务名一行做分隔。 */
+function sideTaskWatch(tid, name) {
+  if (!tid || CHAT.sideTasks.has(tid)) return;
+  CHAT.sideTasks.add(tid);
+  const box = $('#chat-side-log');
+  if (!box) return;
+  const empty = $('#chat-side-empty');
+  if (empty) empty.remove();
+  const head = document.createElement('div');
+  head.className = 'side-task-head';
+  head.textContent = '▶ ' + (TOOL_NAMES[name] || name || '任务')
+    + ' · ' + tid.slice(0, 8);
+  box.appendChild(head);
+  chatSideScroll();
+  // root 给 body（永远 isConnected），让 pollTask 把日志写进右栏盒子
+  pollTask(tid, document.body, '#chat-side-log').catch(() => { });
+}
+
+function chatRender(events) {
+  const body = $('#chat-body');
+  if (!body) return;
+  const empty = $('#chat-empty');
+  if (empty && events.length) empty.remove();
+  let streaming = null;
+  for (const ev of events) {
+    let node = CHAT.nodes.get(ev.i);
+    if (!node) {
+      node = chatNode(ev);
+      if (!node) continue;
+      CHAT.nodes.set(ev.i, node);
+      // 所有事件都进聊天流（tool/tool_result 是左侧小字行）；
+      // 右栏只放后台任务的进度日志，由 sideTaskWatch 负责
+      body.appendChild(node);
+    } else if (ev.kind === 'say' || ev.kind === 'user' || ev.kind === 'error') {
+      if (ev.kind === 'user') {
+        const b = node.querySelector('.msg-body');
+        if (b && b.textContent !== (ev.text || '')) b.textContent = ev.text || '';
+      } else if (node.dataset.raw !== (ev.text || '')) {
+        // say / error：markdown 渲染，流式更新时按最新全文重渲
+        node.dataset.raw = ev.text || '';
+        const b = node.querySelector('.msg-body');
+        if (b) b.innerHTML = mdToHtml(ev.text || '');
+      }
+    }
+    if (ev.kind === 'say') streaming = node;
+    chatScroll(false);
+  }
+  // 除了最后一条，之前的「正在输入」光标都收掉
+  body.querySelectorAll('.msg.say.streaming').forEach(n => {
+    if (n !== streaming) n.classList.remove('streaming');
+  });
+  if (streaming && CHAT.sending) streaming.classList.add('streaming');
+  chatScroll(false);
+}
+
+function chatPoll() {
+  if (!CHAT.open) return;
+  clearTimeout(CHAT.timer);
+  const tick = async () => {
+    if (!CHAT.open) return;     // 面板被关掉就彻底停下，别再空转
+    try {
+      const d = await api('/api/chat/poll?session=' + encodeURIComponent(CHAT.session)
+        + '&since=' + CHAT.since);
+      if (d.events && d.events.length) {
+        CHAT.since = Math.max(CHAT.since, d.next || 0);
+        chatRender(d.events);
+      }
+      if (d.events && d.events.length) {
+        const last = d.events[d.events.length - 1];
+        if (last.kind === 'done') CHAT.sending = false;
+      }
+      CHAT.sending = !!d.running;
+      chatBusy(d.running);
+      // 流式输出时要勤查，空闲时可以放慢
+      CHAT.timer = setTimeout(tick, d.running ? 320 : 1600);
+    } catch (e) {
+      CHAT.timer = setTimeout(tick, 2000);
+    }
+  };
+  tick();
+}
+
+function chatBusy(on) {
+  const b = $('#chat-send');
+  if (b) b.disabled = !!on || !$('#chat-input').value.trim();
+}
+
+async function chatInit() {
+  try {
+    CHAT.cfg = await api('/api/agent/status');
+  } catch (e) { CHAT.cfg = null; }
+  const ok = !!(CHAT.cfg && CHAT.cfg.configured);
+  const m = $('#chat-model');
+  if (m) m.textContent = ok ? CHAT.cfg.model : '未配置模型';
+
+  // 没配好就只留「去配置」这一条：示例问句点了也只会报错，不如不给
+  const empty = $('#chat-empty');
+  if (empty) empty.hidden = !ok;
+  const input = $('#chat-input'), send = $('#chat-send');
+  if (input) {
+    input.disabled = !ok;
+    input.placeholder = ok
+      ? '说人话就行，例如：帮我把最新活动 S 关卡挂完'
+      : '先配置模型才能用';
+  }
+  if (send) send.disabled = !ok;
+
+  const body = $('#chat-body');
+  if (!ok && body && !body.querySelector('.chat-setup')) {
+    const tip = document.createElement('div');
+    tip.className = 'chat-empty chat-setup';
+    tip.innerHTML = '<p>还没配置模型，配好就能用了：</p>'
+      + '<button class="chat-chip" id="chat-go-setup">配置模型（Base URL / 模型名 / API Key）</button>';
+    body.appendChild(tip);
+    const btn = $('#chat-go-setup');
+    if (btn) btn.addEventListener('click', () => openAgentSettings());
+  } else if (ok) {
+    // 配好了就把那条提示撤掉，别留在面板上
+    const t = $('#chat-body .chat-setup');
+    if (t) t.remove();
+  }
+}
+
+/* 助手是模块 tab 里的一页，不再有开/关——切到这一页就开始轮询，切走就停。
+   之前是右下角浮层，`position: fixed` 压不住设置弹窗（层级打过架），
+   而且用户想找它得先在角落里发现一个气泡。 */
+function enterChat() {
+  CHAT.open = true;
+  chatInit().then(() => {
+    chatScroll(true);
+    chatPoll();
+    setTimeout(() => {
+      const i = $('#chat-input');
+      if (i && !CHAT.sending) i.focus();
+    }, 60);
+  });
+}
+
+function leaveChat() {
+  CHAT.open = false;
+  clearTimeout(CHAT.timer);
+}
+
+async function sendChat(text) {
+  text = String(text || '').trim();
+  if (!text || CHAT.sending) return;
+  const input = $('#chat-input');
+  if (input) { input.value = ''; input.style.height = 'auto'; }
+  CHAT.sending = true;
+  chatBusy(true);
+  try {
+    const r = await api('/api/chat', { session: CHAT.session, text });
+    CHAT.session = r.session || CHAT.session;
+    chatPoll();
+  } catch (e) {
+    CHAT.sending = false;
+    toast(e.message, 'err');
+  }
+}
+
+async function confirmChat() {
+  if (!CHAT.session) return;
+  try {
+    await api('/api/chat/confirm', { session: CHAT.session });
+    CHAT.sending = true;
+    chatPoll();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function cancelChat() {
+  try { await api('/api/chat/cancel', { session: CHAT.session }); } catch (e) { }
+  chatPoll();
+}
+
+async function resetChat() {
+  try { await api('/api/chat/reset', { session: CHAT.session }); } catch (e) { }
+  CHAT.nodes.forEach(n => n.remove());
+  CHAT.nodes.clear();
+  CHAT.since = 0;
+  const body = $('#chat-body');
+  if (body) {
+    body.innerHTML = '<div class="chat-empty" id="chat-empty"></div>';
+    paintChatEmpty();
+  }
+  // 右栏执行日志一起清掉
+  const side = $('#chat-side-log');
+  if (side) side.innerHTML = '<div class="chat-side-empty" id="chat-side-empty">skill / 后台任务的进度日志会显示在这里。</div>';
+  chatInit();
+}
+
+function bindChatChips(root) {
+  $$('.chat-chip[data-ask]', root || document).forEach(b => {
+    if (b.dataset.bound) return;
+    b.dataset.bound = '1';
+    b.addEventListener('click', () => sendChat(b.dataset.ask));
+  });
+}
+
+function bindChat() {
+  const input = $('#chat-input');
+  if (!input) return;
+  $('#chat-reset').addEventListener('click', resetChat);
+  const st = $('#chat-skilltest');
+  if (st) st.addEventListener('click', chatSkillTest);
+  const logClear = $('#chat-log-clear');
+  if (logClear) logClear.addEventListener('click', () => {
+    const side = $('#chat-side-log');
+    if (side) side.innerHTML = '<div class="chat-side-empty" id="chat-side-empty">skill / 后台任务的进度日志会显示在这里。</div>';
+  });
+  $('#chat-send').addEventListener('click', () => sendChat(input.value));
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(118, input.scrollHeight) + 'px';
+    chatBusy(CHAT.sending);
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendChat(input.value);
+    }
+  });
+  bindChatChips(document);
+  paintChatEmpty();     // 引导卡片是 JS 生成的，index.html 里只留一个空壳
+}
+
+/* 侧栏：MAA 现在跑到哪（读 /api/watch/status，只读，不碰 MAA） */
+let _runStripTimer = null;
+async function refreshRunStrip() {
+  const box = $('#run-strip');
+  if (!box) return;
+  try {
+    const d = await api('/api/watch/status');
+    const ex = d.explain || {};
+    if (!d.state || d.state === 'idle') {
+      box.className = 'run-strip';
+      box.textContent = '';
+      return;
+    }
+    const level = ex.level || 'ok';
+    box.className = 'run-strip ' + level;
+    let html = esc(ex.text || d.state);
+    if (d.resumeCount) html += ' · 已自动恢复 ' + d.resumeCount + ' 次';
+    if (ex.hint && level !== 'ok') html += '<span class="rs-hint">' + esc(ex.hint) + '</span>';
+    box.innerHTML = html;
+  } catch (e) {
+    box.textContent = '';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  bindChat();
+  refreshRunStrip();
+  _runStripTimer = setInterval(refreshRunStrip, 15000);
 });

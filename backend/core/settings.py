@@ -192,6 +192,16 @@ DEFAULTS = {
     'opBlacklist': [],            # 作业黑名单：['maa://12345']，直接存 MAA 代码
     'lastAccount': '',
     'accountOrder': [],     # 账号列表手动排序（长按拖动保存的文件名顺序）
+    # 环境检测（envcheck.py）：模拟器路径默认从 MAA 的 gui.new.json 里抄，
+    # 这里只在用户手动指定时覆盖（比如 MAA 里没配、或者想指向另一个实例）
+    'emulatorPath': '',
+    'emulatorAutoStart': True,   # 任务开跑前发现模拟器没启动，替用户启动
+    # 内置助手：只存连接参数，apiKey 走 DPAPI 单独存 config/agent.key
+    'agent': {
+        'baseUrl': 'https://api.deepseek.com/v1',
+        'model': 'deepseek-chat',
+        'autoApply': False,   # 关掉时，写 MAA 前必须用户点确认
+    },
 }
 
 _lock = threading.RLock()
@@ -239,6 +249,31 @@ def load() -> dict:
         data['opBlacklist'] = _norm_op_blacklist(data.get('opBlacklist'))
         _cache = data
         return copy.deepcopy(data)
+
+
+def _norm_agent(v) -> dict:
+    """助手连接配置：Base URL / 模型名 / 是否免确认
+
+    只做最小清洗，不在这里校验连通性——保存时网络不通不该让用户存不上。
+    Base URL 接受「只填域名」和「带 /v1」两种写法，统一补成 OpenAI 兼容的
+    形式（末尾不带斜杠），后面拼 ``/chat/completions``。
+    """
+    cur = dict(DEFAULTS['agent'])
+    if isinstance(v, dict):
+        for k in cur:
+            if k in v:
+                cur[k] = v[k]
+    url = str(cur.get('baseUrl') or '').strip().rstrip('/')
+    if url and not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    # 用户从各家文档里粘的多半是 .../v1/chat/completions，把尾巴去掉
+    for tail in ('/chat/completions', '/completions'):
+        if url.endswith(tail):
+            url = url[:-len(tail)]
+    cur['baseUrl'] = url
+    cur['model'] = str(cur.get('model') or '').strip()[:64]
+    cur['autoApply'] = bool(cur.get('autoApply'))
+    return cur
 
 
 def _norm_dir(v: str) -> str:
@@ -373,6 +408,13 @@ def save(patch: dict) -> dict:
                 v = _norm_op_blacklist(v)
             elif k == 'accountOrder':
                 v = [str(x) for x in (v or []) if str(x).endswith('.json')][:200]
+            elif k == 'emulatorPath':
+                v = _norm_dir(v) if v else ''
+            elif k == 'emulatorAutoStart':
+                # 前端可能传 "false" / 0 / 空串，别让字符串 "false" 变成真
+                v = bool(v) and str(v).strip().lower() not in ('0', 'false', 'no', '')
+            elif k == 'agent':
+                v = _norm_agent(v)
             cur[k] = v
         # maaDir 每次保存都并入历史列表（大小写不敏感去重）
         if cur.get('maaDir'):

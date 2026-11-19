@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import py_compile
@@ -36,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -786,8 +788,10 @@ def check_copilot_variants():
     assert copilot.entry_variants(3, 'normal') == [False], '从普通行加通用作业只写普通'
     assert copilot.entry_variants(3, 'raid') == [True], '从突袭行加通用作业只写突袭'
     assert copilot.entry_variants(3, None) == [False, True], '不指定行时按难度展开'
-    assert copilot.entry_variants(2, 'normal') == [True], '普通行里没有普通作业的兜底'
-    assert copilot.entry_variants(1, 'raid') == [False]
+    # 选了哪一行就写哪一行，不再拿作业自己的位标志改主意（2026-11-19 用户报
+    # 「选了突袭还是只打普通」：标漏/通用位作业被静默写成 IsRaid=false）
+    assert copilot.entry_variants(2, 'normal') == [False], '选了普通行就写普通'
+    assert copilot.entry_variants(1, 'raid') == [True], '选了突袭行就写突袭'
 
     # 资源层：变体关不重复出现，主关带 raid 标记
     nl_ex1 = resources.resolve('NL-EX-1')['stages']
@@ -1055,13 +1059,22 @@ def check_story_stage_filter():
     left = [c for c in codes if resources._is_story({'id': '', 'code': c})]
     assert not left, '_stages() 里还有剧情关：%s' % left[:5]
 
-    # 4. 搜剧情关代号拿不到结果；战斗关照常能搜到
+    # 4. 搜剧情关代号：给一张「剧情关」卡（mode=story），不能当成战斗关返回。
+    #    以前是整条过滤掉、搜了落空；现在能看到这一关存在，但挂不了机
     for kw in ('NL-ST-1', 'EG-3'):
         r = resources.resolve(kw)
-        assert not r['stages'], '搜 %s 不该有结果，实际 %d 关' % (kw, len(r['stages']))
+        assert r['mode'] == 'story', '搜 %s 应返回剧情卡，实际 %s' % (kw, r['mode'])
+        assert r['stages'] and all(s['story'] for s in r['stages']), \
+            '%s 返回了非剧情关' % kw
     r = resources.resolve('NL-10')
     assert r['mode'] == 'stage' and len(r['stages']) == 1, \
         'NL-10 是战斗关，必须还能搜到：%r' % r['mode']
+
+    # 4.5 代号既是剧情关、又是章节前缀时（12-1 / 12-10 ~ 12-19），
+    #     必须展开成章节系列，不能被剧情卡抢走
+    r = resources.resolve('12-1')
+    assert r['mode'] == 'activity' and len(r['stages']) > 3, \
+        '12-1 应展开成第 12 章系列，实际 %s / %d 关' % (r['mode'], len(r['stages']))
 
     # 5. 活动展开不带剧情关，但战斗关一个不能少
     r = resources.resolve('act13side')
@@ -1575,6 +1588,599 @@ def check_copilot_rank_band():
 
 
 # ---------------------------------------------------------------- B23 作业黑名单
+def check_story_stages(_tmp):
+    """B29：剧情关双视图 + 森空岛进度解析
+
+    剧情关（资源包里 story=True 的 208 条）以前被 _stages() 整条丢掉，导致
+    两件事：搜 9-1 / TL-ST-1 这类「只有剧情关才有的代号」会落空；森空岛
+    activity.zones 的 totalStage 含剧情关，两边口径永远对不上。
+    """
+    from core import progress, resources as R
+
+    plain = R._stages()
+    full = R._stages(True)
+    assert all(not s['story'] for s in plain), '默认视图里混进了剧情关'
+    stories = [s for s in full if s['story']]
+    assert len(stories) == 208, '剧情关应为 208 条，实际 %d' % len(stories)
+    assert len(full) - len(plain) == len(stories), '两个视图的差应正好是剧情关条数'
+
+    # 剧情关代号精确命中：TL-ST-1 这种前缀不可能被章节抢占；
+    # 主线剧情关用 stageId 精确查（9-1 这个代号要让位给「第 9 章系列」展开，
+    # 因为 9-10 ~ 9-19 都以它开头，见 B18 的 4.5）
+    r = R.resolve('TL-ST-1')
+    assert r['mode'] == 'story' and r['stages'][0]['stageId'] == 'act55side_st01'
+    r = R.resolve('st_09-01')
+    assert r['mode'] == 'story' and r['stages'][0]['code'] == '9-1', \
+        'stageId 精确查剧情关失败：%r' % r['mode']
+
+    # 系列搜索不带剧情关，但能算出「这一段里有几个剧情关」
+    r = R.resolve('TL-')
+    assert r['stages'] and not any(s['story'] for s in r['stages']), 'TL- 系列混进了剧情关'
+    tips = R.stories_between(r['stages'])
+    assert {s['code'] for s in tips} >= {'TL-ST-1', 'TL-ST-2'}, 'TL 系列的剧情关没找出来'
+    assert all(s['story'] for s in tips), 'stories_between 返回了非剧情关'
+
+    # 推图不能跳进剧情关
+    nxt = R.next_stage({'stageId': 'main_09-01', 'difficulty': 'normal'})
+    assert nxt and not R.story_of(nxt['stageId']), 'next_stage 指到了剧情关'
+    after = R.stages_after('st_09-01')
+    assert after and after[0]['code'] == '9-2', '剧情关之后应该是 9-2'
+    assert not any(s['story'] for s in after), 'stages_after 里混进了剧情关'
+
+    # 森空岛进度解析（结构取自 player/info 的真实返回）
+    probe = {
+        'status': {'level': 71, 'mainStageProgress': 'st_09-01',
+                   'ap': {'current': 561, 'max': 127}},
+        'campaign': {'records': [{'campaignId': 'camp_01', 'maxKills': 400},
+                                 {'campaignId': 'camp_03', 'maxKills': 271}]},
+        'activity': [{'actId': 'act55side', 'actReplicaId': 'act55side',
+                      'zones': [{'zoneReplicaId': 'act55side_zone1',
+                                 'clearedStage': 3, 'totalStage': 6}]}],
+        'routine': {'daily': {'current': 1, 'total': 10},
+                    'weekly': {'current': 0, 'total': 13}},
+    }
+    pr = progress.parse(probe)
+    assert pr['main']['story'] is True and pr['main']['remaining'] > 0, '主线进度没解析出来'
+    assert pr['main']['next']['code'] == '9-2', '主线下一关应是 9-2'
+    assert [c['id'] for c in pr['campaign']] == ['camp_03', 'camp_01'], '没打满的剿灭应排前面'
+    assert pr['campaign'][0]['full'] is False and pr['campaign'][1]['full'] is True
+    assert pr['campaign'][0]['name'] == '龙门市区', 'camp_03 应叫龙门市区'
+    a = pr['activities'][0]
+    assert a['left'] == 3 and a['matched'] is True, '活动 zone 余量算错'
+    assert a['name'] == '时间啊，向前！', '活动名应取正式名'
+    assert pr['ap']['current'] == 561 and pr['routine']['daily']['total'] == 10
+    assert progress.summary(pr)['mainRemaining'] == pr['main']['remaining']
+
+
+# ---------------------------------------------------------------- B30 日志观测
+def check_asstlog(_tmp):
+    """B30：MAA 日志观测（增量读 / 轮转 / 事件归一 / 停滞判定 / 运行记录）
+
+    这一层完全靠日志，不认识图。所以 MAA 升级改了格式，最坏结果只能少几个
+    事件，不能抛异常——下面每条断言都在守这件事。
+    """
+    import time as _t
+    from core import asstlog as A
+
+    maa_dir = os.path.join(_tmp, 'obs')
+    dbg = os.path.join(maa_dir, 'debug')
+    os.makedirs(dbg, exist_ok=True)
+    asst = os.path.join(dbg, 'asst.log')
+    gui = os.path.join(dbg, 'gui.log')
+
+    def stamp(ts):
+        return _t.strftime('%Y-%m-%d %H:%M:%S', _t.localtime(ts)) \
+            + '.%03d' % int((ts % 1) * 1000)
+
+    def line(ts, body, tag='INF'):
+        return '[%s][%s][Px1][Tx1] %s' % (stamp(ts), tag, body)
+
+    now = _t.time()
+    stage_body = ('SubTaskExtraInfo {"class":"asst::MultiCopilotTaskPlugin",'
+                  '"details":{"file_name":"config\\\\copilot\\\\TL-1_101.json","id":0,'
+                  '"stage_name":"act55side_01"},"subtask":"MultiCopilotTask",'
+                  '"taskchain":"Copilot","taskid":1,'
+                  '"what":"CopilotListLoadTaskFileSuccess"}')
+    node_body = ('{"class":"asst::ProcessTask","cur_task":"Copilot@WaitUntilEndOfAction",'
+                 '"details":{"cur_retry":18,"retry_times":20,'
+                 '"to_be_recognized":["Copilot@SkipThePreBattlePlot",'
+                 '"Copilot@EndOfAction"]},"subtask":"ProcessTask",'
+                 '"taskchain":"Copilot","taskid":1}')
+    with open(asst, 'w', encoding='utf-8') as f:
+        f.write(line(now - 40, stage_body) + '\n')
+        f.write(line(now - 30, node_body) + '\n')
+    with open(gui, 'w', encoding='utf-8') as f:
+        f.write(line(now - 45, 'AsstProxy | <2> Start Task Chain: Copilot, Task ID: 1') + '\n')
+
+    w = A.Watcher(maa_dir, live=False)
+    snap = w.poll()
+    assert snap['state'] == 'running', '有链起点 + 新日志应判在跑：%r' % snap['state']
+    assert snap['stage'] == 'act55side_01', snap['stage']
+    assert snap['index'] == 0, snap['index']
+    assert snap['node'] == 'Copilot@WaitUntilEndOfAction', snap['node']
+    assert (snap['retry'], snap['retryTotal']) == (18, 20), snap['retry']
+
+    # 增量：只读新追加的那一行，旧的不重复计数
+    with open(asst, 'a', encoding='utf-8') as f:
+        f.write(line(now - 5, stage_body.replace('act55side_01', 'act55side_02')
+                     .replace('"id":0', '"id":1')) + '\n')
+    snap = w.poll()
+    assert snap['newEvents'] == 1, '增量读多算了：%d' % snap['newEvents']
+    assert snap['stage'] == 'act55side_02', snap['stage']
+
+    # 轮转：asst.log 被清空重写（变小）后要能从头读，不能卡在旧 offset
+    # （用单独的目录，否则前面造的两关数据会被这一步冲掉）
+    d3 = os.path.join(_tmp, 'obs3')
+    os.makedirs(os.path.join(d3, 'debug'), exist_ok=True)
+    f3 = os.path.join(d3, 'debug', 'asst.log')
+    with open(f3, 'w', encoding='utf-8') as f:
+        f.write(line(now - 40, stage_body) + '\n')
+    w3 = A.Watcher(d3, live=False)
+    assert w3.poll()['stage'] == 'act55side_01'
+    with open(f3, 'w', encoding='utf-8') as f:
+        f.write(line(now - 2, stage_body.replace('act55side_01', 'act55side_09')) + '\n')
+    assert w3.poll()['stage'] == 'act55side_09', '轮转后没重新读'
+
+    # 停滞：最后一条日志停在 200 秒前、重试已经打满 → stalled（不是 running）
+    d2 = os.path.join(_tmp, 'obs2')
+    os.makedirs(os.path.join(d2, 'debug'), exist_ok=True)
+    with open(os.path.join(d2, 'debug', 'gui.log'), 'w', encoding='utf-8') as f:
+        f.write(line(now - 200, 'AsstProxy | <2> Start Task Chain: Copilot, Task ID: 1') + '\n')
+    with open(os.path.join(d2, 'debug', 'asst.log'), 'w', encoding='utf-8') as f:
+        f.write(line(now - 195, node_body) + '\n')
+    snap2 = A.Watcher(d2, live=False).poll()
+    assert snap2['state'] == 'stalled', '停了 3 分钟该判停滞：%r' % snap2['state']
+    ex = A.explain(snap2)
+    assert ex['level'] == 'bad' and '卡' in ex['text'], ex
+    assert ex['hint'], '停滞要给下一步提示'
+
+    # clean_done：链跑完就收工，不能一直挂在 running
+    with open(os.path.join(d2, 'debug', 'gui.log'), 'a', encoding='utf-8') as f:
+        f.write(line(now - 1, 'AsstProxy | <2> Completed Task Chain: Copilot, Task ID: 1') + '\n')
+    snap3 = A.Watcher(d2, live=False).poll()
+    assert snap3['state'] == 'done', snap3['state']
+    assert A.explain(snap3)['level'] == 'ok'
+
+    # 运行记录：每换一关切一段，同一关的重复上报合并
+    rows = A.failures(maa_dir, limit=10)
+    assert len(rows) >= 2, '应能还原出至少两关：%r' % rows
+    assert rows[0]['stageId'] == 'act55side_01', rows[0]
+    assert all(r['code'] for r in rows), '运行记录要带关卡代号（查不到就回退 stageId）'
+
+    # 认不出的行一律跳过，绝不抛
+    for junk in ('', '乱七八糟一行', '[2026-11-16 10:00:00.000][ERR][Px1][Tx1] 报错',
+                 '{"class":"asst::X"', '[]'):
+        assert A.norm_asst(junk) is None, '非事件行不该产出事件：%r' % junk
+        assert A.norm_gui(junk) is None
+
+
+# ---------------------------------------------------------------- B31 多账号
+def check_multiacct(tmp):
+    """B31：多账号编排（切号名归一 / 一账号一档案 / AccountName 写入）"""
+    from core import copilot, multiacct as M, settings
+
+    _reset_config(tmp)
+    # 切号名：MAA 是子串匹配，官方说明允许「123****4567 / 4567 / 23****45」
+    # 三种写法。以前只认 3 位+4 星+4 位，用户照文档只给尾号就被判非法，
+    # 助手只能反复追问，最后任务出不来（2026-11-17）。
+    from core import acctname
+    assert M.norm_account_name('5505') == '5505', '尾号要原样保留（MAA 认）'
+    assert M.norm_account_name('1815505') == '181****5505'
+    assert M.norm_account_name('18112345505') == '181****5505', '完整手机号也要能补成掩码'
+    assert M.norm_account_name('181****5505') == '181****5505'
+    assert M.norm_account_name('23****45') == '23****45', '部分掩码别被压星号'
+    # 星号数量 / 全角 / 分隔符都不该让用户重填
+    for raw, want in (('181＊5505', '181****5505'), ('181*5505', '181****5505'),
+                      ('181***5505', '181****5505'), ('181 5505', '181****5505'),
+                      ('181-5505', '181****5505'), ('（181）5505', '181****5505'),
+                      ('１２３＊５５０５', '123****5505'),
+                      ('181****  5505', '181****5505')):
+        assert M.norm_account_name(raw) == want, (raw, M.norm_account_name(raw))
+    assert M.norm_account_name('小卡拉帕鲁灰') == '小卡拉帕鲁灰'
+    assert M.norm_account_name('灰bao#0384') == '灰bao#0384', 'B 服用户名带 # 别被吃掉'
+    assert M.norm_account_name('') == ''
+    # 校验：官服只拦昵称，格式问题不归用户
+    assert acctname.check('5505', '官服') == ('5505', '')
+    assert acctname.check('136', '官服') == ('136', ''), '本机档案里就有 3 位片段'
+    assert acctname.check('23****45', '官服')[0] == '23****45'
+    nm, why = acctname.check('小卡拉帕鲁灰', '官服')
+    assert nm is None and '后 4 位' in why, (nm, why)
+    assert acctname.check('小卡拉帕鲁灰', 'bilibili服')[0] == '小卡拉帕鲁灰'
+    assert acctname.is_official_channel('') is True, '渠道缺失按官服算'
+    assert acctname.is_official_channel('B服') is False
+    # 档案名撞了就加序号，不覆盖用户原来的档案
+    # 一律带 PRTS- 前缀：绝不覆盖用户自己那份档案
+    taken = {'PRTS-a', 'PRTS-a_2'}
+    assert M._profile_name('a', 'x', taken) == 'PRTS-a_3'
+    assert M._profile_name('', '', set()) == 'PRTS-acct'
+
+    # 排不出方案时必须明确说缺什么，不能悄悄返回一个空方案
+    p = M.plan({'keyword': '', 'accounts': []})
+    assert not p['ok'] and (p.get('missing') or p.get('error')), \
+        '排不出方案要说明原因：%r' % p
+
+    # 账号绑的 maaProfile 是**档案名**（moren / 136），不是切号名。拿它填
+    # StartUp.AccountName，MAA 切号必然失败，整轮挂机死在「登录」这一步。
+    old_c = M.candidates
+    M.candidates = lambda: [{'file': 'x.json', 'name': '测试号',
+                             'nickName': '测试号', 'channel': '官服',
+                             'maaProfile': 'moren', 'accountName': '',
+                             'maaDir': '', 'progress': {}}]
+    try:
+        pl = M.plan({'keyword': '', 'accounts': []})
+        whys = {m.get('what') for m in pl['missing']}
+        assert 'accountName' in whys, pl
+        assert all(not r.get('accountName') for r in pl['accounts']), \
+            '档案名不能冒充切号名：%r' % pl['accounts']
+        # 用户给尾号就能过，且原样写进 rows
+        pl = M.plan({'keyword': '', 'accounts': [], 'names': {'x.json': '5505'}})
+        assert pl['accounts'][0]['accountName'] == '5505', pl['accounts'][0]
+    finally:
+        M.candidates = old_c
+
+    # 假 MAA 目录：一个账号 → 一个档案，AccountName 与开关都写进去
+    md = os.path.join(tmp, 'fakemaa')
+    os.makedirs(os.path.join(md, 'config'), exist_ok=True)
+    cfg = {'Current': 'Default', 'Configurations': {'Default': {
+        'TaskQueue': [{'$type': 'StartUpTask', 'AccountName': '',
+                       'AccountSwitchEnabled': False, 'TaskType': 'StartUp',
+                       'Name': '开始唤醒', 'IsEnable': True}],
+        'Copilot': {'TaskList': []},
+    }}}
+    with open(os.path.join(md, 'config', 'gui.new.json'), 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False)
+
+    old_fetch = copilot.fetch_prepared
+    # 不联网：假装作业已经下好了
+    copilot.fetch_prepared = lambda cid, *a, **k: (
+        {'stage_name': 'main_01-07', 'opers': []}, 1, 'main_01-07', [], True)
+    try:
+        plan = {'maaDir': md, 'accounts': [{
+            'file': 'x.json', 'name': '测试号', 'accountName': '181****5505',
+            'profile': '181****5505', 'reuse': False,
+            'ops': [{'copilotId': 1, 'stageCode': '1-7', 'title': 't'}],
+        }]}
+        res = M.apply(plan)
+        assert res['profiles'] == ['PRTS-181****5505'], res
+        with open(os.path.join(md, 'config', 'gui.new.json'), encoding='utf-8') as f:
+            cfg2 = json.load(f)
+        prof = cfg2['Configurations']['PRTS-181****5505']
+        su = prof['TaskQueue'][0]
+        assert su['AccountName'] == '181****5505', '切号名没写进 StartUpTask'
+        assert su['AccountSwitchEnabled'] is True, '没打开切号开关'
+        tl = prof['Copilot']['TaskList']
+        assert len(tl) == 1 and tl[0]['CopilotId'] == 1, tl
+        # 模板档案本身不能被改动
+        assert cfg2['Configurations']['Default']['Copilot']['TaskList'] == []
+
+        # set_tasklist / set_current：续跑与切号的底层，索引要重排
+        from core import maa
+        maa.set_current('PRTS-181****5505', md, close_first=False)
+        assert maa.profiles(md)['current'] == 'PRTS-181****5505'
+        maa.set_tasklist(tl, 'PRTS-181****5505', md, close_first=False)
+        got = maa.tasklist('PRTS-181****5505', md)['items']
+        assert len(got) == 1 and got[0]['Index'] == 0
+        try:
+            maa.set_current('不存在', md, close_first=False)
+            raise AssertionError('切到不存在的档案应该报错')
+        except ValueError:
+            pass
+    finally:
+        copilot.fetch_prepared = old_fetch
+
+
+# ---------------------------------------------------------------- B32 助手与 CLI
+def check_agent_cli(tmp):
+    """B32：内置助手的工具白名单 + 写操作闸门 + CLI 契约"""
+    import contextlib
+    import io as _io
+    import time as _t
+
+    from core import agent, settings
+    import cli
+
+    _reset_config(tmp)
+    _patch_settings(tmp)      # 造账号/读账号都落在 tmp/config，别碰隔离根
+    # 工具表与实现必须一一对应：多一个没实现 = 模型调到就崩
+    names = {t['function']['name'] for t in agent.TOOLS}
+    handlers = set(agent._HANDLERS) | set(agent._WRITE_HANDLERS)
+    assert names == handlers, '工具表与实现不一致：%r' % (names ^ handlers)
+    for t in agent.TOOLS:
+        fn = t['function']
+        assert fn.get('description'), '工具缺描述：' + fn['name']
+        assert fn['parameters']['type'] == 'object'
+
+    # 模型给错工具名不能把 loop 炸掉
+    r = agent.run_tool('does_not_exist', {})
+    assert isinstance(r, dict) and r.get('error'), '未知工具应返回 error'
+
+    # 工具内部异常也要兜住
+    r = agent.run_tool('op_detail', {'copilot_id': 'not-a-number'})
+    assert isinstance(r, dict) and r.get('error'), '坏参数应兜成 error'
+    assert r.get('hint'), '内部异常要带 hint，否则模型会原样重试同一个调用'
+
+    # 账号字段对齐：list_accounts() 给的是 nickName/alias/channelName，
+    # progress.summary() 给的是 mainRemaining/activityLeft。助手工具曾直接
+    # 下标 'name'（KeyError，一问进度就报错）、又去取不存在的 'mainLeft' /
+    # 'activityZones'（全是 null）。同一个坑踩过两次（CLI 一次、助手一次），
+    # 这里用真实账号文件钉住字段名。
+    acc = {
+        'account': {'uid': '123', 'nickName': '测试号#0001',
+                    'channelName': '官服', 'game': 'arknights', 'level': 120},
+        'progress': {
+            'main': {'stageId': 'main_15-17', 'code': '15-19', 'name': '直至，此刻',
+                     'remaining': 5,
+                     'next': {'code': '15-20', 'stageId': 'main_15-18',
+                              'name': '得以重回'}},
+            'campaign': [],
+            'activities': [{'name': '孤星', 'left': 3, 'matched': True}],
+        },
+    }
+    with open(os.path.join(tmp, 'config', '测试号#0001 官服.json'),
+              'w', encoding='utf-8') as f:
+        json.dump(acc, f, ensure_ascii=False)
+    rows = agent.run_tool('list_accounts', {})['accounts']
+    assert len(rows) == 1, '账号列表应读到造的账号：%r' % rows
+    row = rows[0]
+    assert row['name'] == '测试号#0001', '账号名要取 nickName/alias：%r' % row
+    assert row['channel'] == '官服', row
+    assert row['mainLeft'] == 5, 'mainLeft 要取 summary 的 mainRemaining：%r' % row
+    assert row['mainKnown'] is True and row['activityLeft'] == 1, row
+    pg = agent.run_tool('account_progress', {'account': row['file']})
+    assert pg['summary']['mainRemaining'] == 5, pg
+    assert pg['summary']['mainKnown'] is True, pg
+    # 主线缺数据时不能靠 0 推断「已推完」
+    acc['progress']['main'] = None
+    with open(os.path.join(tmp, 'config', '测试号#0001 官服.json'),
+              'w', encoding='utf-8') as f:
+        json.dump(acc, f, ensure_ascii=False)
+    pg = agent.run_tool('account_progress', {'account': row['file']})
+    assert pg['summary']['mainKnown'] is False, 'main=null 要标成没数据：%r' % pg
+
+    # 切号名：助手只问尾号，用户给什么格式都得吃下（原来 3+4 星+4 的死正则
+    # 把「照 MAA 文档填的 5505」判成非法，助手反复追问，任务出不来）
+    f = row['file']
+    got, miss, err = agent._roster([], {f: '5505'}, '')
+    assert not err and not miss and got[0]['accountName'] == '5505', (got, miss)
+    for raw in ('181 5505', '181＊5505', '18112345505', '1815505'):
+        got, miss, _ = agent._roster([], {f: raw}, '')
+        assert got and got[0]['accountName'] == '181****5505', (raw, got, miss)
+    # 清掉上面几轮写回账号文件的切号名，否则会走「saved」分支蒙过去
+    from core import accounts as _accounts
+    _accounts.save_maa_meta(f, {'accountName': ''})
+    got, miss, _ = agent._roster([], {f: '测试号#0001'}, '')
+    assert not got and miss, ('官服填昵称必须拦下（否则切号死循环）', got, miss)
+    assert '后 4 位' in miss[0]['question'], miss[0]['question']
+
+    # 写操作在 autoApply 关闭时必须停下来等用户点确认
+    settings.save({'agent': {'baseUrl': 'https://api.deepseek.com/v1',
+                             'model': 'deepseek-chat', 'autoApply': False}})
+    agent._plans['t1'] = {'at': _t.time(), 'plan': {
+        'maaDir': '', 'totalStages': 1, 'totalOps': 1,
+        'accounts': [{'name': '测试号', 'accountName': '181****5505',
+                      'ops': [{'stageCode': '1-7', 'copilotId': 1}]}],
+    }}
+    s = agent.Session()
+    out = agent.run_tool('apply_plan', {'plan_id': 't1'}, s)
+    assert out.get('need_confirm') is True, out
+    assert s.pending and s.pending['action'] == 'apply_plan', s.pending
+    assert '测试号' in (out.get('summary') or ''), '确认文案要写清楚给谁挂什么'
+
+    # 助手没配 Key 时，状态要如实说「不能用」，不能假装可用
+    st = agent.status()
+    assert st['configured'] is False and st['hasKey'] is False
+    # apiKey 绝不回显
+    assert 'apiKey' not in st and 'key' not in st, st
+
+    # CLI：输出形状 + 退出码是给外部 harness 的契约
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(['doctor', '--maa-dir', os.path.join(tmp, 'nope')])
+    body = json.loads(buf.getvalue())
+    assert body['command'] == 'doctor' and 'ok' in body, body
+    assert body['data']['ready'] is False, '空目录不该判就绪'
+    assert rc in (0, 1, 2, 3), rc
+
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(['no_such_cmd'])
+    assert rc == 2, '未知命令应回 2'
+    assert json.loads(buf.getvalue())['ok'] is False
+
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(['stages'])
+    assert rc == 2, '缺参数应回 2'
+    assert 'hint' in json.loads(buf.getvalue())['error'], '错误要带 hint'
+
+    # 关卡命令的出口必须过 resources：模型/脚本给的代号查不到就明确报错
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(['stages', 'TL-'])
+    body = json.loads(buf.getvalue())
+    assert rc == 0 and body['data']['stages'], body
+    assert any(s['code'] == 'TL-1' for s in body['data']['stages'])
+
+    # 位置参数要跳过 --opt value：``ops --account 号.json TL-5`` 曾经把账号名
+    # 当成关卡关键词
+    assert cli._positionals(['--account', '号.json', 'TL-5']) == ['TL-5']
+    assert cli._positionals(['TL-5', '--limit', '2']) == ['TL-5']
+
+    # ``plan --stages TL-5`` 是文档里的写法，但 --stages 同时被当成数量上限，
+    # 于是 int('TL-5') 直接炸 ValueError。不联网：把 plan 换成假的抓参数。
+    seen = {}
+    old_plan = cli.multiacct.plan
+    cli.multiacct.plan = lambda req: (seen.update(req)
+                                      or {'ok': False, 'warnings': ['测试']})
+    try:
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(['plan', '--stages', 'TL-5', '--limit', '2'])
+    finally:
+        cli.multiacct.plan = old_plan
+    assert rc == cli.EXIT_DECIDE, '排不出方案应回 3（该问用户），实际 %r' % rc
+    assert seen.get('keyword') == 'TL-5', seen
+    assert seen.get('limitStages') == 2, '--limit 要进 limitStages：%r' % seen
+
+
+
+# ---------------------------------------------------------------- B33 任务编排
+def check_maaplan(tmp):
+    """B33：任务编排（GUI 队列 / 直连序列 / 档案隔离）
+
+    两条路线各自的契约：
+    - GUI 路线写 ``<档案>.TaskQueue``，**绝不能**放 Copilot —— MAA 的
+      ``TaskQueueViewModel.InitializeItems`` 不认识 CopilotTask，会抛
+      NotImplementedException，整个任务列表变空白（连别的任务也看不见）。
+    - 直连路线 ``core_tasks`` 生成 MaaCore 的任务序列，Copilot 的
+      ``filename`` 必须是绝对路径（相对路径不报错，就是静默不入队）。
+    """
+    from core import copilot, maacore, maaplan
+
+    _reset_config(tmp)
+    md = os.path.join(tmp, 'fakemaa3')
+    os.makedirs(os.path.join(md, 'config', 'copilot'), exist_ok=True)
+    user_prof = {
+        'TaskQueue': [
+            {'$type': 'StartUpTask', 'TaskType': 'StartUp', 'Name': '开始唤醒',
+             'IsEnable': True, 'AccountName': 'mine', 'AccountSwitchEnabled': False},
+            {'$type': 'FightTask', 'TaskType': 'Fight', 'Name': '理智作战',
+             'IsEnable': True, 'StagePlan': ['1-7']},
+            {'$type': 'RecruitTask', 'TaskType': 'Recruit', 'Name': '自动公招',
+             'IsEnable': True},
+            {'$type': 'InfrastTask', 'TaskType': 'Infrast', 'Name': '基建换班',
+             'IsEnable': True},
+        ],
+        'Copilot': {'TaskList': []},
+        'Gui': {'ConnectSettings': {'AdbPath': 'adb.exe', 'Address': 'emulator-5554',
+                                    'Config': 'LDPlayer'},
+                'StartUpSettings': {'RunDirectly': False}},
+    }
+    cfg = {'Current': 'mine',
+           'Configurations': {'mine': json.loads(json.dumps(user_prof))}}
+    with open(os.path.join(md, 'config', 'gui.new.json'), 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False)
+
+    # 1) GUI 队列：Copilot 必须被剔出去
+    q, skipped = maaplan.build_queue(
+        {'tasks': ['startup', 'copilot', 'fight'], 'stages': ['TL-5'],
+         'ops': [{'copilotId': 1}]},
+        user_prof['TaskQueue'])
+    types = [t['TaskType'] for t in q]
+    assert 'Copilot' not in types, 'GUI 队列不能有 CopilotTask：%r' % types
+    assert 'StartUp' in types and 'Fight' in types, types
+    assert any('自动战斗' in s for s in skipped), skipped
+
+    # 2) 关卡写进 FightTask，模板里其它参数原样保留
+    fq = next(t for t in q if t['TaskType'] == 'Fight')
+    assert fq['StagePlan'] == ['TL-5'], fq
+    assert fq['IsEnable'] is True
+
+    # 3) 建档案：只多一份 PRTS-，用户那份一个字段都不变
+    info = maaplan.ensure_profile(
+        {'profile': '活动', 'accountName': '181****5505',
+         'tasks': ['startup', 'fight'], 'stages': ['TL-5'], 'maaDir': md}, md)
+    assert info['profile'] == 'PRTS-活动', info
+    with open(os.path.join(md, 'config', 'gui.new.json'), encoding='utf-8') as f:
+        cfg2 = json.load(f)
+    assert 'PRTS-活动' in cfg2['Configurations']
+    assert cfg2['Configurations']['mine'] == user_prof, '用户档案被改了'
+    ours = cfg2['Configurations']['PRTS-活动']
+    assert ours['Gui']['StartUpSettings']['RunDirectly'] is True, '没打开启动即跑'
+    su = next(t for t in ours['TaskQueue'] if t['TaskType'] == 'StartUp')
+    assert su['AccountName'] == '181****5505', su
+    assert su['AccountSwitchEnabled'] is True, '没打开切号开关'
+
+    # 4) 档案名：带前缀、保留 *（官服切号名就靠它）
+    assert maaplan._profile_name({'accountName': '181****5505'}) == 'PRTS-181****5505'
+    assert maaplan._profile_name({'profile': 'PRTS-x'}) == 'PRTS-x'
+    assert maaplan._profile_name({}) == 'PRTS-挂机'
+
+    # 5) 直连序列：StartUp 带切号、Fight 带关卡、渠道映射对
+    seq = maaplan.core_tasks({'tasks': ['startup', 'fight'], 'stages': ['TL-5'],
+                              'accountName': '181****5505',
+                              'channel': 'bilibili服'})
+    assert [t for t, _ in seq] == ['StartUp', 'Fight'], seq
+    assert seq[0][1]['client_type'] == 'Bilibili', seq[0]
+    assert seq[0][1]['account_name'] == '181****5505'
+    # MaaCore 的 StartUpTask 只认 account_name/client_type/start_game_enabled
+    # 三个键（给了非空 account_name 就切号），不许再发它不认的假参数
+    assert 'account_switch_enabled' not in seq[0][1], seq[0][1]
+    # 明说了不切号（switchAccount=False）时，切号名整个不发
+    seq2 = maaplan.core_tasks({'tasks': ['startup'], 'accountName': '5505',
+                               'switchAccount': False})
+    assert 'account_name' not in seq2[0][1], seq2[0][1]
+    assert seq[1][1]['stage'] == 'TL-5'
+
+    # 6) 抄作业：filename 必须绝对路径（相对路径会被 MaaCore 静默丢掉）
+    old = copilot.fetch_prepared
+    copilot.fetch_prepared = lambda cid, *a, **k: (
+        {'stage_name': 'act55side_05', 'opers': []}, 1, 'act55side_05', [], True)
+    try:
+        rows = maaplan.prepare_copilot([{'copilotId': 108609, 'stageCode': 'TL-5'}], md)
+    finally:
+        copilot.fetch_prepared = old
+    assert rows, '作业列表是空的'
+    assert os.path.isabs(rows[0]['filename']), rows[0]
+    assert rows[0]['filename'].endswith('TL-5_108609.json'), rows[0]
+    assert rows[0]['stage_name'] == 'TL-5', rows[0]
+    # 必须是**关卡代号**不是作业内部 id（act55side_05）：MaaCore 的
+    # MultiCopilotTaskPlugin 拿它去拼 `<代号>@Copilot@ClickStageName`，
+    # 传内部 id 拼出来的 pipeline 不存在，OCR 永远匹配不上
+    assert os.path.isfile(rows[0]['filename']), '作业文件没落盘'
+    cq = maaplan.core_tasks({'tasks': ['copilot'], 'copilotList': rows,
+                             'copilot': {'formation': True}})
+    # core_tasks 会自动补一个 StartUp 在最前面（没有唤醒什么都跑不了）
+    assert [t for t, _ in cq] == ['StartUp', 'Copilot'], cq
+    cp = cq[-1][1]
+    assert cp['copilot_list'][0]['filename'] == rows[0]['filename']
+    assert cp['formation'] is True
+
+    # 7) 渠道 → client_type
+    for cn, code in [('官服', 'Official'), ('bilibili服', 'Bilibili'),
+                     ('B服', 'Bilibili'), ('日服', 'YoStarJP'), ('', 'Official')]:
+        assert maaplan.client_type_of(cn) == code, (cn, maaplan.client_type_of(cn))
+
+    # 8) 引擎事件翻译（纯函数，不碰设备）
+    eng = maacore.Engine.__new__(maacore.Engine)
+    eng.connected = False
+    eng._chain_starts = 0
+    ev = eng._translate(maacore.MSG_CONNECTION_INFO, {'what': 'Connected'})
+    assert ev['kind'] == 'connected' and eng.connected, ev
+    ev = eng._translate(maacore.MSG_CONNECTION_INFO, {'what': 'ConnectFailed'})
+    assert ev['kind'] == 'error', ev
+    assert eng._translate(maacore.MSG_ALL_TASKS_COMPLETED, {})['kind'] == 'done'
+    assert '自动战斗' in eng._translate(
+        maacore.MSG_TASK_START, {'taskchain': 'Copilot'})['text']
+    assert maacore._chain_cn('Fight') == '理智作战'
+
+    # 9) 停挂机：直连跑的时候机器上没有 MAA 进程，只能让引擎自己 AsstStop。
+    #    空表返回 0 就够——真停要设备，这里钉住「有这个出口且不会炸」。
+    assert maacore.stop_all_live() == 0
+
+    # 10) capabilities 带上核心版本位（GUI 6.20.1 但核心可能单独更新过，
+    #     版本对不上时 AsstAppendTask 会静默不收，所以前端要能看到）
+    cap = maaplan.capabilities(md)
+    assert 'coreVersion' in cap and isinstance(cap['coreVersion'], str), cap
+    assert len(cap['tasks']) == 9, len(cap['tasks'])
+    assert all('available' in t for t in cap['tasks']), cap['tasks'][:1]
+
+    # 11) build_run(start=false)：只建档案，不启动、不连模拟器
+    from core import agent
+    res = agent._start_build({
+        'rows': [{'name': '测号', 'accountName': '181****5505'}],
+        'tasks': ['startup', 'fight', 'copilot'], 'fightStages': ['TL-5'],
+        'formation': True, 'start': False, 'maaDir': md, 'profileHint': '只配不跑',
+    })
+    assert res['started'] is False, res
+    assert res['profiles'] == ['PRTS-只配不跑'], res
+    assert 'copilotNote' in res, '抄作业配不进档案，必须如实告诉用户'
+    with open(os.path.join(md, 'config', 'gui.new.json'), encoding='utf-8') as f:
+        cfg3 = json.load(f)
+    assert cfg3['Configurations']['mine'] == user_prof, '用户档案被改了'
+    assert cfg3['Configurations']['PRTS-只配不跑']['TaskQueue'], '队列是空的'
+
+
 def check_op_blacklist(tmp):
     """作业黑名单：条目按 MAA 代码存（maa://12345），归一化容错（裸数字补全、
     去重、非法丢弃）；fetch_ops 出口按代码滤，与作者黑名单同一出口"""
@@ -2043,7 +2649,1872 @@ def check_applog_capture(_tmp):
     assert 'boom' in filed, '缺 traceback 现场'
 
 
+# ---------------------------------------------------------------- B34 活动关导航
+def check_stagenav(tmp):
+    """B34：活动关导航（区域行号推算 / 页面判别 / 商店保护）
+
+    这块全靠固定坐标 + 截图判断，最容易被"顺手改一下"改坏，所以把两条稳定
+    契约钉住：代号→区域行号、当前页面的分类。
+    """
+    from core import stagenav
+
+    # 1) 代号 → 区域行号（0=残阳终尽 1=长冬初青 2=世纪之春）
+    cases = {
+        'TL-S-1': 2,        # 当期新关，本地资源库还没收录 → 走后缀规则
+        'TL-S-3': 2,
+        'TL-EX-1': 1,       # EX 挑战关在第二个区域
+        'TL-5': 0,          # 本地查得到 zoneId → 走精确路径
+        '1-7': None,        # 主线关不归这段导航管
+        '15-3': None,
+        'S4-1': None,       # 「1 个字母 + 章节号」的主线特殊关
+        'R8-2': None,
+        'act55side_s01': None,   # 作业内部 id，调用方本来就该传代号
+    }
+    for code, want in cases.items():
+        got = stagenav.zone_rows_of(code)
+        assert got == want, (code, got, want)
+
+    # 2) 导航点齐全（少一个就是 KeyError 直接炸导航）
+    p = stagenav.points()
+    for k in ('tabTerminal', 'activityCard', 'themeZone', 'zoneRows',
+              'backCorner'):
+        assert k in p, '缺导航点：%s' % k
+    assert len(p['zoneRows']) == 3, p['zoneRows']
+
+    # 3) 页面判别：造四张图钉阈值（底部白占比 / 中部纯白 + 亮度）
+    import io
+
+    from PIL import Image, ImageDraw
+
+    class Shot:
+        def __init__(self, data):
+            self._d = data
+
+        def shot(self):
+            return self._d
+
+    def png(tab_white, mid_pure=0.0, mid_fill=(60, 60, 60)):
+        im = Image.new('RGB', (1280, 720), (60, 60, 60))
+        d = ImageDraw.Draw(im)
+        x1, y1 = int(0.01 * 1280), int(0.86 * 720)
+        x2, y2 = int(0.35 * 1280), int(0.94 * 720)
+        if tab_white > 0:
+            d.rectangle([x1, y1, x1 + int((x2 - x1) * tab_white), y2],
+                        fill=(255, 255, 255))
+        mx1, my1 = int(0.30 * 1280), int(0.35 * 720)
+        mw, mh = int(0.40 * 1280), int(0.20 * 720)
+        d.rectangle([mx1, my1, mx1 + mw, my1 + mh], fill=mid_fill)
+        if mid_pure > 0:
+            d.rectangle([mx1, my1, mx1 + int(mw * mid_pure), my1 + mh],
+                        fill=(255, 255, 255))
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return Shot(buf.getvalue())
+
+    assert stagenav.probe(png(0.0)) == 'map', '底部全暗应判成活动地图'
+    assert stagenav.probe(png(0.30)) == 'home', '底部半白应判成主界面'
+    assert stagenav.probe(png(0.85, 0.0, (225, 225, 225))) == 'theme', \
+        '底部大半白 + 中部亮应判成活动主题页'
+    assert stagenav.probe(png(0.50, 0.40)) == 'store', \
+        '中部成片纯白（商品卡片）应判成活动商店'
+
+    # 4) 主线关不点：直接返回 False，绝不能对主线关乱点活动入口
+    class NullTouch:
+        def __init__(self):
+            self.hits = []
+
+        def tap(self, x, y):
+            self.hits.append((x, y))
+            return True
+
+        def shot(self):
+            return b''
+
+    nt = NullTouch()
+    ok, why = stagenav.goto_stage_list(nt, '1-7')
+    assert ok is False and '不是活动关' in why, (ok, why)
+    assert nt.hits == [], '主线关不该产生任何点击：%s' % (nt.hits,)
+
+
+# ---------------------------------------------------------------- B35 老故事集导航
+def check_story_nav(tmp):
+    """B35：老故事集导航（曲谱入口 / 卡片模板匹配）
+
+    MN 这类老活动 MAA 资源里没有导航配置，``Fight`` 直接拒收（实测
+    ``AsstAppendTask`` 返回 0），只能自己从「曲谱 → 乐章收录」的网格里按图
+    找活动卡片。这里钉住三件事：模板找得到、匹配定位准、曲谱页判据。
+    """
+    import io as _io
+
+    from PIL import Image, ImageDraw
+
+    from core import stagenav
+
+    # 1) 模板查找：MN 有卡片模板，当期活动（TL）不该有
+    assert stagenav.tpl_path_of('MN-7'), 'MN-7 应该能找到卡片模板'
+    assert stagenav.tpl_path_of('MN-EX-1'), 'MN-EX-1 也该命中同一个模板'
+    assert stagenav.tpl_path_of('TL-9') == '', 'TL-9 不该有卡片模板'
+    assert stagenav.tpl_path_of('1-7') == '', '主线关不该有卡片模板'
+
+    tpl_path = stagenav.tpl_path_of('MN-7')
+    tpl = Image.open(tpl_path).convert('L')
+
+    class Shot:
+        def __init__(self, data):
+            self._d = data
+
+        def shot(self):
+            return self._d
+
+    # 2) 模板匹配：贴到黑底大图的固定位置，得能找回那个位置
+    canvas = Image.new('L', (1920, 1080), 8)
+    px, py = 520, 380
+    canvas.paste(tpl, (px, py))
+    buf = _io.BytesIO()
+    canvas.save(buf, 'PNG')
+    x, y, s = stagenav.find_card(Shot(buf.getvalue()), tpl_path)
+    want = (px + tpl.width // 2, py + tpl.height // 2)
+    assert x and abs(x - want[0]) <= 12 and abs(y - want[1]) <= 12, \
+        ('模板定位偏了', (x, y), want, s)
+    assert s <= stagenav._CARD_MAX_SCORE, ('分数应该很低才对', s)
+
+    # 3) 曲谱页判据：暗底 True / 亮底 False（实测 曲谱 42 / 网格 53 / 主界面 99~130）
+    def gray(v):
+        im = Image.new('L', (1280, 720), v)
+        b = _io.BytesIO()
+        im.save(b, 'PNG')
+        return Shot(b.getvalue())
+
+    assert stagenav.in_story_page(gray(45)) is True, '暗底应判成曲谱页'
+    assert stagenav.in_story_page(gray(128)) is False, '亮底不该判成曲谱页'
+
+    # 只靠「左上角够暗」会把主界面判成曲谱页：皮肤立绘压在左边，实测灰度
+    # 98.5，正好卡在旧阈值 100 下面。后果是登录后一步都没走就开始翻三十几屏，
+    # 最后报「翻了几十屏都没找到」——2026-11-17 用户报的跳转失败就是这个。
+    # 这里造一张「左上暗 + 左下角那块礼包白卡」的主界面：必须判 False。
+    im = Image.new('RGB', (1280, 720), (45, 45, 45))
+    dr = ImageDraw.Draw(im)
+    dr.rectangle([int(0.02 * 1280), int(0.86 * 720),
+                  int(0.35 * 1280), int(0.98 * 720)],
+                 fill=(255, 255, 255))
+    b = _io.BytesIO()
+    im.save(b, 'PNG')
+    assert stagenav.in_story_page(Shot(b.getvalue())) is False, \
+        '左下角有白色功能卡的是主界面，不能判成曲谱页'
+
+    # 3.5) 「乐章收录」网格判据 + 进网格必点「默认进度」。
+    #      这一页会记住上次选的标签：停在「完成进度」时每张卡左上角都盖着
+    #      进度徽章（38/39 那种蓝色菱形），卡片图被改掉一块，模板匹配从 5 分
+    #      涨到 20 分以上——整轮扫描白跑（2026-11-18 用户报 RI 导航失败，
+    #      现场截图正停在「完成进度」）。判据就是顶部三个标签必有一个蓝字。
+    def rgb_box(blue):
+        im = Image.new('RGB', (1920, 1080), (18, 18, 22))
+        dr = ImageDraw.Draw(im)
+        if blue:
+            dr.rectangle([int(0.57 * 1920), int(0.04 * 1080),
+                          int(0.62 * 1920), int(0.085 * 1080)],
+                         fill=(60, 170, 255))
+        b = _io.BytesIO()
+        im.save(b, 'PNG')
+        return Shot(b.getvalue())
+
+    assert stagenav.in_score_grid(rgb_box(True)) is True, \
+        '有蓝色标签的应该是乐章收录网格'
+    assert stagenav.in_score_grid(rgb_box(False)) is False, \
+        '没有蓝色标签的（曲谱时间轴）不该判成网格'
+
+    p = stagenav.points()
+    assert 'tabProgress' in p and len(p['tabProgress']) == 2, \
+        ('要有一个「默认进度」标签的点击点', p.get('tabProgress'))
+    src = inspect.getsource(stagenav.goto_story_activity)
+    assert "p['tabProgress']" in src, '进网格后必须点一下「默认进度」'
+    assert 'in_score_grid' in src, '点完「乐章收录」要确认真的进了网格'
+
+    # 3.6) 扫描要「等画面停稳再截图」：滑动惯性能吃好几秒，中途截到的帧整屏
+    #      带拖影（卡片被拉成两半），匹配分数虚高 → 明明在屏幕上却报没找到。
+    assert hasattr(stagenav, '_settled_shot'), '截图前要先等画面停稳'
+    assert '_settled_shot' in inspect.getsource(stagenav.goto_story_activity), \
+        '扫描循环必须用 _settled_shot 取帧'
+
+    # 3.7) 回顶要甩够（旧写法从列表底部到不了顶，扫描会从中间开始漏上半张表），
+    #      卡片位置缓存读不到时要安静返回 0（不能因为少个 json 就导航不了）。
+    assert hasattr(stagenav, '_scroll_top'), '要有「甩到顶」的辅助函数'
+    assert '_scroll_top' in src, '整页扫之前必须先回顶'
+    assert stagenav._load_card_offset('ZZZ') == 0, '缓存读不到要返回 0'
+
+    # 4) 九张老活动的卡片模板都在（少一张就意味着那个活动导航不了）
+    for code, name in (('MN-1', 'MN'), ('WD-1', 'WD'), ('DM-1', 'DM'),
+                       ('MB-1', 'MB'), ('BI-1', 'BI'), ('TW-1', 'TW'),
+                       ('RI-1', 'RI'), ('SV-1', 'SV'), ('WR-1', 'WR')):
+        assert stagenav.tpl_path_of(code), '缺卡片模板：%s' % name
+
+    # 5) EX / S / MO 关识别与「分区图标」坐标
+    #    活动地图右下角不是「一个 EX 开关」，是 2~4 个分区图标（基础 / EX /
+    #    S / MO），点哪个切哪个；EX 也不总在最右边（DM/BB/MT/PV 在中间）。
+    assert stagenav.is_extra('MN-EX-1') is True
+    assert stagenav.is_extra('MN-EX-8') is True
+    assert stagenav.is_extra('MN-7') is False
+    assert stagenav.is_extra('TL-S-1') is False
+    assert stagenav.ex_point('MN-EX-1') == (1199, 620), stagenav.ex_point('MN-EX-1')
+    assert stagenav.ex_point('WD-EX-3') == (1199, 620)
+
+    # 分区类型：EX / S / MO / ST / 基础
+    assert stagenav.zone_kind('DM-EX-1') == 'ex', stagenav.zone_kind('DM-EX-1')
+    assert stagenav.zone_kind('OF-EX1') == 'ex', '火蓝之心是 EX1 写法'
+    assert stagenav.zone_kind('BB-S-1') == 's', stagenav.zone_kind('BB-S-1')
+    assert stagenav.zone_kind('MT-S-2') == 's'
+    assert stagenav.zone_kind('DM-MO-1') == 'mo', stagenav.zone_kind('DM-MO-1')
+    assert stagenav.zone_kind('MN-ST-1') == 'st', stagenav.zone_kind('MN-ST-1')
+    assert stagenav.zone_kind('DM-1') == 'base'
+
+    # 分区序号 = 资源库 zoneId 排序（基础 0 / EX 1 / S、MO 2），和界面上
+    # 那排图标的左右顺序一致——这是「不用 OCR 也能选对格子」的根据。
+    for code, want in (('DM-1', 0), ('DM-EX-1', 1), ('DM-MO-1', 2),
+                       ('BB-S-1', 2), ('PV-EX-3', 1), ('GA-EX-1', 1),
+                       ('BB-ST-1', 0), ('MT-S-1', 2)):
+        got = stagenav.zone_rows_of(code)
+        assert got == want, '分区序号错了：%s → %s（应为 %d）' % (code, got, want)
+
+    # 已经标定过的活动：图标数与分区数一致，坐标都在 1280×720 内
+    for code, n in (('DM-EX-1', 3), ('BB-S-1', 3), ('MT-S-1', 3), ('PV-EX-1', 3),
+                    ('WD-EX-1', 2), ('GA-EX-1', 2), ('HE-EX-1', 2),
+                    ('BI-EX-1', 2), ('RS-EX-1', 2), ('GO-EX-1', 2),
+                    ('MN-EX-1', 2),
+                    # 2026-11-18 第二批（用户逐活动截图标的 EX / S 入口）
+                    ('NL-EX-1', 3), ('NL-S-1', 3),
+                    ('HS-EX-1', 3), ('HS-S-1', 3), ('HS-MO-1', 3),
+                    ('OR-EX-1', 3), ('OR-S-1', 3), ('OR-MO-1', 3),
+                    ('CW-EX-1', 2), ('DV-EX-1', 2), ('MB-EX-1', 2),
+                    # 2026-11-18 第三批（老故事集剩下这批，用户逐活动截图标的）
+                    ('SV-EX-1', 2), ('BP-EX-1', 2), ('EP-EX-1', 2),
+                    ('TW-EX-1', 3), ('TW-MO-1', 3), ('LE-EX-1', 2),
+                    ('ZT-EX-1', 3), ('ZT-S-1', 3), ('FC-EX-1', 2),
+                    ('EA-EX-1', 2), ('OF-EX1', 3), ('OF-F1', 3),
+                    ('RI-EX-1', 2), ('DH-EX-1', 3), ('DH-S-1', 3),
+                    ('IC-EX-1', 3), ('IC-S-1', 3), ('SL-EX-1', 3),
+                    ('SL-MO-1', 3), ('AS-EX-1', 3), ('AS-S-1', 3),
+                    ('AT-EX-1', 3), ('AT-S-1', 3), ('CB-EX1', 2),
+                    ('CV-EX-1', 2), ('AD-EX-1', 2)):
+        pts = stagenav.zone_icons_of(code)
+        assert len(pts) == n, '%s 应该标定了 %d 个分区图标，实际 %d' % (code, n, len(pts))
+        for x, y in pts:
+            assert 0 < x < 1280 and 0 < y < 720, ('分区图标坐标越界', code, x, y)
+        # 同一个活动的图标必须左→右有序、且互不重叠（MT 的「谒见神祇」离
+        # 「瞻望圣堂」只有 87px，所以门槛按图标宽度的下限定 70）
+        for a, b in zip(pts, pts[1:]):
+            assert b[0] - a[0] >= 70, ('分区图标间距过小', code, a, b)
+
+    # 分区栏式活动：序号要落在资源库算出来的那一格上（错了就点到隔壁分区）
+    for code, want in (('NL-EX-1', 1), ('NL-S-1', 2), ('HS-EX-1', 1),
+                       ('HS-MO-1', 2), ('OR-EX-1', 1), ('OR-MO-1', 2),
+                       ('CW-EX-1', 1), ('DV-EX-1', 1), ('MB-EX-1', 1),
+                       # 第三批
+                       ('SV-EX-1', 1), ('BP-EX-1', 1), ('EP-EX-1', 1),
+                       ('TW-EX-1', 1), ('TW-MO-1', 2), ('LE-EX-1', 1),
+                       ('ZT-EX-1', 1), ('ZT-S-1', 2), ('FC-EX-1', 1),
+                       ('EA-EX-1', 1), ('OF-EX1', 2), ('OF-F1', 1),
+                       ('RI-EX-1', 1), ('DH-EX-1', 1), ('DH-S-1', 2),
+                       ('IC-EX-1', 1), ('IC-S-1', 2), ('SL-EX-1', 1),
+                       ('SL-MO-1', 2), ('AS-EX-1', 1), ('AS-S-1', 2),
+                       ('AT-EX-1', 1), ('AT-S-1', 2), ('AT-MO-1', 2),
+                       ('CB-EX1', 1), ('CV-EX-1', 1), ('AD-EX-1', 1)):
+        assert stagenav.zone_rows_of(code) == want, \
+            ('分区序号错了：%s → %s' % (code, stagenav.zone_rows_of(code)))
+
+    # OF 是「地区切换」面板：①基础 / ②OF-F / EX，三格都是按钮
+    assert stagenav.zone_kind('OF-F1') == 'f', stagenav.zone_kind('OF-F1')
+    assert stagenav.zone_kind('OF-EX1') == 'ex'
+    # SV 复刻过，资源库里两套基础区都收着，EX 排出来会是第 3 格；界面上只有
+    # 两格，靠 zoneRowByCode 硬指。IC-P-1/P-2 同理（自成一区，界面挂在基础区）。
+    assert stagenav.zone_rows_of('SV-EX-1') == 1, stagenav.zone_rows_of('SV-EX-1')
+    assert stagenav.zone_rows_of('SV-1') == 0
+    assert stagenav.zone_rows_of('IC-P-1') == 0, stagenav.zone_rows_of('IC-P-1')
+    # 前缀要按整段匹配：'TW-S' 不能把 TW-ST-1 也算进去，'IC-P' 不能认 IC-PX
+    assert stagenav._row_override('TW-S-1') is None
+    assert stagenav._row_override('IC-P-1') == 0
+    assert stagenav._row_override('IC-PX-1') is None
+
+    # 只有「基础区 + 一个 EX 按钮」的活动：不进 zoneIcons，按活动覆盖单点。
+    # 这类界面上右边那块是活动名/副标题，不是格子，硬按分区栏下标点会点空。
+    for code, pt in (('WR-EX-1', (1073, 605)), ('WB-EX-1', (1005, 628)),
+                     ('IW-EX-1', (1175, 620)), ('GT-EX-1', (1171, 605))):
+        assert stagenav.zone_icons_of(code) == [], \
+            ('%s 不是分区栏，不该进 zoneIcons' % code)
+        assert stagenav.ex_point(code) == pt, (code, stagenav.ex_point(code))
+        assert stagenav.zone_rows_of(code) == 1, code
+
+    # GT-HX 与 GT-EX 同属 act13d2_zone2（界面上共用一个 EX 图标）：代号归一成 ex
+    assert stagenav.zone_kind('GT-HX-1') == 'ex', stagenav.zone_kind('GT-HX-1')
+    assert stagenav.zone_rows_of('GT-HX-1') == 1
+    assert stagenav.is_extra('GT-HX-1') is True
+
+    # CW 的第 3 格（S 分区）故意不标：那套 UI 不是常规战斗列表，MAA 跑不了，
+    # 标了会把它点开。留给 goto_subzone 报「只标了 2 个」。
+    assert len(stagenav.zone_icons_of('CW-S-1')) == 2
+
+    # 切入必须走独立函数，而且要在「进入活动」之后
+    src = inspect.getsource(stagenav.goto_story_activity)
+    assert 'goto_subzone(touch, stage_code' in src, '进地图后要调 goto_subzone 切分区'
+    assert hasattr(stagenav, 'goto_subzone') and callable(stagenav.goto_subzone)
+    sub = inspect.getsource(stagenav.goto_subzone)
+    assert '先归位' in sub or '归位到第 1 个分区' in sub, '要先点第 1 格归位再切目标格'
+    assert '_snap_icon' in sub, '点之前要用图像识别校正图标位置'
+    # 图像识别本身：真图上要能认出图标列（用 2026-11-18 用户截图标定的坐标自检）
+    assert hasattr(stagenav, '_icon_peaks') and hasattr(stagenav, '_snap_icon')
+
+    # 6) 扫描覆盖与步长：整张表（主线 + 各 Story Line 分组 + 未归组新活动）
+    #    实测 15 屏、约 12000 像素高（1080 口径）。覆盖要留几倍余量，但
+    #    **步长不能贪大**：560 那版会漏屏（玛莉娅·临光正好落在两张截图之间）；
+    #    360 仍会截断卡片（截断卡匹配分从 4 涨到 19，掉出阈值），
+    #    240（1080 口径 360px）保证每行至少有一屏基本完整（2026-11-17）。
+    assert stagenav._MAX_SCREENS * stagenav._SWIPE_STEP >= 10000, \
+        ('扫描覆盖要够整个曲谱网格', stagenav._MAX_SCREENS, stagenav._SWIPE_STEP)
+    assert 200 <= stagenav._SWIPE_STEP <= 460, \
+        ('步长太大漏屏、太小翻不完', stagenav._SWIPE_STEP)
+    # 加载竞态必须有兜底：卡片图是网络异步加载的，滚到那屏时可能还是黑色占位
+    # （2026-11-17 实测 DH/GA/GO/HE/MT 稳定 999）。2026-11-18 把「预滚一遍」
+    # 换成了逐屏「整屏无候选就补拍一帧」，代码里必须还留着这道补拍。
+    assert 'wait=0.9' in inspect.getsource(stagenav.goto_story_activity), \
+        ('整屏没有候选时要补拍一帧，兜住缩略图加载竞态',)
+
+    # 7) adb 通道自检：地址写错时要能自己换一个，连不上要明确说「连不上」，
+    #    而不是让上层一路点空、最后误报「翻了几十屏没找到卡片」。
+    assert hasattr(stagenav.Touch, 'ready'), 'Touch 要有 ready() 自检'
+
+    # 8) 活动总表（EVENTS）与分发：乐章收录网格里全部有关卡的活动都在表里。
+    #    2026-11-17 打包版踩过：PYZ 里模板目录解析不到 → tpl_path_of 返回空 →
+    #    MN-7 被当成当期活动去点区域列表。所以分发必须「模板 or 总表」双闸。
+    #    代号全部经真机落图核对（2026-11-17，46 个），易错代号在此钉死。
+    assert len(stagenav.EVENTS) >= 45, ('活动总表不该缩水', len(stagenav.EVENTS))
+    assert stagenav.event_of('SV-EX-1') == ('SV', '覆潮之下')
+    assert stagenav.event_of('DM-2') == ('DM', '生于黑夜')
+    assert stagenav.event_of('15-3') == ('', ''), '主线关不该进活动表'
+    assert stagenav.event_of('H15-1') == ('', ''), '突袭关不该进活动表'
+    assert stagenav._navtpl_dirs(), '模板目录一个都没找到'
+    # 真机落图核出的易错代号（2026-11-17）：别再回退成按英文缩写猜的旧表
+    assert stagenav.event_of('BP-1') == ('BP', '生路'), '生路=BP（RS 是银心湖列车）'
+    assert stagenav.event_of('RS-1') == ('RS', '银心湖列车')
+    assert stagenav.event_of('WR-1') == ('WR', '画中人')
+    assert stagenav.event_of('WB-2') == ('WB', '登临意')
+    assert stagenav.event_of('CV-1') == ('CV', '不义之财')
+    assert stagenav.event_of('ZT-3') == ('ZT', '崔林特尔梅之金')
+    assert stagenav.event_of('EP-1') == ('EP', '出苍白海')
+    assert stagenav.event_of('MT-1') == ('MT', '众生行记')
+    assert stagenav.event_of('EA-1') == ('EA', '挽歌燃烧殆尽')
+    assert stagenav.event_of('ME-1') == ('ME', '雅赛努斯复仇记')
+    assert stagenav.event_of('AW-1') == ('AW', '日暮寻路')
+    assert stagenav.event_of('TG-1') == ('TG', '去咧嘴谷')
+    assert stagenav.event_of('KR-1')[1] == '熔炉"还魂"记'
+    assert stagenav.event_of('OS-1') == ('OS', '雪山降临1101')
+    assert stagenav.event_of('UR-1') == ('UR', '未许之地')
+    assert stagenav.event_of('AT-1') == ('AT', '墟')
+    # 46 张模板都随包带上
+    tpldir = stagenav._navtpl_dirs()[0]
+    missing = [c for c in stagenav.EVENTS
+               if not any(os.path.isfile(os.path.join(d, c + '.png'))
+                          for d in stagenav._navtpl_dirs())]
+    assert not missing, ('这些活动缺模板图', missing)
+    assert len([f for f in os.listdir(tpldir) if f.endswith('.png')]) >= 40
+
+
+# ---------------------------------------------------------------- B36 打关预检
+def check_stage_precheck(tmp):
+    """B36：开打前预检（前置关 / 练度 / 连锁 / 卡在哪一关）
+
+    2026-11-18 用户实测：练度不够还硬挂 BB-S-1~4，MAA 跑 8 分钟 0/1，
+    第一关就打不过，后面三关根本没解锁。预检必须做到：
+      1) 按游戏流程排，目标关的前置关自动补进计划；
+      2) 练度不够 / 缺干员的关不排队；
+      3) 前面的关打不了，后面的关标「前置未通」（不是「能打」）；
+      4) 一关都打不了时，skill_fight 直接报错，不碰设备；
+      5) 真开打了要知道卡在哪一关（作业文件名 → 代号）。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import stageplan, skills, maaplan
+
+    # 1) 顺序与分区：代号后缀决定类型，同活动同类型按序号排
+    assert stageplan.kind_of('BB-S-3') == 's'
+    assert stageplan.kind_of('MN-EX-1') == 'ex'
+    assert stageplan.kind_of('OF-EX1') == 'ex', '火蓝之心没有横杠也要认'
+    assert stageplan.kind_of('BB-MO-1') == 'mo'
+    assert stageplan.kind_of('BB-1') == 'base'
+    assert stageplan.chain('BB-S-3') == ['BB-S-1', 'BB-S-2', 'BB-S-3']
+    assert stageplan.chain('BB-EX-3') == ['BB-EX-1', 'BB-EX-2', 'BB-EX-3']
+    # 主线不展开（一章十几关，用户没这个预期）
+    assert stageplan.chain('1-7') == ['1-7']
+
+    # 2) 要打 S3 时 S1、S2 自动补进计划，并标成「前置」而不是用户点名
+    plan = stageplan.expand(['BB-S-3'])
+    assert [(p['code'], p['prereq']) for p in plan] == [
+        ('BB-S-1', True), ('BB-S-2', True), ('BB-S-3', False)], plan
+    # 跨分区按游戏顺序：EX 在 S 前面
+    codes = [p['code'] for p in stageplan.expand(['BB-S-1', 'BB-EX-2'])]
+    assert codes == ['BB-EX-1', 'BB-EX-2', 'BB-S-1'], codes
+    # 基础关默认**不**补前置（刷 BB-7 的材料不该顺手排 BB-1~BB-6），
+    # 但计划里必须出现「没补前置」的提示；显式 fill_base=True 才补。
+    assert [p['code'] for p in stageplan.expand(['BB-7'])] == ['BB-7']
+    assert len(stageplan.expand(['BB-7'], fill_base=True)) == 7
+    assert any('没补前置' in n for n in stageplan.review(['BB-7'], mode='fight')['notes'])
+
+    # 3) 练度判定 + 前置连锁（不联网，直接喂 lookup 结果）
+    orig = stageplan._lookup
+    try:
+        stageplan._lookup = lambda code, snap, **kw: {
+            'state': 'train' if code == 'BB-S-2' else 'ready',
+            'reason': '练度不足' if code == 'BB-S-2' else '',
+            'notes': ['缺 精二 60'] if code == 'BB-S-2' else [],
+            'op': {'copilotId': 1, 'stageCode': code, 'variant': 'normal'},
+            'rating': 9, 'title': 'x'}
+        rep = stageplan.review(['BB-S-4'], '', use_cache=False)
+        states = [(i['code'], i['state']) for i in rep['plan']]
+        assert states == [('BB-S-1', 'ready'), ('BB-S-2', 'train'),
+                          ('BB-S-3', 'locked'), ('BB-S-4', 'locked')], states
+        assert rep['playable'] == ['BB-S-1'], rep['playable']
+        assert [b['code'] for b in rep['blocked']] == ['BB-S-2', 'BB-S-3', 'BB-S-4']
+        assert 'BB-S-2' in rep['blocked'][0]['reason'] or \
+            rep['blocked'][0]['reason'] == '练度不足'
+    finally:
+        stageplan._lookup = orig
+
+    # 4) 一关都打不了：直接报错，绝不能把空队列交给 MAA
+    orig_rev = stageplan.review
+    orig_acc = skills._account_file
+    try:
+        stageplan.review = lambda stages, *a, **k: {
+            'plan': [], 'playable': [], 'blocked': [{'code': 'BB-S-1',
+                                                     'reason': '练度不足',
+                                                     'notes': []}],
+            'ops': {}, 'notes': ['练度不够'], 'summary': '能打 0 关'}
+        skills._account_file = lambda n: 'x.json'
+        try:
+            skills.skill_fight({'stages': ['BB-S-1']}, lambda *_: None)
+        except ValueError as e:
+            assert '一关都打不了' in str(e), e
+        else:
+            raise AssertionError('一关都打不了还继续排队了')
+
+        # 4.1) 纯刷关（fight）默认不补前置：刷 S-3 的材料不该顺手打 S-1、S-2
+        cap = {}
+
+        def fake_review(stages, *a, **k):
+            cap.update(k)
+            return {'plan': [], 'playable': [], 'blocked': [],
+                    'ops': {}, 'notes': [], 'summary': 'x'}
+        stageplan.review = fake_review
+        try:
+            skills.skill_fight({'stages': ['BB-S-3'], 'mode': 'fight',
+                                'account': 'x.json'}, lambda *_: None)
+        except ValueError:
+            pass
+        assert cap.get('with_prereq') is False, cap
+        cap.clear()
+        try:
+            skills.skill_fight({'stages': ['BB-S-3'], 'mode': 'copy',
+                                'account': 'x.json'}, lambda *_: None)
+        except ValueError:
+            pass
+        # 2026-11-19 用户口径：默认「点名的关就是全部」，copy 模式也不再
+        # 自动补前置（他要打 S-3、S-4，结果 S-1、S-2 也被打了一遍）
+        assert cap.get('with_prereq') is False, cap
+        cap.clear()
+        try:
+            skills.skill_fight({'stages': ['BB-S-3'], 'mode': 'copy',
+                                'autoPrereq': True,
+                                'account': 'x.json'}, lambda *_: None)
+        except ValueError:
+            pass
+        assert cap.get('with_prereq') is True, cap
+    finally:
+        stageplan.review = orig_rev
+        skills._account_file = orig_acc
+
+    # 4.2) 没账号快照时不能把「缺干员」当结论：那会把所有关都拦住
+    from core import copilot as cp
+    orig_search = cp.search
+    try:
+        cp.search = lambda *a, **k: {
+            'mode': 'stage',
+            'stages': [{'stage': {'code': 'BB-S-1', 'variant': 'normal'},
+                        'ops': [{'copilotId': 1, 'mode': 'blocked',
+                                 'missing': ['甲', '乙', '丙'], 'training': [],
+                                 'total': 11, 'rating': 9, 'title': 'x'}],
+                        'best': {'copilotId': 1, 'mode': 'blocked',
+                                 'missing': ['甲', '乙', '丙'], 'training': [],
+                                 'total': 11, 'rating': 9, 'title': 'x'}}]}
+        rep = stageplan.review(['BB-S-1'], '', use_cache=False)
+        assert rep['playable'] == ['BB-S-1'], rep
+        assert not rep['blocked'], rep['blocked']
+        assert rep['plan'][0]['state'] == 'unknown'
+    finally:
+        cp.search = orig_search
+
+    # 4.3) 同样能打时优先突袭行：通用位（difficulty=3）作业以前永远落
+    #      variant=normal，写进 MAA 一律 IsRaid=false，挂 IW-EX 打的全是
+    #      普通难度（2026-11-18 用户实测「只推荐普通难度，说突袭打不了」，
+    #      其实作业就叫「IW-EX-1突袭五人」）。可打性仍优先于变体：突袭行
+    #      全打不了、普通行能打时，照旧选普通。
+    try:
+        good = {'copilotId': 9, 'mode': 'ready', 'missing': [], 'training': [],
+                'total': 11, 'rating': 9, 'title': 'x', 'difficulty': 3}
+        cp.search = lambda *a, **k: {'mode': 'stage', 'stages': [
+            {'stage': {'code': 'IW-EX-1', 'variant': 'normal'},
+             'ops': [dict(good)], 'best': dict(good)},
+            {'stage': {'code': 'IW-EX-1', 'variant': 'raid'},
+             'ops': [dict(good)], 'best': dict(good)}]}
+        v = stageplan._lookup('IW-EX-1', {'chars': []}, use_cache=False)
+        assert (v.get('op') or {}).get('variant') == 'raid', v
+        bad = dict(good, copilotId=2, mode='blocked', missing=['甲', '乙'])
+        cp.search = lambda *a, **k: {'mode': 'stage', 'stages': [
+            {'stage': {'code': 'IW-EX-1', 'variant': 'normal'},
+             'ops': [dict(good)], 'best': dict(good)},
+            {'stage': {'code': 'IW-EX-1', 'variant': 'raid'},
+             'ops': [dict(bad)], 'best': dict(bad)}]}
+        v = stageplan._lookup('IW-EX-1', {'chars': []}, use_cache=False)
+        assert (v.get('op') or {}).get('variant') == 'normal', v
+    finally:
+        cp.search = orig_search
+
+    # 5) 卡在哪一关：作业文件名 → 代号（MAA 只给文件路径）
+    assert maaplan._stage_of_file({'file_name': r'C:\x\BB-S-3_10531.json'}) == 'BB-S-3'
+    assert maaplan._stage_of_file(
+        {'file_name': 'BB-S-3_10531.json'},
+        {'by_file': {'BB-S-3_10531.json': 'BB-S-3'}}) == 'BB-S-3'
+    assert 'failed_stage' in inspect.getsource(maaplan.run_core), \
+        'run_core 要回报卡在哪一关'
+
+    # 6) 失败原因要翻译成人话（认不出来就原样返回，不许瞎猜）
+    assert '解锁' in stageplan.explain_failure('关卡未解锁')
+    assert '练度' in stageplan.explain_failure('未达到三星')
+    assert stageplan.explain_failure('') == ''
+
+    # 7) 助手侧：确认卡里必须先写清「哪几关打不了」，一关都打不了就别摆卡
+    from core import agent
+    orig_rev2 = stageplan.review
+    try:
+        stageplan.review = lambda *a, **k: {
+            'plan': [{'code': 'BB-S-1', 'state': 'train', 'reason': '练度不足',
+                      'notes': ['星熊 需 精二 60 级'], 'prereq': False,
+                      'kind': 's', 'story': False}],
+            'playable': [], 'blocked': [{'code': 'BB-S-1', 'reason': '练度不足',
+                                         'notes': []}],
+            'ops': {}, 'notes': [], 'summary': '能打 0 关'}
+        out = agent._skill_via_guard('fight', {'stages': ['BB-S-1']}, None)
+        assert out.get('error') and 'precheck' in out, out
+        assert '练度不足' in out['precheck'], out['precheck']
+    finally:
+        stageplan.review = orig_rev2
+
+
+# ---------------------------------------------------------------- B37 环境检测
+def check_envcheck(_tmp):
+    """B37：开跑前环境检测（配置来源 / 静默 / 替用户启动 / 闸门）
+
+    2026-11-18 用户要求：每次跑任务前先看模拟器在不在，路径优先从 MAA 的
+    配置里读；检测本身「不显示出来」，只有真没启动、真替他启动了才说话。
+    所以这组断言的语气很明确——**正常路径必须一行日志都没有**。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from unittest import mock
+    from core import envcheck, skills, tasks
+
+    cfg = {'adb': 'adb', 'address': 'emulator-5554', 'kind': 'LDPlayer',
+           'emu_dir': 'D:\\LDPlayer\\', 'index': 0, 'name': '雷电模拟器',
+           'source': 'MAA 配置'}
+    empty = {'adb': '', 'address': '', 'kind': '', 'emu_dir': '', 'index': 0,
+             'name': '', 'source': ''}
+
+    # 1) 读不到 MAA 配置（还没引导过）：放行，别把任务堵死
+    with mock.patch.object(envcheck, 'read_config', lambda: empty):
+        logs = []
+        ok, why = envcheck.ensure(log=logs.append)
+        assert ok and not logs, ('没配置时应静默放行', logs)
+
+    # 2) 已经连上：零日志（「不显示出来」就是这条）
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: cfg,
+            adb_now=lambda cfg=None: (True, 'emulator-5554', 'adb 正常')):
+        logs = []
+        ok, why = envcheck.ensure(log=logs.append)
+        assert ok and why == 'adb 正常', (ok, why)
+        assert not logs, ('已连上时不该刷日志', logs)
+
+    # 3) 用户关了自动启动：只提示，绝不发启动命令
+    started = []
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: cfg,
+            adb_now=lambda cfg=None: (False, '', '没有在线设备'),
+            instance_up=lambda cfg: False,
+            launch=lambda c: started.append(c) or (True, 'x')):
+        with mock.patch.object(envcheck, 'settings',
+                               mock.Mock(load=lambda: {'emulatorAutoStart': False})):
+            ok, why = envcheck.ensure(log=lambda *_: None)
+        assert not ok and '自动启动' in why, why
+        assert not started, '关了自动启动还去点启动器'
+
+    # 4) 没开就替用户启动；起了才放行，日志里要说清「帮你了」
+    seq = []
+
+    def fake_adb(cfg=None):
+        seq.append(1)
+        return (len(seq) > 1, 'emulator-5554', 'adb 正常（emulator-5554）')
+    logs = []
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: cfg, adb_now=fake_adb,
+            instance_up=lambda cfg: False,
+            launch=lambda c: (True, 'ldconsole.exe launch --index 0')):
+        with mock.patch.object(envcheck, 'settings',
+                               mock.Mock(load=lambda: {'emulatorAutoStart': True})):
+            ok, why = envcheck.ensure(log=logs.append, wait=3)
+    assert ok, why
+    assert any('帮你启动' in l for l in logs), logs
+    assert any('adb 就绪' in l for l in logs), logs
+
+    # 5) 启动器找不到 / 类型不认识：说清原因，别静默往下走
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: dict(cfg, emu_dir='D:\\nope\\'),
+            adb_now=lambda cfg=None: (False, '', '没有在线设备'),
+            instance_up=lambda cfg: False):
+        with mock.patch.object(envcheck, 'settings',
+                               mock.Mock(load=lambda: {'emulatorAutoStart': True})):
+            ok, why = envcheck.ensure(log=lambda *_: None)
+        assert not ok and '目录不存在' in why, why
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: dict(cfg, kind='Weird'),
+            adb_now=lambda cfg=None: (False, '', '没有在线设备'),
+            instance_up=lambda cfg: False):
+        with mock.patch.object(envcheck, 'settings',
+                               mock.Mock(load=lambda: {'emulatorAutoStart': True})):
+            ok, why = envcheck.ensure(log=lambda *_: None)
+        assert not ok and '不认识' in why, why
+
+    # 6) 进程在、adb 连不上（模拟器还在开机 / adb 端口被占）：等一小会再给话术
+    with mock.patch.multiple(
+            envcheck, read_config=lambda: cfg,
+            adb_now=lambda cfg=None: (False, 'emulator-5554', '设备 offline'),
+            instance_up=lambda cfg: True):
+        ok, why = envcheck.ensure(log=lambda *_: None, wait=1)
+        assert not ok and 'adb' in why and 'MAA' in why, why
+
+    # 7) 闸门挂对了：除签到（森空岛网页）外都要先查环境
+    assert set(skills._NEEDS_GAME) == set(skills.SKILLS) - {'signin'}, \
+        skills._NEEDS_GAME
+    # /api/skill/list 和助手工具表都按 (desc, fn) 二元组取值，形状不能变
+    for name, entry in skills.SKILLS.items():
+        assert len(entry) == 2 and callable(entry[1]), name
+
+    # 8) 真挡一次：环境没过，任务直接 error，skill 本体一次都不该被调
+    boom = []
+    entry = skills.SKILLS['wakeup']
+    skills.SKILLS['wakeup'] = (entry[0], lambda *a, **k: boom.append(1))
+    try:
+        with mock.patch.object(skills.envcheck, 'ensure',
+                               lambda log=None: (False, '模拟器没起来')):
+            tid = skills.run_skill('wakeup', {})
+            t = None
+            for _ in range(300):
+                t = tasks.get(tid)
+                if t and t['status'] != 'running':
+                    break
+                time.sleep(0.02)
+    finally:
+        skills.SKILLS['wakeup'] = entry
+    assert not boom, '环境没过还是把 skill 本体跑了'
+    assert t and t['status'] == 'error', (t or {}).get('status')
+    assert '环境没准备好' in (t.get('error') or ''), t.get('error')
+
+
+def check_settings_panel(tmp):
+    """B38：设置页改版后的接口口径（账号 token / 账号级 MAA 绑定）
+
+    2026-11-18 设置从「一列到底」改成左 tab 右内容，账号页开始展示 token、
+    MAA 页开始按账号写切号名。这两处都直接改账号文件，口径错一点就是
+    「把别的号的凭证写进来」或「把昵称当切号名写进去，MAA 在账号列表里
+    死找 4 分钟」，所以单独一组建言。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import accounts, api
+
+    _reset_config(tmp)
+    cfg = os.path.join(tmp, 'config')
+    path = os.path.join(cfg, 'smoke-acc.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'account': {'uid': '9', 'nickName': '冒烟', 'channelName': '官服',
+                               'game': 'arknights'}}, f, ensure_ascii=False)
+
+    # 1) 没存过 token：要判「没有」，不能跟「坏了」混成一句
+    st = accounts.token_state('smoke-acc.json')
+    assert st['has'] is False and st['broken'] is False and st['token'] == '', st
+    d = api.api_account_token({}, {'file': 'smoke-acc.json'})
+    assert d['has'] is False and d['mask'] == '' and d['token'] == '', d
+
+    # 2) 写 token：密文落盘、能读回、掩码只露尾 4 位
+    accounts.set_token('smoke-acc.json', 'SMOKE_TOKEN_ABCD')
+    st = accounts.token_state('smoke-acc.json')
+    assert st['has'] and not st['broken'] and st['token'] == 'SMOKE_TOKEN_ABCD', st
+    raw = open(path, encoding='utf-8').read()
+    assert 'SMOKE_TOKEN_ABCD' not in raw, 'token 明文落盘'
+    d = api.api_account_token({}, {'file': 'smoke-acc.json'})
+    assert d['mask'].endswith('ABCD') and 'SMOKE_TOKEN' not in d['mask'], d
+    # 换 token 只动 skd 段，账号本体（uid/昵称）与备注必须原样
+    snap = accounts.get_account('smoke-acc.json')
+    assert snap['account']['uid'] == '9' and snap['account']['nickName'] == '冒烟'
+    accounts.update('smoke-acc.json', lambda s2: s2['skd'].__setitem__('alias', '大号'))
+    accounts.set_token('smoke-acc.json', 'SMOKE_TOKEN_WXYZ')
+    snap = accounts.get_account('smoke-acc.json')
+    assert snap['skd']['alias'] == '大号', '换 token 不该把备注冲掉'
+    assert accounts.token_state('smoke-acc.json')['token'] == 'SMOKE_TOKEN_WXYZ'
+
+    # 3) 密文解不开：点名「本机解不开」，而不是「没有 token」
+    snap['skd'] = {'data': base64.b64encode(b'not-dpapi').decode('ascii')}
+    accounts.save_account('smoke-acc.json', snap)
+    st = accounts.token_state('smoke-acc.json')
+    assert st['has'] and st['broken'] and st['token'] == '', st
+    assert '解不开' in st['error'], st['error']
+
+    # 4) 切号名：归一化、清空、官服填昵称要拦、B 服用户名不许动
+    m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'accountName': '181 5505'}})['maa']
+    assert m['accountName'] == '181****5505', m
+    m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'accountName': ''}})['maa']
+    assert m['accountName'] == '', '清空切号名是合法操作，不能拦'
+    try:
+        api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'accountName': '冒烟'}})
+        raise AssertionError('官服填昵称没被拦下')
+    except ValueError as e:
+        assert '切号名' in str(e), e
+    snap = accounts.get_account('smoke-acc.json')
+    snap['account']['channelName'] = 'B服'
+    accounts.save_account('smoke-acc.json', snap)
+    m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'accountName': '灰bao#7986'}})['maa']
+    assert m['accountName'] == '灰bao#7986', m
+
+    # 5) bootstrap 要把日志目录一起给界面（「数据与日志」页要用）
+    boot = api.bootstrap({}, {})
+    assert {'root', 'accounts', 'config', 'logs', 'appLog'} <= set(boot['paths']), boot['paths']
+    assert boot['paths']['logs'].replace('/', '\\').endswith('debug')
+
+
+# ---------------------------------------------------------------- B39 培养干员
+def check_oper_train(tmp):
+    """B39：培养干员（练度导入 / 材料不足暂停 / 续跑 / 战斗日志补全）
+
+    2026-11-18 用户要求「新增培养干员 skill：导入需要培养的练度，材料不足
+    会暂停」，同时报「自动战斗没有日志」。这里钉住四件最容易错的：
+
+    ① 专精目标是**绝对等级**（``[0,3,0]`` = 二技能专三），不是「再升三级」；
+    ② 已经达标的项要从计划里剔掉，否则 MAA 白跑一趟还报一串「失败」；
+    ③ 材料不足 = 暂停而不是失败：剩下的计划要落盘，``resume`` 能接着来；
+    ④ 战斗过程（编队 / 部署 / 开技能）必须出日志，重复动作不能刷屏。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import accounts, maalog, maaplan, skills
+
+    _reset_config(tmp)
+    cfg = os.path.join(tmp, 'config')
+    path = os.path.join(cfg, 'smoke-acc.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'account': {'uid': '1', 'nickName': '冒烟',
+                               'channelName': '官服'},
+                   'chars': [
+                       {'name': '泥岩', 'profession': '重装', 'elite': 1,
+                        'skillLevel': 4,
+                        'skills': [{'mastery': 0}, {'mastery': 1}, {'mastery': 0}]},
+                       {'name': '银灰', 'profession': '近卫', 'elite': 2,
+                        'skillLevel': 7,
+                        'skills': [{'mastery': 0}, {'mastery': 3}, {'mastery': 3}]},
+                   ]}, f, ensure_ascii=False)
+
+    # 1) 专精写法统一吃下（列表 / 字典 / 冒号 / 中文）
+    assert skills._norm_mastery([0, 3, 0]) == [0, 3, 0]
+    assert skills._norm_mastery({'2': 3}) == [0, 3, 0]
+    assert skills._norm_mastery('2:3') == [0, 3, 0]
+    assert skills._norm_mastery('技能2专精3') == [0, 3, 0]
+    assert skills._norm_mastery('二技能专三') == [0, 3, 0]
+    assert skills._norm_mastery(None) is None
+    for bad in ('看不懂', [0, 9, 0], {'9': 1}):
+        try:
+            skills._norm_mastery(bad)
+            raise AssertionError('非法专精目标没被拦：%r' % (bad,))
+        except ValueError:
+            pass
+
+    # 2) 入参三种写法 → 同一条计划；已达标项剔掉；未知干员当场拦
+    rows = skills._train_rows({'operator': '泥岩', 'elite': 2,
+                               'skillLevel': 7, 'mastery': [0, 3, 0]})
+    assert rows == [{'name': '泥岩', 'elite': 2, 'skillLevel': 7,
+                     'mastery': [0, 3, 0]}], rows
+    logs = []
+    plans = skills._train_plans(rows, 'smoke-acc.json', log=logs.append)
+    assert plans == [{'name': '泥岩', 'role': 'Tank', 'elite': 2,
+                      'skill_level': 7, 'skill_mastery': [0, 3, 0]}], plans
+
+    done_rows = skills._train_rows({'operator': '银灰', 'elite': 2,
+                                    'skillLevel': 7, 'mastery': [0, 3, 0]})
+    assert skills._train_plans(done_rows, 'smoke-acc.json',
+                               log=logs.append) == []
+    assert any('不用培养' in x for x in logs), logs
+    try:
+        skills._train_plans([{'name': '不存在的干员'}], 'smoke-acc.json',
+                            log=lambda *_: None)
+        raise AssertionError('未知干员没被拦')
+    except ValueError as e:
+        assert '没有' in str(e), e
+
+    # 3) core_tasks：plans 原样进 OperProgress；noStartUp 时不补唤醒
+    seq = maaplan.core_tasks({'tasks': ['operprogress'], 'plans': plans,
+                              'noStartUp': True})
+    assert seq == [('OperProgress', {'plans': plans})], seq
+    seq = maaplan.core_tasks({'tasks': ['operprogress'], 'plans': plans,
+                              'accountName': '5505'})
+    assert [t for t, _ in seq] == ['StartUp', 'OperProgress'], seq
+
+    # 4) 材料不足 → 暂停（不是失败），剩下计划落盘、resume 读得回来
+    calls = []
+    st = {'plans': plans, 'done': {}, 'stop': lambda: calls.append('stop')}
+    maaplan._on_core_event({'kind': 'extra', 'what': 'OperProgressDetail',
+                            'data': {'name': '泥岩', 'result': 'Success',
+                                     'elite': 2}}, lambda *_: None, 't', st)
+    assert st['done']['泥岩']['elite'] == 2, st['done']
+    maaplan._on_core_event({'kind': 'extra', 'what': 'OperProgressDetail',
+                            'data': {'name': '泥岩', 'result': 'Failed',
+                                     'result_detail': 'ResourceInsufficient'}},
+                           lambda *_: None, 't', st)
+    assert '材料不足' in st['pause'], st
+    assert calls == ['stop'], calls
+    left = skills._remain_plans(plans, st['done'])
+    # 精英化已经做完 → 只剩技能与专精（绝对等级，不扣减）
+    assert left == [{'name': '泥岩', 'role': 'Tank', 'skill_level': 7,
+                     'skill_mastery': [0, 3, 0]}], left
+    skills._save_train_plan('smoke-acc.json', left)
+    got = skills._load_train_plan()
+    assert got and got['account'] == 'smoke-acc.json' and got['plans'] == left, got
+    skills._save_train_plan('smoke-acc.json', [])
+    assert skills._load_train_plan() is None
+
+    # 4b) 缺芯片 = 「该去补芯片」，不是崩。MaaCore 6.20.1 在 E0→E1 缺普通
+    #     芯片时直接返回 ChipNotCraftable、不去加工站合成（上游 issue #18612，
+    #     MAA 自己的界面跑也一样）。2026-11-19 用户看到的「卡在升级界面报错」
+    #     就是这条 + 下面 start 的误判。日志要写清「缺什么、怎么补」，
+    #     精英化没成之后的连环 PrerequisiteNotMet 不许刷屏。
+    calls2 = []
+    st3 = {'plans': plans, 'done': {}, 'stop': lambda: calls2.append('stop')}
+    out3 = []
+    maaplan._on_core_event({'kind': 'extra', 'what': 'OperProgressDetail',
+                            'data': {'name': '泥岩', 'result': 'Failed',
+                                     'result_detail': 'ChipNotCraftable'}},
+                           out3.append, 't', st3)
+    assert '芯片' in st3['pause'], st3
+    assert any('加工站' in x for x in out3), out3
+    assert calls2 == ['stop'], calls2
+    out4 = []
+    maaplan._on_core_event({'kind': 'extra', 'what': 'OperProgressDetail',
+                            'data': {'name': '泥岩', 'result': 'Failed',
+                                     'result_detail': 'PrerequisiteNotMet'}},
+                           out4.append, 't', st3)
+    assert out4 == [], out4
+
+    # 4c) 暂停后 _wait_run 不许「重排一次」把刚停下的任务又拉起来
+    class _StubEng:
+        starts = 0
+
+        def wait(self, timeout=None, poll=1.0):
+            return False
+
+        def running(self):
+            return False
+
+        def start(self, settle=15.0):
+            type(self).starts += 1
+            return True
+
+    assert maaplan._wait_run(_StubEng(), 5, lambda *_: None,
+                             {'pause': '泥岩 缺精英化芯片'}) is False
+    assert _StubEng.starts == 0, '暂停还被重排了'
+
+    # 5) MAA 日志桥：只翻有信息量的行，噪音（识别框为空 / 缺 pipeline）全丢
+    tap = maalog.Tap(None)
+    msg = tap.translate('[2026-11-18 14:41:00.533][ERR][Px1][Tx2] '
+                        'asst::MultiCopilotTaskPlugin::confirm_stage_name '
+                        'confirm stage name failed after retrying 3 times, '
+                        'stage name: MN-EX-6')
+    assert msg and 'MN-EX-6' in msg[1], msg
+    assert tap.translate('[2026-11-18 14:41:00.533][WRN][Px1][Tx2] '
+                         'asst::VisionHelper::correct_rect roi is empty') is None
+    assert tap.translate('[2026-11-18 14:41:00.533][ERR][Px1][Tx2] '
+                         'Unknown task: FightSeries-OldMethodFlag') is None
+    assert tap.translate('[2026-11-18 14:41:00.533][TRC][Px1][Tx2] x') is None
+
+    # 6) 战斗过程要有日志：编队 / 部署 / 开技能各一条，重复的部署不刷屏
+    out = []
+    st2 = {'actions': {}, 'deployed': []}
+    for ev in ({'kind': 'extra', 'what': 'BattleFormation',
+                'data': {'formation': ['银灰', '泥岩']}},
+               {'kind': 'extra', 'what': 'CopilotAction',
+                'data': {'action': 'Deploy', 'target': '银灰'}},
+               {'kind': 'extra', 'what': 'CopilotAction',
+                'data': {'action': 'Deploy', 'target': '银灰'}},
+               {'kind': 'extra', 'what': 'CopilotAction',
+                'data': {'action': 'UseSkill'}}):
+        maaplan._on_core_event(ev, out.append, 't', st2)
+    assert out == ['编队：银灰、泥岩', '部署 银灰', '开技能'], out
+    # Output / SkillUsage 这类内部记账不该把英文原文写进面板
+    out = []
+    maaplan._on_core_event({'kind': 'extra', 'what': 'CopilotAction',
+                            'data': {'action': 'Output'}},
+                           out.append, 't', {'actions': {}})
+    assert out == [], out
+
+    # 7) SubTaskStart 的 pipeline 名必须跟真实 asst.log 对得上。
+    #    2026-11-18 踩过：映射表的键是照源码猜的（Copilot@BattleStartPreFlag），
+    #    而 asst.log 里 first[0] 实际是 BattleStartAll / BattleQuickFormation，
+    #    结果战斗一整段没日志。这里把「真实 JSON → maacore._translate →
+    #    中文进度」整条链走一遍，键再错位会直接红。
+    from core import maacore
+    eng = object.__new__(maacore.Engine)   # 不 open，只借 _translate（不碰 DLL）
+    samples = [
+        ({'first': ['Copilot@WaitUntilEndOfAction'], 'taskchain': 'Copilot'}, '战斗中'),
+        ({'first': ['Copilot@FullStageNavigation'], 'taskchain': 'Copilot'}, '找关卡'),
+        ({'first': ['Copilot@StageNavigationSlowlySwipeLeft'],
+          'taskchain': 'Copilot'}, '滑动找关卡'),
+        ({'first': ['BattleStartAll'], 'taskchain': 'Copilot'}, '开始行动'),
+        ({'first': ['BattleQuickFormation'], 'taskchain': 'Copilot'}, '快速编队'),
+        ({'first': ['UseMedicine'], 'taskchain': 'Fight'}, '吃理智药'),
+        ({'first': ['OperProgress@EliteUp'], 'taskchain': 'OperProgress'}, '精英化'),
+    ]
+    for d, want in samples:
+        ev = eng._translate(maacore.MSG_SUBTASK_START, d)
+        assert ev and ev.get('kind') == 'node', (d, ev)
+        out = []
+        maaplan._on_core_event(ev, out.append, 't', {'nodes': {}})
+        assert out == ['· ' + want], (d, out)
+    # 插件类名节点（不是用户能看懂的阶段）静默
+    ev = eng._translate(maacore.MSG_SUBTASK_START,
+                        {'first': ['BattleProcessTask'], 'taskchain': 'Copilot'})
+    out = []
+    maaplan._on_core_event(ev, out.append, 't', {'nodes': {}})
+    assert out == [], out
+    # 按职业筛选的十几种后缀统一归一类
+    assert (maaplan._subtask_label('Copilot@BattleQuickFormationRole-Caster')
+            == '编队·按职业筛选')
+
+    # 8) 切号名唯一来源 = 账号绑定的 maa.accountName；**绝不读用户的 MAA
+    #    配置档案**（2026-11-18 用户口径：agent 模式跑临时配置=StartUp 任务
+    #    参数，不碰用户的 gui.new.json）。以前这里会退回读 MAA 当前档案的
+    #    AccountName / 纯数字档案名来猜——档案和账号对不上号，猜错切号名
+    #    MAA 会在账号列表里死找 4 分钟。昵称也绝不能顶——官服切号认手机号。
+    from core import maa as maa_mod
+
+    def _forbidden(*a, **k):
+        raise AssertionError('不许读用户的 MAA 配置档案')
+
+    orig_load = maa_mod._load_cfg
+    maa_mod._load_cfg = _forbidden
+    try:
+        assert skills._account_name_tail('smoke-acc.json') == '', \
+            '没绑定切号名 → 空串（且全程没读 MAA 配置）'
+        accounts.save_maa_meta('smoke-acc.json', {'accountName': '5505'})
+        assert skills._account_name_tail('smoke-acc.json') == '5505', \
+            '账号绑定的切号名要能读到'
+    finally:
+        maa_mod._load_cfg = orig_load
+        accounts.save_maa_meta('smoke-acc.json', {'accountName': ''})
+
+    # 9) Engine.wait 的启动宽限：AsstStart 异步生效，刚 start 完 AsstRunning
+    #    还是 False——以前这里直接 return，把「还没开始跑」当「跑完」，
+    #    run_core 收尾 close，培养任务排进队列的同一毫秒就被析构（17:02
+    #    用户实测：OperProgress 一步没跑，任务报错）。
+    from types import SimpleNamespace
+    from core import maacore
+    eng = object.__new__(maacore.Engine)
+    eng._done = threading.Event()
+    eng._handle = 1
+    calls = {'n': 0}
+
+    def _running():
+        calls['n'] += 1
+        if calls['n'] > 4:             # running 生效后任务正常跑完
+            eng._done.set()
+            return True
+        return False                   # 前 4 次 False（AsstStart 还没生效）
+
+    eng._lib = SimpleNamespace(AsstRunning=lambda h: _running())
+    assert eng.wait(timeout=10, poll=0.01) is True, '启动宽限内等到 running'
+    eng2 = object.__new__(maacore.Engine)
+    eng2._done = threading.Event()
+    eng2._handle = 1
+    flip = {'n': 0}
+
+    def _flip():
+        flip['n'] += 1
+        return flip['n'] <= 3          # 先跑起来，然后被停
+
+    eng2._lib = SimpleNamespace(AsstRunning=lambda h: _flip())
+    assert eng2.wait(timeout=10, poll=0.01) is False, \
+        '跑过之后 running 变 False → 停（_done 未 set）'
+
+    # 10) Engine.start 的收尾重试：上一次任务刚跑完时 AsstStart 会返回 false
+    #     （AllTasksCompleted 早于工作线程收尾，AsstRunning 仍为 true）——
+    #     run_core 第二段「唤醒完了再排培养」正好撞这个窗口，用户 2026-11-18
+    #     看到的就是 StartUp 完成 → 排队培养 → AsstStart 返回失败。
+    eng3 = object.__new__(maacore.Engine)
+    eng3._done = threading.Event()
+    eng3._handle = 1
+    eng3._chain_starts = 0
+    st = {'start_calls': 0, 'running': 3}
+
+    def _asst_start(h):
+        st['start_calls'] += 1
+        return st['running'] <= 0        # 还没退干净就拒
+
+    def _asst_running(h):
+        if st['running'] > 0:
+            st['running'] -= 1
+            return True
+        return False
+
+    eng3._lib = SimpleNamespace(AsstStart=_asst_start, AsstRunning=_asst_running)
+    assert eng3.start(settle=5) is True, '退干净后要能重试成功'
+    assert st['start_calls'] == 2, st
+
+    # AsstStart 被拒、但实例一直在跑：这是「上一批还在收尾、队列继续被消费」，
+    # **不是**失败。2026-11-19 用户报「培养卡在升级界面报错」，三次全是这条：
+    # asst.log 里 00:25:09.674 Start | block（返回 false）→ 00:25:09.776
+    # TaskChainStart（任务照跑），我们在 15 秒后把它判成失败抛错。
+    eng4 = object.__new__(maacore.Engine)
+    eng4._done = threading.Event()
+    eng4._handle = 1
+    eng4._chain_starts = 0
+    eng4._lib = SimpleNamespace(AsstStart=lambda h: False,
+                                AsstRunning=lambda h: True)
+    assert eng4.start(settle=0.2) is True, \
+        '一直 running = 队列还在被消费，不许判成「AsstStart 返回失败」'
+
+    # 更准的判据：新任务链开始（_chain_starts 增加）就立刻返回，不干等 settle
+    eng5 = object.__new__(maacore.Engine)
+    eng5._done = threading.Event()
+    eng5._handle = 1
+    eng5._chain_starts = 0
+
+    def _deny_then_chain(h):
+        threading.Timer(0.1, lambda: setattr(eng5, '_chain_starts', 1)).start()
+        return False
+
+    eng5._lib = SimpleNamespace(AsstStart=_deny_then_chain,
+                                AsstRunning=lambda h: True)
+    t0 = time.time()
+    assert eng5.start(settle=5) is True
+    assert time.time() - t0 < 2, '看到新链开始就该立刻返回'
+
+    # 11) 账号列表要带出已绑定的切号名：用户设置里配过尾号，助手还追问过一次
+    #     （2026-11-18）——列表里有值，模型才不会重复问
+    from core import agent as agent_mod
+    lc = agent_mod._tool_list_accounts({})
+    row = next((a for a in lc['accounts'] if a['file'] == 'smoke-acc.json'), None)
+    assert row is not None, lc
+    assert 'accountName' in row, '账号列表少了 accountName 字段'
+    assert 'accountName' in (lc.get('hint') or ''), 'hint 没提示已有尾号就别问'
+
+
+def check_config_globals(tmp):
+    """B40：config/ 里的全局 json 不许把账号列表炸掉
+
+    2026-11-19 01:24 用户实测「突然无法自动战斗」：培养暂停时 skills 把
+    ``train-plan.json`` 落进 config/（里面 ``account`` 是**文件名字符串**），
+    ``accounts.list_accounts`` 的 ``(snap.get('account') or {}).get('uid')``
+    正好撞上字符串 → 整个账号列表抛 AttributeError → 唤醒 / 战斗 / 培养
+    全部报「'str' object has no attribute 'get'」。
+
+    这里把「我们自己的全局文件」和「畸形 account 段」都摆进目录，断言只有
+    真账号被列出、且谁都不抛。
+    """
+    _reset_config(tmp)
+    from core import accounts, skills, updater
+    cfg = os.path.join(tmp, 'config')
+
+    def dump(name, obj):
+        with open(os.path.join(cfg, name), 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False)
+
+    dump('good.json', {'account': {'uid': '42', 'nickName': '冒烟',
+                                   'channelName': '官服'},
+                       'maa': {'accountName': '181****5505'},
+                       'stats': {'charCount': 3}})
+    # 真正踩雷的那个：account 是文件名字符串
+    dump('train-plan.json', {'account': 'good.json', 'savedAt': '',
+                             'plans': [{'name': '山'}]})
+    dump('str-account.json', {'account': 'oops'})
+    dump('list-account.json', {'account': ['oops']})
+    dump('bad-segs.json', {'account': {'uid': '43'},
+                           'stats': 'oops', 'maa': 'oops', 'skd': 'oops'})
+    dump('arr.json', [1, 2, 3])
+
+    assert 'train-plan.json' in updater.NON_ACCOUNT_JSON, \
+        '培养计划文件必须登记成全局文件，不是账号'
+
+    rows = accounts.list_accounts()
+    files = sorted(r['file'] for r in rows)
+    assert files == ['bad-segs.json', 'good.json'], files
+
+    bad = next(r for r in rows if r['file'] == 'bad-segs.json')
+    assert bad['stats']['charCount'] is None, 'stats 是字符串时应当当空'
+    assert bad['maaAccountName'] == '', 'maa 是字符串时应当当空'
+    assert bad['hasToken'] is False
+
+    good = next(r for r in rows if r['file'] == 'good.json')
+    assert good['maaAccountName'] == '181****5505'
+
+    # 每个 skill 开跑第一句都是 _account_file('')
+    assert skills._account_file('') == 'good.json'
+    assert skills._account_file('冒烟') == 'good.json'
+
+    # 同步侧扫描 / 同名改名也不能被这些文件带崩
+    assert sorted(updater.scan_accounts(cfg)) == ['42', '43']
+
+
+def check_raid_order(tmp):
+    """B41：每关只打真正要打的那一档（默认突袭、可逐关指定）
+
+    用户 2026-11-19 03:13 实测反馈：「说好只排突袭，结果又从头挂了一遍普通
+    EX-1」。asst.log 01:42 证明 MaaCore 拿到 is_raid=true 会自己点
+    ChangeToRaidDifficulty 切难度，不需要前面垫一条普通；上一版排
+    「普通 → 突袭」两条，用户看到的就是白打一次普通。
+
+    这里钉六件事：
+    ① 默认 raid='auto'：有突袭作业的关**只排突袭**一条；
+    ② raid='both'：普通 → 突袭两条，顺序不能反；
+    ③ raid=False / 'normal'：只排普通；
+    ④ stages 支持 @raid / @both / @normal 逐关覆盖（agent 承诺的
+      「EX-1~5 只打突袭、EX-6/7 普通+突袭」要能落地）；
+    ⑤ prepare_copilot 不再自动给突袭垫普通；
+    ⑥ 主线险地（#s）仍是单条 is_raid=true。
+    """
+    _reset_config(tmp)
+    from core import copilot, maaplan, skills
+
+    stage_name = {}
+
+    def fake_search(st, snap, pages=1, limit=6):
+        st = st.upper()
+        base = sum(ord(c) for c in st) * 100
+        stage_name[base] = st
+        stage_name[base + 1] = st
+        return {'stages': [
+            {'stage': {'code': st, 'variant': 'normal'},
+             'ops': [{'copilotId': base, 'mode': 'ready', 'rating': 9,
+                      'title': '普通作业', 'difficulty': copilot.DIFF_NORMAL}]},
+            {'stage': {'code': st, 'variant': 'raid'},
+             'ops': [{'copilotId': base + 1, 'mode': 'ready', 'rating': 8,
+                      'title': '突袭作业', 'difficulty': copilot.DIFF_RAID}]},
+        ]}
+
+    def fake_fetch(cid):
+        cid = int(cid)
+        if cid == 301:      # 通用位作业：既能打普通也能打突袭
+            return ({'stage_name': 'SV-EX-3'},
+                    copilot.DIFF_NORMAL | copilot.DIFF_RAID, 'SV-EX-3', [], True)
+        raid = cid % 100 == 1
+        flags = copilot.DIFF_RAID if raid else copilot.DIFF_NORMAL
+        return ({'stage_name': stage_name.get(cid, 'X')}, flags,
+                stage_name.get(cid, 'X'), [], True)
+
+    old = (copilot.search, copilot.fetch_prepared, skills._default_maa_dir)
+    copilot.search, copilot.fetch_prepared = fake_search, fake_fetch
+    skills._default_maa_dir = lambda: tmp
+    try:
+        logs = []
+        rows, _retry = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '',
+                                          logs.append)
+        seq = [(r['stage_name'], r['is_raid']) for r in rows]
+        # ① 默认只打突袭——不再先刷一遍普通
+        assert seq == [('SV-EX-1', True), ('SV-EX-2', True)], seq
+
+        # ② both：普通 → 突袭两条，顺序不能反
+        rows_b, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='both')
+        seq_b = [(r['stage_name'], r['is_raid']) for r in rows_b]
+        assert seq_b == [('SV-EX-1', False), ('SV-EX-1', True)], seq_b
+
+        # ③ raid=False / 'normal'：只排普通
+        rows2, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid=False)
+        assert [(r['stage_name'], r['is_raid']) for r in rows2] == [('SV-EX-1', False)]
+        rows2b, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='normal')
+        assert [(r['stage_name'], r['is_raid']) for r in rows2b] == [('SV-EX-1', False)]
+
+        # ④ 逐关覆盖：EX-1 只突袭、EX-2 普通+突袭（agent 承诺的混合计划）
+        want = {'SV-EX-1': 'raid', 'SV-EX-2': 'both'}
+        rows_w, _ = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '', logs.append,
+                                       raid='auto', wants=want)
+        seq_w = [(r['stage_name'], r['is_raid']) for r in rows_w]
+        assert seq_w == [('SV-EX-1', True), ('SV-EX-2', False),
+                         ('SV-EX-2', True)], seq_w
+
+        # 解析 @ 后缀与 dict 写法
+        codes, wants = skills._parse_stages(
+            ['SV-EX-1@raid', 'SV-EX-2@both', 'SV-EX-3@normal',
+             {'stage': 'SV-EX-4', 'raid': True}, 'SV-EX-5'])
+        assert codes == ['SV-EX-1', 'SV-EX-2', 'SV-EX-3', 'SV-EX-4', 'SV-EX-5'], codes
+        assert wants == {'SV-EX-1': 'raid', 'SV-EX-2': 'both',
+                         'SV-EX-3': 'normal', 'SV-EX-4': 'both'}, wants
+
+        # 某一关没作业 / 搜挂了：跳过它继续，别拖垮整批（预检标 unknown
+        # 的关卡、作业站抽风时靠这条，否则一发请求失败整次挂机都不跑）
+        logs_skip = []
+
+        def fake_search_mixed(st, snap, pages=1, limit=6):
+            if st.upper() == 'XX-1':
+                return {'stages': []}
+            return fake_search(st, snap, pages=pages, limit=limit)
+
+        copilot.search = fake_search_mixed
+        rows_skip, _ = skills._prepare_ops(['SV-EX-1', 'XX-1'], '',
+                                           logs_skip.append)
+        assert [r['stage_name'] for r in rows_skip] == ['SV-EX-1'], rows_skip
+        assert any('跳过 XX-1' in x for x in logs_skip), logs_skip
+        copilot.search = fake_search
+
+        # ⑤ 突袭条目不再自动垫一条普通（上一版就是它让用户白打一遍普通）
+        logs3 = []
+        rows3 = maaplan.prepare_copilot(
+            [{'copilotId': 301, 'stageCode': 'SV-EX-3', 'variant': 'raid'}],
+            tmp, log=logs3.append)
+        assert [(r['stage_name'], r['is_raid']) for r in rows3] == \
+            [('SV-EX-3', True)], rows3
+        assert not any('补一条普通' in x for x in logs3), logs3
+
+        # 主线险地（#s）不是突袭：不补普通条目
+        logs5 = []
+        copilot.fetch_prepared = lambda cid: ({'stage_name': 'main_15-3#s'},
+                                              copilot.DIFF_NORMAL | copilot.DIFF_RAID,
+                                              'main_15-3#s', [], True)
+        rows5 = maaplan.prepare_copilot(
+            [{'copilotId': 501, 'stageCode': '15-3', 'variant': 'raid'}],
+            tmp, log=logs5.append)
+        assert [(r['stage_name'], r['is_raid']) for r in rows5] == [('15-3', True)], rows5
+    finally:
+        copilot.search, copilot.fetch_prepared, skills._default_maa_dir = old
+
+
+def check_agent_tool_chain(tmp):
+    """B42：工具调用历史断链 + 点名换作业真的生效（2026-11-19 03:00）
+
+    用户报「老是存在这种报错」：服务端 400 `Messages with role 'tool' must be
+    a response to a preceding message with 'tool_calls'`。三种断法：
+
+    ① `_trim` 按条数裁剪，切点落在 tool_calls 与 tool 结果中间 → 开头孤儿 tool；
+    ② 工具要确认、用户点取消 → tool_call 永远没有响应；
+    ③ 工具抛异常 / 一批调用里后面几个没执行。
+
+    历史断一次就每轮都 400（坏消息一直在 s.messages 里），所以发送前必须
+    `_sanitize`：孤儿 tool 丢弃、缺响应的 tool_call 补占位。
+
+    第二个问题：「换了作业但 MAA 还是用同一份」。skill_fight 新增 ops 参数
+    钉住 copilotId，`_prepare_ops(fixed=...)` 不许再搜索。
+    """
+    _reset_config(tmp)
+    from types import SimpleNamespace
+    from core import agent, copilot, skills
+
+    def ids(msgs):
+        return [(m.get('role'), m.get('tool_call_id') or '') for m in msgs]
+
+    tc = {'id': 'call_a', 'type': 'function',
+          'function': {'name': 'skill_fight', 'arguments': '{}'}}
+    msgs = [
+        {'role': 'user', 'content': '开打'},
+        {'role': 'tool', 'tool_call_id': 'orphan', 'content': '孤儿'},   # ①
+        {'role': 'assistant', 'content': '', 'tool_calls': [tc]},
+        {'role': 'user', 'content': '算了'},                              # ② 没响应
+    ]
+    out = agent._sanitize(msgs)
+    assert ('tool', 'orphan') not in ids(out), '孤儿 tool 要丢掉'
+    # 每个 tool 前面必须有带同名 tool_calls 的 assistant
+    seen = set()
+    for m in out:
+        if m['role'] == 'assistant':
+            seen |= {x.get('id') for x in (m.get('tool_calls') or [])}
+        elif m['role'] == 'tool':
+            assert m.get('tool_call_id') in seen, 'tool 前面没有对应 tool_calls'
+    assert any(m['role'] == 'tool' and m.get('tool_call_id') == 'call_a'
+               for m in out), '缺响应的 tool_call 要补占位'
+
+    # 正常序列原样保留
+    good = [{'role': 'user', 'content': 'q'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [tc]},
+            {'role': 'tool', 'tool_call_id': 'call_a', 'content': 'ok'}]
+    assert agent._sanitize(good) == good, '合法序列不许改动'
+
+    # ③ 裁剪后不能以 tool 开头
+    s = SimpleNamespace(messages=[{'role': 'user', 'content': 'q'}] +
+                        [{'role': 'tool', 'tool_call_id': 't%d' % i,
+                          'content': ''} for i in range(40)])
+    agent._trim(s)
+    assert s.messages[0]['role'] == 'user'
+    assert all(m['role'] != 'tool' for m in s.messages[1:]), \
+        '裁剪后开头不许是半截工具结果'
+
+    # ---- 点名换作业：fixed 里给了 copilotId 就不再搜索 ----
+    stage_name = {4242: 'SV-EX-1'}
+    hits = {'search': 0}
+
+    def fake_search(st, snap, pages=1, limit=6):
+        hits['search'] += 1
+        return {'stages': [{'stage': {'code': st, 'variant': 'raid'},
+                            'ops': [{'copilotId': 4242, 'mode': 'ready',
+                                     'rating': 9, 'title': '默认那份'}]}]}
+
+    def fake_fetch(cid):
+        cid = int(cid)
+        return ({'stage_name': stage_name.get(cid, 'SV-EX-1')},
+                copilot.DIFF_RAID, 'SV-EX-1', [], True)
+
+    old = (copilot.search, copilot.fetch_prepared, skills._default_maa_dir)
+    copilot.search, copilot.fetch_prepared = fake_search, fake_fetch
+    skills._default_maa_dir = lambda: tmp
+    try:
+        logs = []
+        rows, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                      fixed={'SV-EX-1': 98765})
+        assert hits['search'] == 0, '指名作业后不许再搜作业站'
+        assert rows[0]['filename'].endswith('98765.json'), rows
+        assert rows[0]['is_raid'] is True, rows
+        assert any('按指定作业 #98765' in x for x in logs), logs
+    finally:
+        copilot.search, copilot.fetch_prepared, skills._default_maa_dir = old
+
+
+def check_battle_retry(tmp):
+    """B43：逐关战报 + 换作业重挂 + 分段扫图（用户 2026-11-19 的四条需求）
+
+    ① 一关打完日志有「✔ X 战斗成功」，刷材料重复结算不刷屏
+    ② 作业翻车时日志明确「✘ X 翻车：原因」，能看出是哪一关
+    ③ 失败后换下一份作业重挂这一关，**已成功的关不重排**
+    ④ skill_sweep 的分段顺序：普通关 → EX 普通 → EX 突袭 → S 关
+    """
+    _reset_config(tmp)
+    from core import copilot, maaplan, resources, skills
+
+    # ① 逐关成功
+    st = {'stage': 'SV-EX-1', 'cleared': {}, 'results': [], 'cur_cid': 41623}
+    logs = []
+    maaplan._mark_clear({'stats': [{'itemName': '固源岩', 'addQuantity': 2}]},
+                        logs.append, st)
+    assert len(st['results']) == 1, st
+    r0 = st['results'][0]
+    assert r0['stage'] == 'SV-EX-1' and r0['ok'] is True and r0['cid'] == 41623, r0
+    assert any('✔ SV-EX-1 战斗成功' in x and '固源岩' in x for x in logs), logs
+    # 同一关再结算一次（刷材料）：只喊一次「战斗成功」
+    maaplan._mark_clear({'stats': []}, logs.append, st)
+    assert sum(1 for x in logs if '战斗成功' in x) == 1, logs
+
+    # ② 翻车要说清是哪一关
+    st2 = {'stage': 'SV-EX-2', 'cleared': {}, 'results': []}
+    logs2 = []
+    maaplan._mark_fail({'chain': 'Copilot', 'why': 'not enough operators'},
+                       logs2.append, st2)
+    assert st2['results'] and st2['results'][0]['ok'] is False, st2
+    assert any('✘ SV-EX-2 翻车' in x for x in logs2), logs2
+    # 不是 Copilot 链挂了（例如 StartUp）：没有「哪一关」，不记到关卡上
+    st2b = {'stage': 'SV-EX-2', 'cleared': {}, 'results': []}
+    maaplan._mark_fail({'chain': 'StartUp', 'why': 'x'}, logs2.append, st2b)
+    assert st2b['results'] == [], st2b
+    # 同一关先失败后成功：算成功
+    ok, bad = maaplan._tally([{'stage': 'A', 'ok': False, 'why': 'x'},
+                              {'stage': 'A', 'ok': True, 'why': ''}])
+    assert ok == ['A'] and bad == [], (ok, bad)
+
+    # ③ 换作业重挂：只挂没成功的那关，并且换成候选里的下一份
+    def fake_fetch(cid):
+        cid = int(cid)
+        code = 'SV-EX-%d' % (2 if cid in (102, 202) else 1)
+        return ({'stage_name': code}, copilot.DIFF_RAID, code, [], True)
+
+    class Eng:
+        def __init__(self):
+            self.appended, self.chains = [], []
+
+        def append(self, typ, params):
+            self.appended.append((typ, params))
+            self.chains.append({'chain': typ, 'ok': True, 'stopped': False})
+
+        def start(self):
+            return True
+
+        def running(self):
+            return False
+
+        def wait(self, timeout=0, poll=0.5):
+            return True
+
+        def stop(self):
+            pass
+
+    old = (copilot.fetch_prepared, skills._default_maa_dir)
+    copilot.fetch_prepared = fake_fetch
+    skills._default_maa_dir = lambda: tmp
+    try:
+        eng = Eng()
+        state = {'stage': 'SV-EX-2', 'cleared': {'SV-EX-1': True},
+                 'results': [{'stage': 'SV-EX-1', 'ok': True, 'why': '',
+                              'at': 0, 'cid': 101},
+                             {'stage': 'SV-EX-2', 'ok': False, 'why': 'x',
+                              'at': 0, 'cid': 102}],
+                 'tried': {'SV-EX-1@raid': 101, 'SV-EX-2@raid': 102},
+                 'by_file': {}, 'cid_of': {}, 'last_log': 0}
+        spec = {'copilotList': [
+                    {'filename': 'SV-EX-1_101.json', 'stage_name': 'SV-EX-1',
+                     'is_raid': True},
+                    {'filename': 'SV-EX-2_102.json', 'stage_name': 'SV-EX-2',
+                     'is_raid': True}],
+                'retry': {'maxRounds': 3,
+                          'pool': {'SV-EX-1@raid': [101, 201],
+                                   'SV-EX-2@raid': [102, 202]}}}
+        logs3 = []
+        swapped, mark = maaplan._retry_failed(eng, spec, state, logs3.append,
+                                              tmp, time.time() + 600)
+        assert len(eng.appended) == 1, eng.appended
+        rows = eng.appended[0][1]['copilot_list']
+        assert [r['stage_name'] for r in rows] == ['SV-EX-2'], rows
+        assert rows[0]['filename'].endswith('_202.json'), rows
+        assert swapped and swapped[0]['to'] == 202, swapped
+        assert mark is not None, '重试过就要给收尾一个 chains 分界'
+        assert any('换作业重挂：SV-EX-2' in x for x in logs3), logs3
+        assert not any('SV-EX-1' in x for x in logs3), '已成功的关不该重挂'
+    finally:
+        copilot.fetch_prepared, skills._default_maa_dir = old
+
+    # ④ 分段扫图：普通 → EX 普通 → EX 突袭 → S
+    old_res = resources.resolve
+    resources.resolve = lambda kw: {
+        'mode': 'activity', 'title': '测试活动', 'stages': [
+            {'code': 'SV-1', 'story': False, 'stageId': 'act55side_01'},
+            {'code': 'SV-2', 'story': False, 'stageId': 'act55side_02'},
+            {'code': 'SV-EX-1', 'story': False, 'stageId': 'act55side_ex01'},
+            {'code': 'SV-S-1', 'story': False, 'stageId': 'act55side_s01'},
+            {'code': 'SV-ST-1', 'story': True, 'stageId': 'act55side_st01'}]}
+    try:
+        segs, title = skills._sweep_segments('SV', lambda *_: None)
+        assert [s['name'] for s in segs] == ['普通关', 'EX 关·普通',
+                                            'EX 关·突袭', 'S 关'], segs
+        assert [s['variant'] for s in segs] == ['normal', 'normal', 'raid',
+                                                'normal'], segs
+        assert all('ST-' not in c for s in segs for c in s['codes']), segs
+        segs2, _ = skills._sweep_segments('SV', lambda *_: None, raid='normal')
+        assert [s['name'] for s in segs2] == ['普通关', 'EX 关', 'S 关'], segs2
+        segs3, _ = skills._sweep_segments('SV', lambda *_: None, tiers=['ex'])
+        assert [s['name'] for s in segs3] == ['EX 关·普通', 'EX 关·突袭'], segs3
+    finally:
+        resources.resolve = old_res
+
+
+def check_event_nav(tmp):
+    """B44：当期活动导航 + 翻车重挂前点结算页 + 关卡名单核对
+
+    ① 当期活动表带有效期（TL 到 2026-11-25），过期只提示不失效
+    ② 用户说「最新活动 / 活动名」能落到真实代号（TL-1）
+    ③ 导航模板都在包里（缺了就只能靠兜底坐标）
+    ④ goto_stage_list 对当期活动先走 eventnav，不再点老的活动大图
+    ⑤ 翻车重挂前点一下结算页（MAA 自己的 ClickCorner 位置）回关卡列表
+    ⑥ 名单核对：用户点名的关之外的编号一律剔掉
+    """
+    _reset_config(tmp)
+    import datetime
+
+    from core import eventnav, maaplan, skills, stagenav
+
+    # ① 有效期
+    assert eventnav.has('TL-EX-1') and not eventnav.has('SV-EX-1')
+    assert not eventnav.is_expired('TL', datetime.date(2026, 11, 19))
+    assert eventnav.is_expired('TL', datetime.date(2026, 11, 26))
+    act = eventnav.active(datetime.date(2026, 11, 19))
+    assert any(r['prefix'] == 'TL' and r['until'] == '2026-11-25' for r in act), act
+    assert not any(r['prefix'] == 'TL'
+                   for r in eventnav.active(datetime.date(2026, 12, 1)))
+
+    # ② 指代 → 真实代号
+    assert eventnav.match_name('最新活动') == 'TL-1'
+    assert eventnav.match_name('当期活动') == 'TL-1'
+    assert eventnav.match_name('时间啊，向前！') == 'TL-1'
+    assert eventnav.match_name('时间啊向前') == 'TL-1'
+    assert eventnav.match_name('覆潮之下') == ''
+    assert skills.norm_stage('最新活动')[0] == 'TL-1'
+    assert skills.norm_stage('SV-EX-1')[0] == 'SV-EX-1'
+
+    # ③ 模板齐全 + 分区结构（基础 / EX / S 都要有兜底坐标和识别区域）
+    ent = eventnav.ENTRIES['TL']
+    specs = [ent['entry']] + list(ent['zones'].values())
+    for s in specs:
+        p = eventnav._tpl_path(s['tpl'])
+        assert p and os.path.isfile(p), s
+    assert set(ent['zones']) == {'base', 'ex', 's'}, ent['zones']
+    for k, v in ent['zones'].items():
+        assert len(v['tap']) == 2 and len(v['roi']) == 4, (k, v)
+    # ROI 只框住目标按钮：EX 和 S 的识别区域不能重叠到互相抢
+    assert ent['zones']['ex']['roi'][1] + ent['zones']['ex']['roi'][3] \
+        <= ent['zones']['s']['roi'][1], ent['zones']
+
+    # ④ 当期活动先走 eventnav
+    called = []
+    old_run = eventnav.run
+    eventnav.run = lambda touch, code, log=None: (
+        called.append(code) or (True, 'ok'))
+    try:
+        ok, why = stagenav.goto_stage_list(object(), 'TL-EX-1', lambda *_: None)
+    finally:
+        eventnav.run = old_run
+    assert ok and called == ['TL-EX-1'], (ok, called)
+
+    # ⑤ 重挂前点结算页 → 回到关卡列表
+    taps = []
+
+    class Touch:
+        def __init__(self, *a, **kw):
+            self.n = 0
+
+        def ready(self):
+            return True, 'ok'
+
+        def shot(self):
+            self.n += 1
+            return b'frame%d' % self.n
+
+        def tap(self, x, y):
+            taps.append((x, y))
+            return True
+
+    class FakeTime:
+        @staticmethod
+        def sleep(_s):
+            return None
+
+        @staticmethod
+        def time():
+            return 0.0
+
+    old = (stagenav.Touch, stagenav.probe, stagenav._moved, maaplan.time)
+    stagenav.Touch = Touch
+    stagenav._moved = lambda a, b, thr=3.0: False      # 画面不动 = 点完了
+    maaplan.time = FakeTime
+    talk, naved = [], []
+    old_nav = maaplan._navigate
+    maaplan._navigate = lambda conn, st, log, client=None: (
+        naved.append(st) or (True, 'ok'))
+    try:
+        stagenav.probe = lambda t: 'map'
+        ok = maaplan._leave_result({'adb_path': 'adb', 'address': 'x'},
+                                   {'clientType': 'Official'}, 'TL-EX-1',
+                                   talk.append)
+        assert ok, talk
+        assert taps and taps[0] == maaplan._RESULT_TAP, (taps, maaplan._RESULT_TAP)
+        assert any('点回到关卡列表' in x for x in talk), talk
+        assert not naved, '已经在关卡列表就不该再导航'
+        # 点完不在关卡列表（例如停在主题页）：退回重新导航
+        taps.clear()
+        stagenav.probe = lambda t: 'theme'
+        ok2 = maaplan._leave_result({'adb_path': 'adb', 'address': 'x'},
+                                    {'clientType': 'Official'}, 'TL-EX-1',
+                                    talk.append)
+        assert ok2 and naved == ['TL-EX-1'], (ok2, naved)
+    finally:
+        (stagenav.Touch, stagenav.probe, stagenav._moved,
+         maaplan.time) = old
+        maaplan._navigate = old_nav
+
+    # ⑥ 名单核对：用户点名之外的关剔掉，缺的要点名
+    logs = []
+    got = skills._tidy_stage_list(['SV-EX-1', 'SV-EX-2', 'SV-EX-7'],
+                                 ['SV-EX-1', 'SV-EX-2'], logs.append)
+    assert got == ['SV-EX-1', 'SV-EX-2'], got
+    assert any('SV-EX-7' in x and '剔除' in x for x in logs), logs
+    logs2 = []
+    got2 = skills._tidy_stage_list(['SV-EX-1'], ['SV-EX-1', 'SV-EX-2'],
+                                   logs2.append)
+    assert got2 == ['SV-EX-1'], got2
+    assert any('SV-EX-2' in x and '没在计划里' in x for x in logs2), logs2
+
+def check_stage_infer(tmp):
+    """B45：资源包缺分区（当期活动 EX/S）时的四件事
+
+    2026-11-19 用户实测：「还是不会选突袭，说的和实际给我选择的关不一样」。
+    查下来是三处连环：
+      1) 资源包只有 TL-1~TL-10，没有 TL-S-4，于是搜索走「全文搜第一条的
+         stage_name」兜底，把 TL-S-4 认成 act55side_s02 —— 挂 S-4 抄 S-2 的
+         作业，突袭行也拿不到；
+      2) 预检默认补前置，用户只点名 S-3/S-4，S-1、S-2 也被从头打一遍；
+      3) 突袭作业判「缺干员」时程序默默降级成普通，用户看到的就是「不打突袭」。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import resources, stageplan, skills
+    from core import copilot as cp
+
+    # ① 代号推断：资源包里没有的分区按同活动基础关推 stageId
+    assert resources.resolve('TL-1')['stages'], 'TL 基础关应该在资源包里'
+    inf = resources.infer_stage('TL-S-4')
+    assert inf and inf['stageId'] == 'act55side_s04', inf
+    assert inf['raid'] is True and inf['difficulty'] == 'normal', inf
+    assert resources.infer_stage('TL-EX-3')['stageId'] == 'act55side_ex03'
+    assert resources.infer_stage('TL-MO-1')['stageId'] == 'act55side_mo01'
+    assert resources.infer_stage('TL-1') is None, '基础关不瞎推'
+    assert resources.infer_stage('胡言乱语') is None
+    rep = resources.resolve('TL-S-4')
+    assert rep['mode'] == 'stage' and rep['stages'][0]['code'] == 'TL-S-4', rep
+    assert rep['stages'][0]['stageId'] == 'act55side_s04', rep
+
+    # ② 预检认识推断出来的关：能算前置、能排序、默认不展开
+    assert (stageplan.row_of('TL-S-4') or {}).get('stageId') == 'act55side_s04'
+    assert stageplan.prereq_codes('TL-S-4') == [
+        'TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4'], stageplan.prereq_codes('TL-S-4')
+    assert [i['code'] for i in stageplan.expand(['TL-S-4'], with_prereq=False)] \
+        == ['TL-S-4']
+    assert [i['code'] for i in stageplan.expand(['TL-S-4'], with_prereq=True)] \
+        == ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4']
+
+    # ③ 名单核对：多出来的 S-5 剔掉，S-1~S-4（同分区前面的关）留着
+    got = skills._tidy_stage_list(
+        ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4', 'TL-S-5'],
+        ['TL-S-3', 'TL-S-4'], lambda *_: None)
+    assert got == ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4'], got
+
+    # ④ 突袭作业判「缺干员」也照排突袭；补进来的前置关只打普通；@both 两条
+    orig = cp.search
+
+    def fake_search(code, snap=None, **kw):
+        return {'mode': 'stage', 'stages': [
+            {'stage': {'code': code, 'variant': 'normal'},
+             'ops': [{'copilotId': 11, 'mode': 'ready', 'rating': 9, 'title': 'n'}]},
+            {'stage': {'code': code, 'variant': 'raid'},
+             'ops': [{'copilotId': 12, 'mode': 'blocked', 'missing': ['甲'],
+                      'rating': 9, 'title': 'r'}]}]}
+    cp.search = fake_search
+    try:
+        logs = []
+        picks, pool = skills._select_ops(['TL-S-3'], '', logs.append, raid='auto')
+        assert picks == [{'copilotId': 12, 'stageCode': 'TL-S-3',
+                          'variant': 'raid'}], picks
+        assert any('缺干员' in x for x in logs), logs
+
+        picks, _ = skills._select_ops(['TL-S-1'], '', logs.append, raid='auto',
+                                      prereq={'TL-S-1'})
+        assert picks and picks[0]['variant'] == 'normal', picks
+        assert any('补的前置关' in x for x in logs), logs
+
+        picks, _ = skills._select_ops(['TL-S-3'], '', logs.append, raid='auto',
+                                      wants={'TL-S-3': 'both'})
+        assert [p['variant'] for p in picks] == ['normal', 'raid'], picks
+
+        # 这关压根没有突袭作业时才退回普通
+        cp.search = lambda code, snap=None, **kw: {
+            'mode': 'stage', 'stages': [
+                {'stage': {'code': code, 'variant': 'normal'},
+                 'ops': [{'copilotId': 21, 'mode': 'ready', 'rating': 9,
+                          'title': 'n'}]}]}
+        picks, _ = skills._select_ops(['TL-S-2'], '', logs.append, raid='auto')
+        assert picks and picks[0]['variant'] == 'normal', picks
+    finally:
+        cp.search = orig
+
+    # ⑤ 预检全判「缺干员」时不拒绝（缺人能借助战），判「练度不足」才拒绝
+    orig_rev, orig_prep, orig_run, orig_acc = (
+        stageplan.review, skills._prepare_ops,
+        skills.maaplan.run_core, skills._account_file)
+    orig_dir = skills._default_maa_dir
+    try:
+        skills._account_file = lambda n: 'x.json'
+        skills._default_maa_dir = lambda: 'MAA'
+        skills._prepare_ops = lambda *a, **k: ([], {})
+        skills.maaplan.run_core = lambda *a, **k: {
+            'ok': True, 'stages_ok': [], 'stages_failed': [], 'swaps': []}
+
+        def fake_review(stages, *a, **k):
+            return {'plan': [{'code': 'TL-S-3', 'prereq': False,
+                              'state': 'blocked', 'reason': '缺干员',
+                              'notes': [], 'story': False, 'kind': 's'}],
+                    'playable': [], 'ops': {}, 'notes': [],
+                    'blocked': [{'code': 'TL-S-3', 'reason': '缺干员且借不到',
+                                 'notes': []}],
+                    'summary': 'x', 'requested': list(stages)}
+        stageplan.review = fake_review
+        res = skills.skill_fight({'stages': ['TL-S-3'], 'account': 'x'},
+                                 lambda *_: None)
+        assert res['ok'] and res['stages'] == ['TL-S-3'], res
+
+        stageplan.review = lambda *a, **k: dict(
+            fake_review(['TL-S-3']),
+            blocked=[{'code': 'TL-S-3', 'reason': '练度不足', 'notes': []}])
+        try:
+            skills.skill_fight({'stages': ['TL-S-3'], 'account': 'x'},
+                               lambda *_: None)
+        except ValueError as e:
+            assert '一关都打不了' in str(e), e
+        else:
+            raise AssertionError('练度不足也不该硬排')
+    finally:
+        (stageplan.review, skills._prepare_ops, skills.maaplan.run_core,
+         skills._account_file) = (orig_rev, orig_prep, orig_run, orig_acc)
+        skills._default_maa_dir = orig_dir
+
+
+def check_maa_tool(tmp):
+    """B46：MAA 小工具（牛杂）—— 战时新闻委员会 / 活动商店
+
+    ① 两个入口模板都在包里，`tools` 结构合法（roi/tap/wait）
+    ② `run_tool` 先到活动地图、再点入口节点，点位用的是 tools 里的配置
+    ③ `maatools.resolve` 认中文名 / 别名 / 键
+    ④ 活动商店黑名单**只能**挂在 `params.event_shop.blacklist`，且非空全字符串
+       （挂错地方 / 空数组 = 静默买光无限池，这条是实测踩出来的）
+    ⑤ 空黑名单直接报错，不给「悄悄买无限池」的机会
+    ⑥ `skill_tool` 串起来：导航 → run_custom，卡住时把教程那句话带给用户
+    """
+    _reset_config(tmp)
+
+    from core import eventnav, maaplan, maatools, skills
+
+    # ① 模板 + 结构
+    ent = eventnav.ENTRIES['TL']
+    assert set(ent['tools']) == {'minigame', 'shop'}, ent['tools']
+    for k, v in ent['tools'].items():
+        p = eventnav._tpl_path(v['tpl'])
+        assert p and os.path.isfile(p), (k, v['tpl'])
+        assert len(v['tap']) == 2 and len(v['roi']) == 4, (k, v)
+    # 小游戏在左上、商店在右上，识别区域不能互相盖住
+    a, b = ent['tools']['minigame']['roi'], ent['tools']['shop']['roi']
+    assert a[0] + a[2] <= b[0], (a, b)
+
+    # ② run_tool：先到活动地图，再点入口
+    calls = []
+
+    class Shot:
+        def __init__(self):
+            self.n = 0
+
+        def shot(self):
+            self.n += 1
+            return b'\x89PNG' + bytes([self.n]) * 8
+
+    orig_map, orig_tap, orig_sleep = (eventnav._to_map, eventnav._tap,
+                                      eventnav.time.sleep)
+    eventnav._to_map = lambda touch, pre, e, log: (
+        calls.append(('map', pre)) or (True, b'\x89PNG-0', '活动地图'))
+    eventnav._tap = lambda touch, data, spec, log, what: (
+        calls.append(('tap', what)) or True)
+    eventnav.time.sleep = lambda *_: None
+    try:
+        ok, why = eventnav.run_tool(Shot(), 'minigame', log=lambda *_: None)
+        assert ok and why, (ok, why)
+        assert calls[0] == ('map', 'TL'), calls
+        assert calls[1][0] == 'tap' and '战时新闻委员会' in calls[1][1], calls
+        ok2, _ = eventnav.run_tool(Shot(), 'shop', log=lambda *_: None)
+        assert ok2
+        # 没配入口要说清楚，而不是默默点到别的地方
+        ok3, why3 = eventnav.run_tool(Shot(), 'nope', log=lambda *_: None)
+        assert not ok3 and 'nope' in why3, why3
+    finally:
+        eventnav._to_map, eventnav._tap = orig_map, orig_tap
+        eventnav.time.sleep = orig_sleep
+
+    # ③ 名字 → 键
+    assert maatools.resolve('战时新闻委员会')[0] == 'wartime_press'
+    assert maatools.resolve('小游戏')[0] == 'wartime_press'
+    assert maatools.resolve('活动商店')[0] == 'event_shop'
+    assert maatools.resolve('shop')[0] == 'event_shop'
+    try:
+        maatools.resolve('抽卡')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('不认识的名字该报错')
+
+    # ④ Custom 参数：黑名单的位置和类型
+    p = maatools.build_params('wartime_press')
+    assert p == {'task_names': ['MiniGame@WartimePressCommittee@Begin']}, p
+    p = maatools.build_params('event_shop')
+    assert p['task_names'] == ['SS@Store@Begin'], p
+    bl = p['params']['event_shop']['blacklist']
+    assert bl and all(isinstance(x, str) for x in bl), bl
+    assert '龙门币' in bl and '数据增补条' in bl, bl
+    # 顶层不许出现 blacklist（挂错位置会被 MaaCore 静默忽略）
+    assert 'blacklist' not in p and 'params' in p, p
+    # 自定义名单
+    p2 = maatools.build_params('event_shop', ['固源岩'])
+    assert p2['params']['event_shop']['blacklist'] == ['固源岩'], p2
+
+    # ⑤ 空黑名单必须炸
+    try:
+        maatools.build_params('event_shop', [])
+    except ValueError as e:
+        assert '无限池' in str(e), e
+    else:
+        raise AssertionError('空黑名单会把无限池买掉，必须报错')
+
+    # ⑥ skill_tool：导航 → run_custom（打桩，不连模拟器）
+    seen = {}
+
+    class Touch:
+        def ready(self):
+            return True, 'ok'
+
+        def game_alive(self):
+            return True
+
+    orig_conn = maaplan._connection
+    orig_run_custom = maaplan.run_custom
+    orig_acc = skills._account_file
+    orig_dir = skills._default_maa_dir
+    orig_touch = skills.stagenav.Touch
+    orig_run_tool = eventnav.run_tool
+    try:
+        skills._account_file = lambda n: 'x.json'
+        skills._default_maa_dir = lambda: 'D:/fake-maa'
+        skills.stagenav.Touch = lambda *a, **k: Touch()
+
+        def fake_run_tool(t, tool, prefix=None, log=None):
+            seen['nav'] = tool
+            return True, '已进入'
+
+        eventnav.run_tool = fake_run_tool
+        maaplan._connection = lambda d, profile=None: {
+            'adb_path': 'adb', 'address': '127.0.0.1:5555',
+            'config': 'General', 'touch': 'MiniTouch', 'maa_dir': d}
+
+        def fake_run_custom(spec, tid=None, timeout=None):
+            seen['spec'] = spec
+            seen['timeout'] = timeout
+            return {'ok': False, 'stuck': 'idle', 'timed_out': False,
+                    'tutorial': spec.get('tutorial') or '',
+                    'error': ''}
+
+        maaplan.run_custom = fake_run_custom
+        logs = []
+        r = skills.skill_tool({'name': 'wartime_press', 'account': 'x'},
+                              logs.append)
+        assert seen['nav'] == 'minigame', seen
+        assert seen['spec']['task'] == {
+            'task_names': ['MiniGame@WartimePressCommittee@Begin']}, seen['spec']
+        assert seen['spec']['tutorial'], seen['spec']
+        assert seen['timeout'] >= 600, seen['timeout']
+        # 卡住时必须把「手动过教程」这句话带给用户
+        assert not r['ok'] and r['stuck'] == 'idle', r
+        assert '教程' in (r.get('hint') or ''), r
+        assert any('教程' in m for m in logs), logs
+
+        r2 = skills.skill_tool({'name': 'shop', 'account': 'x',
+                                'blacklist': '龙门币,固源岩'}, logs.append)
+        bl2 = seen['spec']['task']['params']['event_shop']['blacklist']
+        assert bl2 == ['龙门币', '固源岩'], bl2
+        assert r2['tool'] == 'event_shop', r2
+    finally:
+        maaplan._connection = orig_conn
+        maaplan.run_custom = orig_run_custom
+        skills._account_file = orig_acc
+        skills._default_maa_dir = orig_dir
+        skills.stagenav.Touch = orig_touch
+        eventnav.run_tool = orig_run_tool
+
+
 # ---------------------------------------------------------------- 入口
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -2088,6 +4559,24 @@ def main():
         r.check('B26 skland HTTP 错误响应体进任务日志（401 鉴别信息）', lambda: check_skland_http_body(tmp))
         r.check('B27 app.log 失败现场（森空岛响应体全量 + 任务失败摘要/traceback）', lambda: check_applog_capture(tmp))
         r.check('B28 推荐排序分档 + 详情缺练度/缺人提示', check_copilot_rank_band)
+        r.check('B29 剧情关双视图 + 森空岛进度解析', lambda: check_story_stages(tmp))
+        r.check('B30 日志观测（增量/轮转/停滞判定/运行记录）', lambda: check_asstlog(tmp))
+        r.check('B31 多账号编排（切号名/一账号一档案/作业列表）', lambda: check_multiacct(tmp))
+        r.check('B32 助手工具白名单 + 写操作闸门 + CLI 契约', lambda: check_agent_cli(tmp))
+        r.check('B33 任务编排（GUI 队列剔除 Copilot/直连序列/档案隔离）', lambda: check_maaplan(tmp))
+        r.check('B34 活动关导航（区域行号/页面判别/主线关不点）', lambda: check_stagenav(tmp))
+        r.check('B35 老故事集导航（曲谱入口/卡片模板/EX 切换）', lambda: check_story_nav(tmp))
+        r.check('B36 打关预检（前置关/练度/连锁/卡在哪关）', lambda: check_stage_precheck(tmp))
+        r.check('B37 环境检测（配置来源/静默/替用户启动/任务前闸门）', lambda: check_envcheck(tmp))
+        r.check('B38 设置页接口（token 读写/掩码/切号名归一）', lambda: check_settings_panel(tmp))
+        r.check('B39 培养干员（练度导入/材料暂停/续跑/战斗日志）', lambda: check_oper_train(tmp))
+        r.check('B40 全局 json 不炸账号列表（train-plan/畸形 account 段）', lambda: check_config_globals(tmp))
+        r.check('B41 每关只打要打的档（默认突袭/@后缀逐关/不再垫普通）', lambda: check_raid_order(tmp))
+        r.check('B42 工具调用断链自愈 + 点名作业真的生效', lambda: check_agent_tool_chain(tmp))
+        r.check('B43 逐关战报 + 失败换作业重挂 + 分段扫图', lambda: check_battle_retry(tmp))
+        r.check('B44 当期活动导航（有效期/指代/模板/点结算页/名单核对）', lambda: check_event_nav(tmp))
+        r.check('B45 资源包缺分区（EX/S 推断/默认不补前置/突袭不降级）', lambda: check_stage_infer(tmp))
+        r.check('B46 牛杂小工具（小游戏/活动商店/黑名单位置/卡教程提示）', lambda: check_maa_tool(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

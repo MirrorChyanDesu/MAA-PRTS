@@ -104,7 +104,8 @@ def difficulty_text(flags: int) -> str:
 def entry_variants(flags: int, variant=None, stage_name=None) -> list:
     """作业集条目在 MAA 里要写成哪几条（返回 IsRaid 列表）
 
-    variant='normal'/'raid' 是从「普通 / 突袭」那一行加的，只写对应那一条；
+    variant='normal'/'raid' 是从「普通 / 突袭」那一行加的，只写对应那一条
+    （选了突袭就一定是 IsRaid=true，不再看作业自己的位标志）；
     不带 variant（卡片、详情弹窗）沿用 MAA 的做法，按作业自身的难度标志展开。
 
     stage_name（作业自己的关卡 id）是最终裁判，覆盖上面的位标志：
@@ -119,10 +120,14 @@ def entry_variants(flags: int, variant=None, stage_name=None) -> list:
             return [True]
         if str(stage_name).startswith(('easy_', 'tough_')):
             return [False]
-    if variant == 'normal' and flags & DIFF_NORMAL:
-        return [False]
-    if variant == 'raid' and flags & DIFF_RAID:
+    if variant == 'raid':
+        # 用户 / 前端明确选了突袭这一行：就写突袭。以前这里还要看作业自身的
+        # 难度位标志（`flags & DIFF_RAID`），通用位或标漏的作业会被**静默写成
+        # 普通**——用户 2026-11-19 报「选了突袭还是只打普通」就是这条。
+        # 能不能真进去由 maaplan.prepare_copilot 保证：同一关前面垫一条普通。
         return [True]
+    if variant == 'normal':
+        return [False]
     out = [False] if flags & DIFF_NORMAL else []
     if flags & DIFF_RAID:
         out.append(True)
@@ -687,17 +692,25 @@ def row_sort_key(packed):
 
 def search(keyword, snap, pages=2, min_rating=0, limit=12):
     res = resources.resolve(keyword)
+    if res['mode'] == 'story':
+        # 剧情关没有作业可抄，也不用去问作业站：把这张卡直接给前端，
+        # 它渲染成「看剧情、不可挂机」，顺带告诉用户通关送一颗源石
+        return {'mode': 'story', 'title': res['title'], 'keyword': keyword,
+                'stages': [], 'story': res['stages'][0], 'stories': [],
+                'next': None}
     if not res['stages']:
-        # 回退：把关键词当关卡代号问作业站，用返回的 stage_name 反推
-        pool = [p for p in _pull({'document': keyword.strip()}, pages=1)
-                if p['content'].get('stage_name')]
-        if not pool:
-            return {'mode': 'unknown', 'title': '', 'keyword': keyword, 'stages': []}
-        sid = pool[0]['content']['stage_name']
-        stage = {'stageId': sid, 'code': keyword.strip().upper(), 'name': '',
-                 'zoneId': '', 'zoneName': '', 'raid': sid.endswith('#f#')}
-        res = {'mode': 'stage', 'title': '%s（%s）' % (keyword, sid),
-               'keyword': keyword, 'stages': [stage]}
+        # 资源包里没有：按代号规则推真实 stageId（当期活动的 EX / S 分区）。
+        # **不再拿「全文搜第一条的 stage_name」顶**——那条路会把 TL-S-4
+        # 认成 act55side_s02，挂 S-4 抄 S-2 的作业，用户看到的就是
+        # 「说的和实际给我选择的关不一样」。推不出来就如实说搜不到。
+        inf = resources.infer_stage(keyword)
+        if not inf:
+            return {'mode': 'unknown', 'title': '', 'keyword': keyword,
+                    'stages': []}
+        res = {'mode': 'stage',
+               'title': '%s %s' % (keyword.strip().upper(),
+                                   inf.get('zoneName') or ''),
+               'keyword': keyword, 'stages': [inf]}
 
     owned = build_owned(snap)
     # 排序算法跟账号存（用户在搜索框旁的下拉里选）：不再按干员数自动判萌新号
@@ -725,6 +738,9 @@ def search(keyword, snap, pages=2, min_rating=0, limit=12):
         'title': res['title'],
         'keyword': res['keyword'],
         'stages': results,
+        # 这一段里的剧情关（同活动 / 同章）：结果区拿它提示「挂到那里会停」，
+        # 不进结果行、不参与排序，也不去作业站查
+        'stories': resources.stories_between([s for s, _ in collected]),
         # 「下一关」按钮的数据：按置顶行（用户正在看的难度视角）推进
         'next': resources.next_stage(results[0]['stage']) if results else None,
     }

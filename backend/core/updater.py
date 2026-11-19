@@ -14,7 +14,7 @@ import json
 import os
 import re
 
-from . import atomicio, gacha, skland
+from . import atomicio, gacha, progress, skland
 from .skland import Skland
 
 SCHEMA_VERSION = 2
@@ -397,7 +397,8 @@ def diff_snapshots(old, new):
 # R5 起账号文件与这些全局文件同层放在 config/，目录遍历必须显式跳过
 # （account.uid 检查只是兜底，不能依赖它挡住解析失败的 json）
 NON_ACCOUNT_JSON = {'settings.json', 'gamedata.json', 'tokens.json',
-                    'subprof_cache.json'}
+                    'subprof_cache.json', 'train-plan.json', 'navcache.json',
+                    'appupdate.json'}
 
 
 def safe_filename(name, fallback=''):
@@ -418,7 +419,8 @@ def char_path(accounts_dir, nick, channel, uid):
         if not os.path.exists(p):
             return p
         d = load_json(p) or {}
-        if str((d.get('account') or {}).get('uid')) == str(uid):
+        acc = d.get('account') if isinstance(d, dict) else None
+        if isinstance(acc, dict) and str(acc.get('uid')) == str(uid):
             return p
         cand = '%s (%d)' % (base, n)
         n += 1
@@ -443,7 +445,9 @@ def scan_accounts(accounts_dir, game='arknights'):
         d = load_json(p)
         if not isinstance(d, dict):    # 数组形等非 dict JSON：跳过（#57）
             continue
-        acc = d.get('account') or {}
+        acc = d.get('account')
+        if not isinstance(acc, dict):   # account 段是字符串等：不是账号文件
+            continue
         if (acc.get('game') or 'arknights') != game:
             continue
         uid = str(acc.get('uid') or '')
@@ -475,8 +479,10 @@ def merge_preserved(snap, old):
     # 新快照不带 skd（重加密失败/兜底路径）而旧文件有 → 原样保留，token 不丢
     if not snap.get('skd') and old.get('skd'):
         snap['skd'] = old['skd']
-    if not ((snap.get('account') or {}).get('alias')) and (old.get('account') or {}).get('alias'):
-        snap['account']['alias'] = old['account']['alias']
+    new_acc, old_acc = snap.get('account'), old.get('account')
+    if isinstance(new_acc, dict) and isinstance(old_acc, dict) \
+            and not new_acc.get('alias') and old_acc.get('alias'):
+        new_acc['alias'] = old_acc['alias']
     return snap
 
 
@@ -523,6 +529,10 @@ def sync_one(token, alias, accounts_dir, log, with_skins=False, cache_path=None,
         old_path = existing.get(uid)
         old = load_json(old_path) if old_path else None
         snap = merge_preserved(snap, old)
+        # 关卡进度（推图点、活动 zone 计数、剿灭击杀、日常周常）：同一个
+        # player/info 里本来就有，以前没解析。放在 merge 之后，老账号下一次
+        # 同步就能补上，不需要重登
+        snap['progress'] = progress.parse(info)
         if skd_meta:
             snap['skd'] = dict(skd_meta)
         changes = diff_snapshots(old, snap)
@@ -536,6 +546,10 @@ def sync_one(token, alias, accounts_dir, log, with_skins=False, cache_path=None,
             s['mastery3Count'], s['moduleCount'], s['module3Count']))
         log('    缺卡 %d%s' % (s['missingCount'],
                                '：' + fmt_missing(snap['missing']) if snap['missing'] else '（图鉴已满）'))
+        ps = progress.summary(snap['progress'])
+        log('    进度 主线剩 %d 关（下一关 %s）｜活动 %d 区待清｜剿灭 %d 张未满' % (
+            ps['mainRemaining'], (ps.get('mainNext') or {}).get('code') or '-',
+            ps['activityLeft'], ps['campaignLeft']))
         for line in changes:
             log('    · %s' % line)
 
@@ -607,8 +621,8 @@ def _sync_endfield(roles, token, accounts_dir, log, skd_meta=None, alias=''):
         d = load_json(p)
         if not isinstance(d, dict):
             continue
-        acc = d.get('account') or {}
-        if acc.get('game') == 'endfield' and acc.get('uid'):
+        acc = d.get('account')
+        if isinstance(acc, dict) and acc.get('game') == 'endfield' and acc.get('uid'):
             existing[str(acc['uid'])] = p
 
     out = []

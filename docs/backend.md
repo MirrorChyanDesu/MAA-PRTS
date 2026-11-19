@@ -24,12 +24,25 @@
 | `core/gacha.py` | 抽卡记录（明日方舟 / 终末地）：通行证 grant → 角色 token → 记录分页 → 本地增量缓存与统计 |
 | `core/signin.py` | 森空岛每日签到（明日方舟 / 终末地）：两套接口口径，先查状态再签，全局 / 单号两种跑法 |
 | `core/copilot.py` | 作业站接口 + 干员要求匹配算法 |
-| `core/resources.py` | 读 `resources/arknights.json`：关卡索引、干员表、技能/模组名、活动正式名与代号前缀 |
+| `core/resources.py` | 读 `resources/arknights.json`：关卡索引（战斗关默认视图 / `include_story=True` 全量）、干员表、技能/模组名、活动正式名与代号前缀 |
 | `core/version.py` | 版本管理：程序版本、内置资源包版本、资源更新检测与提示 |
 | `core/packsync.py` | 资源包自动更新：读远端 manifest → 校验 sha256/条数 → 原子替换 |
 | `core/appupdate.py` | 程序本体自动更新（GitHub Releases）：查版本 → 下载校验 → 退出后由 install.ps1 替换 |
 | `core/maa.py` | MAA 进程控制、`gui.new.json` 读写、作业文件下载 |
+| `core/envcheck.py` | 开跑前的环境闸：模拟器开着没有、adb 通不通。路径优先从 MAA 的 `gui.new.json` 抄（`Config` 类型 / `AdbPath` / `Extras.<类型>.EmulatorPath` / `InstanceIndex`），再退到 `settings.emulatorPath` 和 adb 反推。没启动就替用户启动（`settings.emulatorAutoStart`，默认开），起来才放行。**不进 `SKILLS`**，所以 `/api/skill/list` 和助手工具表里都看不到它——它是每个任务的前置闸，`skills.run_skill` 起任务时自动调一次，正常时零日志 |
 | `core/tasks.py` | 内存任务表：状态、日志、结果，供前端轮询 |
+| `core/progress.py` | 森空岛 `player/info` → 关卡进度：主线推到哪（含剧情关落点）、后续关卡、活动 zone 已打/总数、剿灭最高击杀、日常周常。只做 zone 级余量判断，不拿计数切关卡列表（两边口径含剧情关/突袭关，会错位） |
+| `core/asstlog.py` | MAA 日志观测：`debug/asst.log` 的回调 JSON + `debug/gui.log` 的 `Start/Completed Task Chain` → 结构化事件流；增量读、轮转识别、状态推导（idle/running/stalled/failed/done）、`failures()` 还原「跑过哪几关、哪几关没跑完」 |
+| `core/maalog.py` | 直连跑机时的 MAA 日志桥：`maalog.Tap` 从 `asst.log` **末尾**开始增量读（`Tail.seek_end()`，不重放历史），只把 `[ERR]/[WRN]` 里能解释问题的行翻成人话（认不出关卡名 / 干员不存在 / 参数不合法），噪行丢弃、同句 20 秒去重。回调 JSON 行不读——那部分由 `maacore` 回调负责，避免同一件事写两遍 |
+| `core/watch.py` | 自愈层：后台线程盯 `asstlog` 的状态，判停滞就关 MAA → 从当前关续写作业列表 → 重启。同一关连续 3 次救不回来就停手报给用户 |
+| `core/acctname.py` | 切号名（MAA `AccountName`）的归一化与校验，**唯一一份规则**。MAA 是拿它和登录界面那行 OCR 做子串匹配，所以 `5505` / `136` / `23****45` / `181****5505` 都合法；用户给全号、带横线、全角数字、星号数量不对都归一成 `前3****后4`。官服只拦「填了昵称」（拿昵称切号会死循环几十次然后失败），B 服不拦 |
+| `core/multiacct.py` | 多账号编排：MAA「一个配置档案 = 一个账号」，按各账号练度各挑作业，串行切换执行。档案一律新建 `PRTS-` 前缀的那份，用户自己的档案一个字段都不动。切号名统一走 `acctname.check()`；`maaProfile` 是档案名不是切号名，别混用 |
+| `core/maaplan.py` | 把「用户想怎么挂」翻成可执行的东西，两条路线：① `build_queue`/`ensure_profile` 写 GUI 的 `TaskQueue` + `RunDirectly`（能看界面，但**不能抄作业**：MAA 的 `InitializeItems` 不认 CopilotTask，会抛 NotImplementedException 让整个任务列表空白）；② `core_tasks`/`run_core` 生成 MaaCore 的任务序列直接驱动（能抄作业、能跑 Custom 小活动、自己按开始）。`run_core` 跑抄作业固定四段：**登录（StartUp）→ `AsstStop` 把 MAA 停住 → 用 `stagenav` 点到关卡地图 → 再 append Copilot + `AsstStart`**。停这一步不能省：不停的话 MaaCore 还在按自己的逻辑截屏/滑动，和我们的 adb 点击抢界面。导航失败且这一关有卡片模板（老故事集）时**直接报错**，不把作业交给 MAA——它只会横向滑主线，白跑 30 秒再失败（2026-11-17 SV 实测：停住后 24 秒内 MAA 就在地图上 OCR 到 SV-1、点开始行动、自动编队开打） |
+| `core/maacore.py` | MaaCore 直连：`AsstCreateEx` → `AsstLoadResource` → `AsstConnect` → `AsstAppendTask` → `AsstStart`，回调翻成事件流。三个坑写在文件头：`AsstCreateEx` 的 restype 必须是 `c_void_p`（否则 64 位句柄截断成 32 位，每次 append 都 access violation）、Copilot 的 `filename` 必须绝对路径、`copilot_list` 的键是 `filename` 不是 `file_name`（写错会让进程 C++ 异常崩溃） |
+| `core/stagenav.py` | 把界面带到活动关的关卡列表。**MAA 自己做不到**：`TL-Open`/`TLChapterToTL` 那套模板图在当前活动 UI 上全匹配失败，Copilot 的 `FullStageNavigation` 又只会横向滑动切章节（这版游戏改成点底部 EPISODE 了）。这条路是真机一步步点出来的：底部「终端」tab → 主界面活动大图 → 主题页区域名 → 活动地图区域列表第 N 行。两个坑：① 主界面点大图是**记忆位置**的，所以流程按 `probe()` 判出的页面状态收敛，不是死按顺序点；② `AsstAsyncClick` 一次连接只能点中第一下，所以点击/截图都走 adb（`Touch`）。坐标 1280×720 口径，可用 `config/nav.json` 覆盖 |
+| `core/stagenav.py`（老故事集） | 当期活动之外的第二条路：**曲谱 → 乐章收录 → 网格找卡片 → 进入活动 →（EX / S / MO 关再点右下角那排分区图标里的对应格子）**。老活动 MAA 资源里压根没有导航配置（`Fight` 直接拒收），只能从「曲谱」这个统一索引里进。网格里卡片位置跟滚动位置绑定、新活动还会把顺序挤动，所以**按模板图找**（`navtpl/<代号>.png`，46 张随包发布，覆盖全部有战斗关的常驻活动；代号是 2026-11-17 真机把 48 张卡逐个导航进图、读落图关卡前缀核出来的，易错对照见 `stagenav.EVENTS` 注释）。分发双闸：模板存在**或**代号在 `EVENTS` 表里都走这条路；`EVENTS` 里的活动导航失败会**直接报错停止**，绝不交给 MAA——它只会横向滑主线，白跑 30 秒再失败。匹配是「1/4 降采样粗扫 + 全分辨率两轮精修 + 全程只记最像那一屏」，粗扫明显不像（>32 分）就跳过精修：真卡 0~7 分、无关卡 21 分起，**阈值 12**（暗色模板在相邻暗卡上能拿 14~19 分，18 挡不住）。五个坑：① 主界面有两套视图，不带底部 tab 的那套要先点中央「终端」大卡（`at_home()` 用底部功能格白像素判，主界面 0.45 / 其它 ≤0.07；带白色 EX 徽章的活动地图上白像素也会超 0.2，所以回主界面的判据是 `at_home AND not in_story_page AND not in_story_dialog AND not on_login_page` 四条件——后两个是 2026-11-17 补的：明亮沙地 CG 回放连 `at_home` 都能骗过，登录页浅灰底 + 白 logo 也能骗过）；② **扫描步长别贪快**：整张表（主线 + 各 Story Line + 未归组的新活动）11 屏，`_SWIPE_STEP` 360 配 1.4 秒等待刚好一张不漏；560 那版实测会漏屏——玛莉娅·临光（MN）正好落在两张截图之间，翻完 34 屏报「没找到」，用 360 重扫第 5 屏 1.0 分命中；③ **`in_story_page()` 必须两条同时成立**（底部左 tab 白 <0.05 且左上灰度 <90）：只看灰度会把主界面判成曲谱页（皮肤立绘压在左边，灰度 98.5 卡在旧阈值 100 下面），于是登录后一步没走就开始翻屏，报「翻了几十屏没找到」；④ **滑动起点必须在最左边缘 x=20 的空白处**，压到卡片上会被判成点击、直接跳进那个活动的详情页，之后分数一动不动（`goto_story_activity` 里躺过一次）；⑤ 退回上一层**先按返回键、再按 ESC**（有些详情页对 `keyevent 4` 完全没反应，ESC 一下就退）；⑥ **剧情页判定换了三版才站住**：白像素占比会把主界面右上角的货币数字（合成玉/342）当成「跳过▶」，于是「剧情排水」在主界面按返回键弹「退出游戏」又点中确认——**游戏被自己关掉**；灰度模板又把 TG 的亮天空烤进了模板，暗背景剧情全失配（而且模板匹配锚点一度把「中心」当「左上角」，全体错位）；最终用**字形掩码 XOR**（两边 >235 二值化后比对差异占比，剧情页 0.00~0.14 / 非剧情 ≥1.0，阈值 0.55），背景无关且天然排除登录页；⑦ **登录页判定也得用模板**：「开始唤醒」按钮（navtpl/_wakeup.png，820,726 起 280×90）匹配认页，整屏均值判据对登录页失效（底部深色横带把均值拉到 ~150，过不了 >165）；⑧ **重启流程**（`restart_app`）：先 `pidof` 查游戏进程（不在就直接拉起，别在安卓桌面上按返回键空转），`am start` 后 30 秒内要看到进程、没看到再拉（最多 3 次），轮询 600 秒、每轮先 `game_alive`（游戏半路崩了要重新拉起——实测强杀后重启会走到 START 页又崩），轮询里**先认拦截页再判主界面**（顺序反了会在登录页误报回主界面）；START 页点**黄色菱形质心**（真实中心 (0.474w,0.949h)，按亮度判会把主界面亮皮肤/公告弹窗误判成 START 页、在主界面上连点几十下）；⑨ **`run_core` 的顺序铁律**：登录（StartUp）没跑完绝不能开始导航——两者并发时导航点在启动页甚至桌面上（nav-fail 现场图是一张桌面截图），作业也永远没排队；队列头是 StartUp 就只排它、等完、`eng.stop()`、导航、再排剩下的；作业列表给了但队列没勾「抄作业」时自动补一条 Copilot；B 服账号要把 `com.hypergryph.arknights.bilibili` 包名传给 Touch，否则「游戏进程不在」的检测永远为真。每一步点完都用 `_moved()`（截图差值 >3.0）验证页面真的切了——「OK」不等于「到对了」，RS/DL/BY 三个模板都曾经匹配到相邻错误卡上还报成功。模板本身也可能过期：卡片改成 214×204 的斜切框以后，早期按「卡片+周边背景」裁的 400×258 图会失配，正确裁法是取卡片中心 200×165、避开左上进度徽章和 NEW! 角标；新活动上线后按 `docs/config.md` 的裁法补一张即可 |
+| `core/agent.py` | 内置助手：10 个工具的 agent loop、OpenAI 兼容流式调用、写操作确认闸门；apiKey 走 DPAPI 单独存 `config/agent.key` |
+| `backend/cli.py` | 命令行入口（`python -m backend.cli` / `MAA-PRTS.exe --cli`），输出 `{ok, command, data, error}`，退出码 0/1/2/3 |
 
 ## 启动流程
 
@@ -71,7 +84,10 @@ main()
 | POST | `/api/settings` | 保存设置（白名单 `maaDir` / `profile` / `autoStartMaa` / `lastAccount`） |
 | GET | `/api/accounts` | 账号列表（含每个账号的统计摘要） |
 | GET | `/api/account?file=` | 单个账号完整配置：account / stats / missing / chars |
-| POST | `/api/account/maa` | 把 `maa.profile` 等用户字段写回账号 JSON（同步不覆盖的那几个） |
+| POST | `/api/account/maa` | 把 `maa.profile` 等用户字段写回账号 JSON（同步不覆盖的那几个）。`dir` 会归一化并并入「用过的 MAA」历史；`accountName`（切号名）统一走 `acctname.check()`——`5505` / `181 5505` / `181****5505` 都收成 `181****5505`，官服填昵称当场 400，**留空合法**（还没填 / 想清掉） |
+| POST | `/api/account/token` | 设置 → 账号管理用：返回 `{has, broken, token, mask}`。`token` 是明文（只在本地窗口里展示，不落日志、不进 bootstrap），`mask` 只留尾 4 位；`broken=true` 表示密文本机解不开（换电脑 / 换 Windows 用户），与「没存过」分开 |
+| POST | `/api/account/token/check` | 拿 grant 接口验一次 token 还能不能用（最长约 12 秒）。只有明确失效才回 `ok:false`，网络问题走异常——界面据此决定要不要解锁「修改」 |
+| POST | `/api/account/token/set` | 换 token：先 `Skland(token)` 登录 + 取绑定，确认 token 绑的 uid 就是这个账号，才把密文写回 `skd` 段（练度 / 进度 / MAA 绑定一个字段都不动）。uid 对不上直接报错，防止粘错号把凭证静默换掉 |
 | POST | `/api/account/remove` | 删除账号：直接删除账号 JSON，不备份不可恢复。账号列表卡片悬停 ✕ 触发，前端有二次确认 |
 | POST | `/api/account/refresh` | 同步账号。带 `token` 同步单个（密文写进账号文件 `skd` 段）；不带则按各账号文件 ∪ 旧 `tokens.json` 全部同步。返回 `taskId` |
 | POST | `/api/account/import-maa` | 从账号绑定的 MAA 目录读干员识别结果（`done=false` 残缺名单拒绝），覆盖练度/统计/缺卡（账号信息与 `skd` 保留），同步任务直接返回摘要。**默认不动森空岛同步来的练度**：命中 `operbox._token_synced()` 时返回 `skippedBy=token`，只把 `force=true` 当作用户确认（账号页手动导入）才覆盖 |
@@ -402,6 +418,382 @@ MAA 运行时会周期性回写配置文件，所以必须先关进程再改，�
 （老版本建的终末地账号没有这两个字段，重新同步一次账号即可）。
 签到结果不落盘（只活在任务的日志里）——这是每天本来就该点一次的操作，不存历史反而省得纠结。
 
+## 挂关 skill（`skills.py`）
+
+2026-11-17 把挂关流程拆成六个可独立调度的 skill，由 `run_skill(name, params)`
+统一跑成后台任务（`tasks.create`），返回 taskId 给前端 / 助手轮询 `/api/task`。
+API：`POST /api/skill/run`（body：`{"skill": ..., "params": {...}}`）、`GET /api/skill/list`。
+2026-11-18 增加第七个 `train`（培养干员）。
+
+| skill | 能力 | 实现依托 |
+|---|---|---|
+| `wakeup` | 唤醒游戏到主界面；带 `accountName`（手机尾号等切号名）时走 MAA StartUp 换号 | `stagenav.restart_app` / `maaplan.run_core` |
+| `navigate` | 从主界面导航到任意活动（老活动走曲谱、当期走区域列表、EX 也能到） | `stagenav.goto_stage_list` |
+| `fight` | 自动战斗：编队 / 借助战 / 吃理智药 / 开打，一次一组关 | `maaplan.run_core`（Copilot 参数 formation/support/sanityPotion） |
+| `skip_story` | 过剧情关（MN-ST-1 这类 ST 关）：MAA fight 单关当「点关探针」，剧情播放页出现后 `stagenav._skip_story_replay` 连续跳幕 | adb 跳幕 |
+| `signin` | 森空岛签到（单号 / 全部） | `signin.run` |
+| `weekly` | 周目编排：ST 关自动过剧情、连续战斗关合并成 fight 批次、EX 收尾；**任何一步失败立即停**并在日志写明卡在哪关 | 本文件 `_cycle_rows` + `_cycle_sort_key` |
+| `train` | 培养干员：精英化 / 技能基础等级 / 专精，可一次排多个；材料不足**暂停**并落盘剩下的计划 | `maaplan.run_core` 的 `OperProgress` 任务 |
+
+排序规则（`_cycle_sort_key`）：`ST-N → 主线 1..N → EX`，正好是 MN 这类周目的
+推图顺序；关卡清单来自 `resources._stages(True)`（含 story=True 的 208 条剧情关，
+resolve 的默认视图查不到它们）。
+
+助手侧（`agent.py`）注册了对应工具：`skill_wakeup / skill_navigate / skill_signin`
+免确认直接跑；`skill_fight / skill_skip_story / skill_weekly / skill_train` 走 `_guard` 确认卡
+（确认标记 `_confirmed` 放进 pending args，重入直接跑不再二次确认）。
+MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与助手都能看到卡在哪。
+
+## 用户实测三连修（2026-11-18 晚）
+
+用户跑完真机测报了三个 bug，根因都在 MAA 日志（asst.log）里看得清清楚楚：
+
+1. **「MAA 根本没跑开始唤醒」——切号名永远为空**。`skills._account_name_tail`
+   读的是 `snap['accountName'] / ['nickName']`，可快照顶层**根本没有这两个
+   字段**（昵称在 `account.nickName`、切号名在 `maa.accountName`）——切号名
+   永远拿不到，StartUp 不带 `account_name`：游戏已在主界面时这条链 2 秒就
+   「完成」，什么都没做，用户看到的就是「没唤醒就开始导航/培养」。
+   **昵称绝不能顶**：官服切号认手机号，拿昵称 MAA 在账号列表里翻不到。
+2. **agent 模式切号 = 临时配置，不碰用户的 MAA 档案**（用户口径，2026-11-18
+   晚再定版）。agent 跑 MAA 从不读写用户的 `gui.new.json` 档案：所谓的
+   「配置」就是 StartUp **任务参数**——只配「开始唤醒 + 该账号绑定的手机
+   尾号」，MaaCore 的 `StartUpTask` 拿到非空 `account_name` 就自己换号
+   （核对过 6.20.1 源码：`set_params` 只认 `account_name` / `client_type` /
+   `start_game_enabled` 三个键，**没有** `account_switch_enabled`，给了也
+   被忽略）。切号名的**唯一来源**是账号绑定 `maa.accountName`（设置 → MAA
+   路径填的，或对话里用户报给助手后回存的）；中间版曾加过「读 MAA 当前
+   档案 AccountName / 纯数字档案名」的 fallback，已按上面口径拆掉——
+   程序里两个游戏账号对 MAA 里五个尾号档案，档案名和 AccountName 说不清
+   谁是谁，猜错 MAA 在账号列表里死找 4 分钟。预检（`agent._roster`）同理：
+   只信用户这次给的 + 账号文件里存过的，没有就**问用户**，不从档案猜。
+2. **「培养干员没进去就报错」——`Engine.wait` 启动竞态**。asst.log 现场：
+   StartUp 完成 → append OperProgress → `start` → **同一毫秒 `~Assistant`
+   析构**，任务「完成」但培养一步没跑。原因：AsstStart 异步生效，刚 start
+   完的头几百毫秒 `AsstRunning` 还是 False，而 `_done` 刚被 `start()` clear，
+   `wait()` 的 `if not self.running(): return self._done.is_set()` 把「还没
+   开始跑」当成「已经跑完」，`_wait_run` 两层立刻返回，run_core 收尾 close
+   把刚排队的任务当场杀掉。修复：`wait()` 只在**见过 running=True** 之后才
+   认「running 变 False = 停了」；没见过时给 15 秒启动宽限。
+   **同一处还有第二个窗口**（2026-11-18 22:35 用户实测）：唤醒链一完成
+   （`AllTasksCompleted` 早于工作线程收尾，`AsstRunning` 仍为 true），run_core
+   第二段 append 培养再 `AsstStart` → **直接返回 false**。第一次修的是「false
+   就等 running 变 false 再重试」，方向反了：MaaCore 被挡时并不会停，它继续
+   消费队列，我们刚 append 的那条几十毫秒后就开跑（asst.log：
+   `00:25:09.674 Start | block` → `00:25:09.776 TaskChainStart`）。于是
+   `running` 一直 true → 等满 15 秒 → 判成失败 → 用户看到「X RuntimeError:
+   AsstStart 返回失败」，可任务其实在跑（2026-11-19 三次培养全中）。
+   **现在的判据**：`AsstStart` 返回 false 后盯 `_chain_starts`（收到
+   `TaskChainStart` 的次数）——新链开始了就直接算成功；`running` 变 false
+   才是「真没接」，这时才重试一次；`running` 一直是 true 也当成功（队列在被
+   消费），交给 `_wait_run` 兜底重排一次，宁可多等一秒也不误判。
+3. **「设置里配过手机尾号，助手每次还问」**——`list_accounts` 没带切号名。
+   模型看不到账号绑定的 `maa.accountName`，只能按提示再问一遍。修复：
+   工具输出补 `accountName`，`hint` 和系统提示都写明「非空的直接沿用，别
+   再问」。真正开跑时 `skills._account_name_tail` 本来就优先读账号绑定。
+4. **「只推荐普通难度，说突袭打不了」——作业变体永远落 normal**。突袭关
+   （含 IW-EX 这类有 `#f#` 突袭 id 的活动关）在作业站拆普通/突袭两行，同一份
+   通用位（difficulty=3）作业两行都有。`stageplan._lookup` 与
+   `skills._prepare_ops` 挑行时 band 相同先到先得、行序普通在前（且
+   `_prepare_ops` 干脆只取第一行），于是 variant 永远是 normal，写进 MAA
+   一律 `IsRaid=false`——用户挂 IW-EX 打的全是普通难度，作业明明叫
+   「IW-EX-1突袭五人」。修复：同样能打时**优先突袭行**（可打性仍优先于
+   变体：突袭行全打不了、普通行能打时照旧选普通）。
+
+## 每关只打真正要打的那一档（2026-11-19 03:13 定稿）
+
+前两版都错了，用户第三次报才拿到决定性证据。asst.log：
+
+```
+11-17 17:42  MN-EX-1_98495.json is_raid=false   ← 手动导的作业集
+             MN-EX-1_98495.json is_raid=true
+11-19 01:42  SV-EX-1_41623.json is_raid=true
+             01:42:21 to_be_recognized: ["RaidConfirm","ChangeToRaidDifficulty"]
+             01:42:22 切突袭完成 → BattleStartPre           ← 单条突袭其实能打！
+11-19 02:02  SV-EX-1 false / SV-EX-1 true 交替 14 条     ← 我们排的两条
+             → 用户在模拟器里看到的就是「又从头挂了一遍普通 EX-1」
+```
+
+**MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度**，不需要
+前面垫一条普通。上一版「普通 → 突袭」两条，等于每关白烧一次理智，用户看到
+「说好只排突袭，结果还是挂普通」就是这个。
+
+现在的口径（`skills._prepare_ops`）：
+
+- 默认 `raid='auto'`：**有突袭作业就只排突袭**一条（`IsRaid=true`）；没有突袭
+  作业的关照旧排普通。
+- `raid='both'`：普通 → 突袭两条（普通还没通关、要一次打通时用）。
+- `raid=False` / `'normal'`：只排普通（刷材料）。
+- **逐关指定**：`stages` 支持 `SV-EX-1@raid` / `SV-EX-1@both` / `SV-EX-1@normal`，
+  也支持 `{'stage': 'SV-EX-1', 'raid': 'both'}`（见 `_parse_stages`）。这是为了
+  让助手能按计划执行（「EX-1~5 只打突袭、EX-6/7 普通+突袭」），以前只有全局
+  开关，助手答应了也做不到。
+- `maaplan.prepare_copilot` **不再给突袭条目自动补普通**（旧兜底已删）。
+- `copilot.entry_variants`：选了哪一行就写哪一行，不再被作业自身的难度位标志
+  改回普通。
+- **磨难 / 险地不是突袭**（用户明确）：主线 10-14 章磨难（`tough_`）和 15+
+  章险地（`#s`）是独立关卡 id、各自一条，不展开、不套突袭规则。
+
+## 逐关战报 + 失败换作业重挂 + 分段扫图（2026-11-19）
+
+用户提了四条，一次做完：
+
+1. 作业翻车要能看见**是哪一关**翻的
+2. 挂完一关就显示「一关战斗成功」
+3. 某关失败就换作业集里**别的作业**重挂这一关，已成功的关不重排
+4. skill 联动：挂完普通 → 导航到突袭 → 挂突袭 → 导航到 S → 挂 S
+
+**① 逐关结果（`run_core` 的 `state['results']`）**
+
+- `StageDrops` 到达 = 这关打完了 → `_mark_clear()` 记成功并打
+  `✔ SV-EX-1 战斗成功（掉落…）`。刷材料（Fight）同一关反复结算只喊一次。
+- `chain_failed` 且链是 Copilot → `_mark_fail()` 打
+  `✘ SV-EX-1 翻车：原因`。`maacore._translate` 的 chain_failed 事件为此补了
+  `why` 字段（以前只有一句「失败：自动战斗」）。
+- `_tally()` 按关卡聚合：同一关先失败后成功算成功。
+
+**② 换作业重挂（`_retry_failed`）**
+
+- `skills._select_ops` 每关挑 `depth=3` 份候选（按「可直接抄 → 借一人 →
+  练度不足」排），`_prepare_ops` 返回 `(copilotList, retry)`，
+  `retry = {'pool': {'SV-EX-1@raid': [41623, 41624, 46114]}, 'maxRounds': 3}`，
+  由 `spec['retry']` 交给 `run_core`。
+- 一轮跑完只挑**没成功**的关；每关换候选池里**还没试过**的下一份，同一个
+  Engine 直接 `append` 新的 Copilot 任务再 `start`——不重新 open / connect /
+  导航，省掉每轮十几秒。`attempted` 记着试过哪些，#102→#202→#102 这种
+  来回打转不会发生。
+- **重挂前必须先点掉结算页**（`_leave_result`，2026-11-19 用户实测补的）：
+  战斗失败后游戏停在「作战失败 / 行动结束」那一层，这时把新作业集排下去，
+  MAA 的 `ClickStageName` 在这一层 OCR 不到关卡名，整轮重挂白跑。用户的口径
+  是「随便点一下回到关卡界面，在那个界面重新运行作业集就能换作业，不需要
+  重新唤醒登录」。
+  点哪儿不随便：用 MAA 自己 `ClickCorner` 的 `[1000,20,270,50]`（1280 口径，
+  中心 `_RESULT_TAP = (1135,45)`），任务定义写明「点屏幕右边不会点到掉落物，
+  也不会关掉关卡选择」，所以结算页能推进、在关卡列表上点了也无害，连点几次
+  都安全。点完 `stagenav.probe == 'map'` 就算回到关卡列表；不是就按正常流程
+  重新导航一次（`_navigate`）。
+- 收尾判失败只从 `eng.chains[mark:]` 看，否则第一轮的失败会把重试成功盖掉。
+  `mark is None` 表示压根没重试（**0 是合法分界**，别拿它当「没重试」）。
+
+**②b 关卡名单核对（`skills._tidy_stage_list`，2026-11-19）**
+
+用户说「SV-EX-1 ~ SV-EX-6」，助手实际排的是 `SV-EX-2 ~ SV-EX-7`——跳掉
+EX-1 之后又往后补了一关凑数，白烧一整轮理智。预检会把前置关补进计划，所以
+计划本来就可能比用户点名的多；这里按白名单收口：
+
+- 允许 = **用户点名的关** ∪ `stageplan.expand(asked, with_prereq=True,
+  fill_base=True)`（游戏内前置关）；
+- 名单外的关一律剔掉并打日志；剔空了直接报错；
+- 用户点名却不在计划里的关也点名（那是预检判定打不了，上面已有原因）。
+
+**③ 分段扫图（`skill_sweep`）**
+
+- `_sweep_segments` 把活动拆成「普通关 / EX 普通 / EX 突袭 / S 关」。老活动
+  没有 S 关就只有三段；`tiers` 可以只挑一段，`raid` 控制 EX（both/raid/normal）。
+- 每段开始前用 `skill_navigate` **重新导航**：EX 和 S 是活动地图里不同的
+  分区，MAA 的 Copilot 只认当前分区上的关卡名（见 `_run_fight_batch` 的注释）。
+- 段内 `_select_ops(strict=True)`：普通段不拿突袭作业顶，反之亦然。
+- 每段一次 `run_core`（带 retry 池），段与段之间靠导航衔接。
+
+## 当期活动导航（`eventnav.py`，2026-11-19）
+
+新活动的入口 UI 和老的「曲谱 / 主界面活动大图」都不一样了，用户逐屏标注了
+步骤，这一段按他的步骤点：
+
+    任意界面 --底部第1个tab「终端」--> 主界面
+    主界面   --固定位置点「终端」大卡---> 终端页（活动提示条 + 黄钻石进度）
+    终端页   --活动提示条（区域+图像识别）-> 活动地图（约 5 秒过场动画）
+    活动地图 --区域节点（残照终尽）------> 普通关卡界面（基础区）
+    关卡列表 --右下区域按钮（长冬初青）--> EX 关卡界面
+    关卡界面 --右下区域按钮（世纪之春）--> S 关卡界面
+
+到关卡列表就交给 Copilot 的 `ClickStageName` 自己 OCR 找关卡名。
+
+**为什么不吃老路径**：老路径是「主界面大图 → 主题页 → 右下区域列表」，
+新活动的地图是散点式区域节点、分区靠关卡列表右下角那排区域名按钮切，
+老坐标（`themeZone` / `zoneRows`）全对不上。`goto_stage_list` 里 eventnav
+**排在曲谱和老路径前面**，认不了才退回去。
+
+**数据在 `ENTRIES`，一条活动一项，老的别删**（活动会复刻，UI 不变、模板还能
+用）。一项长这样：
+
+```python
+'TL': {
+    'name': '时间啊，向前！',
+    'until': '2026-11-25',          # 活动结束日
+    'wrote': '2026-11-19',
+    'entry': {'tpl': '_entry_track.png', 'roi': [80, 500, 300, 130],
+              'tap': [218, 551], 'offset': [0, -51], 'wait': 5.0},
+    'zones': {
+        'base': {'tpl': 'TL_z1.png', 'label': '残照终尽',
+                 'roi': [380, 540, 320, 180], 'tap': [532, 628]},
+        'ex':   {'tpl': 'TL_z2.png', 'label': '长冬初青', ...},
+        's':    {'tpl': 'TL_z3.png', 'label': '世纪之春', ...},
+    },
+    # 同一屏上的两个「入口节点」：小游戏和活动商店（点进去不是关卡列表）
+    'tools': {
+        'minigame': {'tpl': 'TL_mini.png', 'label': '战时新闻委员会',
+                     'roi': [40, 165, 200, 130], 'tap': [127, 227], 'wait': 3.0},
+        'shop':     {'tpl': 'TL_shop.png', 'label': '炮火所掩埋的',
+                     'roi': [880, 120, 200, 130], 'tap': [975, 185], 'wait': 3.0},
+    },
+}
+```
+
+- `roi` 是 1280 口径 `[x,y,w,h]`：**只在这个框里认模板**（同名按钮在别的位
+  置也出现过，框外命中当没认到）。
+- `tap` 是识别不到时的兜底坐标；`offset` 是「认出来的中心不是该点的地方」
+  时的偏移（TL 的活动提示条：认的是下半截黄钻石行，要点的是上面那行文字）。
+- `until` 过期**只提示不失效**（日志会写「标定于 X，活动改过版的话要重新标
+  定」）。`eventnav.active()` 只返回没过去的，给助手看。
+
+**模板**放 `backend/core/navtpl/events/`（用户配置目录
+`config/navtpl/events/` 同名文件优先，升级不覆盖），**1920 口径原样抠**，
+红框往里缩 6~8px 别把红线抠进去，`find_card_bytes` 会按屏幕宽度缩放。
+加一条新活动的流程：用户给带红框的截图 + 步骤 → 抠模板 → 往 `ENTRIES` 加一项
+→ 冒烟 B44 会检查模板在不在、ROI 有没有互相抢。
+
+**「最新活动」怎么落到代号**：`eventnav.match_name` 认活动名 / 代号 /
+「最新活动、当期活动、新活动…」，`skills.norm_stage` 和助手工具
+`list_activities`（返回里的 `current`）都走它，所以助手不用猜 TL 是哪个活动。
+
+**`tools` 是同一屏上的另外两个入口**：小游戏（战时新闻委员会）和活动商店
+（炮火所掩埋的）。它们和分区节点长在同一张活动地图上，但点进去不是关卡列表，
+所以单独列一格。`eventnav.run_tool(touch, 'minigame'|'shop')` 只负责把界面点
+到门口（`_to_map` 到活动地图 → 点节点），点完的画面校验是软的：商店/小游戏
+页面偏静态，`_moved` 硬判会误报，真正认页面的是后面的 MaaCore 任务。
+
+## MAA 小工具（牛杂，`maatools.py`，2026-11-19）
+
+MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列里**，但 MaaCore
+认：它们都是 `Custom` 任务。对着 asst.log 试出来的两种参数：
+
+```python
+# 战时新闻委员会（活动小游戏）
+{"task_names": ["MiniGame@WartimePressCommittee@Begin"]}
+
+# 活动商店
+{"task_names": ["SS@Store@Begin"],
+ "params": {"event_shop": {"blacklist": ["数据增补条", "数据增补", "龙门币", "家具零件"]}}}
+```
+
+黑名单的三个坑（都实测过，别改）：
+
+| 写法 | 结果 |
+|------|------|
+| 挂在 `params.event_shop.blacklist`，非空字符串数组 | ✅ `Parsed and registered EventShop task: SS@Store@Begin` |
+| 挂到顶层 / 塞进 params 字符串 | ❌ 静默忽略，**把无限池一起买光** |
+| 空数组 `[]` | ❌ 不注册插件，同样买无限池 |
+| 元素是数字 | ❌ `set_params failed, event shop blacklist item is not string` |
+
+所以 `maatools.build_params('event_shop', [])` 直接抛错，宁可失败也不买无限池。
+
+**执行**：`maaplan.run_custom(spec)` —— 不复用 `run_core`。那条链是给抄作业
+写的（强制补 StartUp、关卡导航、排 Copilot、失败重挂），牛杂一项都用不上。
+`run_custom` 只做「关 GUI → 连接 → append Custom → start → 等 → 收尾」，顺带
+把 asst.log 里活动商店那几句话翻成人话（跳过黑名单商品 / 选中商品 / 到无限池
+收工 / 代币不够）。
+
+**卡教程**：小游戏第一次进要过一段教程，MAA 认不出教程对话，会安静地重试同一
+个节点。`run_custom` 每 10 秒看一次「多久没新事件」，超过 120 秒就把
+`spec['tutorial']` 那句话打进日志 —— 用户才知道要手动过一遍教程再挂。
+
+**入口**：`skill_tool({'name': 'wartime_press'|'event_shop', 'account': ...,
+'blacklist': [...]})`，助手工具同名。导航和 MAA 都跑在同一个后台任务里，
+`tid` 透传给 `run_custom`，日志落在同一条任务上。
+
+
+## 培养干员 skill（`train`，2026-11-18）
+
+MaaCore v6.20+ 有个 `OperProgress` 任务（GUI 里叫「干员培养」），能力是
+「按计划把干员升到目标练度」：精英化、技能基础等级、技能 1/2/3 专精，还会
+自己跳加工站/制造站补材料（材料够的话）。`skills.skill_train` 就是它的封装：
+
+```python
+{"operators": [{"name": "泥岩", "elite": 2, "skillLevel": 7, "mastery": [0, 3, 0]}],
+ "account": "xxx 官服.json", "accountName": "5505",
+ "switchAccount": True, "wakeup": True}
+```
+
+- **专精是绝对等级**（`[0,3,0]` = 二技能专三），不是「再升三级」；`mastery`
+  也吃 `{"2":3}` / `"2:3"` / `"技能2专精3"` / `"二技能专三"`（`_norm_mastery`）。
+- **先跟账号快照对一遍**（`_train_plans`）：已经精二 / 技能已到 / 技能已专到
+  的项直接剔掉，一条不剩就压根不跑 MAA；名字在快照里找不到（写错字 / 新干员
+  / 没同步）当场报错，别让 MAA 翻完列表再说「干员不存在」。
+- **材料不足 = 暂停，不是失败**：`OperProgressDetail` 的
+  `result_detail=ResourceInsufficient` 一到，`_on_train_detail` 置
+  `state['pause']` 并另起线程 `AsstStop`（不能在回调线程里同步 stop，会等
+  工作线程收尾）。`run_core` 收尾时不再刷一串 `[失败]`，只报「已暂停：XX 材料不足」。
+  **`ChipNotCraftable` / `FormulaLocked` 同样算「该去补东西」**（2026-11-19
+  用户报「卡在升级等级的界面报错」）：MaaCore 6.20.1 在 E0→E1 缺普通芯片时
+  直接 `return ChipNotCraftable`，不走加工站合成（上游 issue #18612，MAA
+  自己的 GUI 手动跑也一样，只有芯片齐备时才成功）。日志写清「缺芯片 / 怎么补」
+  并暂停；暂停后同一干员的连环 `PrerequisiteNotMet` 静默，不刷屏。
+- **暂停/失败要把界面拉回来**：培养中止时 MaaCore 停在干员档案的精英化页，
+  用户切回模拟器以为卡死。`run_core` 收尾等 `running` 变 false（最多 5 秒）
+  后调 `AsstBackToHome`，日志补一句「界面已退回主界面」。
+- **剩下的计划落盘** `config/train-plan.json`（`_remain_plans` 用 MAA 报回来的
+  成功项相减），用户补完材料说「继续培养」→ `skill_train(resume=true)` 接着做，
+  不用重报练度；全部做完就把文件删掉。
+- `wakeup=false`（用户说游戏已经开着）时不排 StartUp（`spec['noStartUp']`，
+  core_tasks 不再强制补）；`OperProgress` 自己会走 `OperBoxBegin` 从任意页面
+  进干员列表。`switchAccount=false` 时 StartUp 照跑，但**不发** `account_name`
+  （MaaCore 里给了这个参数就切号，没有单独的开关可关）。
+
+## config/ 里的全局 json 不是账号（2026-11-19）
+
+用户报「**突然无法自动战斗**」——唤醒、战斗、培养三个 skill 同时失败，日志
+清一色 `AttributeError: 'str' object has no attribute 'get'`。
+
+根因不在 skill，在 `accounts.list_accounts`：培养暂停时 `skills._save_train_plan`
+把 `config/train-plan.json` 落盘，里面 `"account": "灰bao#7986 官服.json"` 是
+**文件名字符串**；账号扫描把这个文件当账号读，`(snap.get('account') or {}).get('uid')`
+撞上字符串 → 整个账号列表抛异常。所有 skill 开跑第一句都是 `_account_file('')`
+→ 全部一起挂。这也解释了「突然」：文件是**上一次培养暂停时才生成**的，
+之前目录里没有它。
+
+修法两层，缺一不可：
+
+1. `updater.NON_ACCOUNT_JSON` 补 `train-plan.json` / `navcache.json` /
+   `appupdate.json`——我们自己写在 config/ 根目录的全局文件都登记进去；
+2. `list_accounts` / `scan_accounts` / `find_by_uid` / `char_path` /
+   `merge_preserved` 里的 `account` 段一律 `isinstance(..., dict)` 才算账号，
+   `stats` / `maa` / `skd` 也走 `_dict()`。**`or {}` 挡不住字符串**，这是
+   这个 bug 的全部原因；以后新增全局文件忘了登记也不会再连锁崩。
+
+B40 用「train-plan.json + account 为字符串/数组/缺 game 的文件」钉死。
+
+## MAA 日志补全（2026-11-18）
+
+用户报「自动战斗没有日志，右边不知道 MAA 在干什么」。原因有两层，都补了：
+
+1. **回调侧**（`maaplan._on_core_event`）：以前只写「换作业 / 掉落 / 理智 /
+   打满」，一场战斗 3 分钟面板上只有一行「开始执行」。现在补上
+   `CopilotAction`（部署 / 开技能 / 二倍速 / 技能就绪自动开）、`BattleFormation`
+   （编队名单）、`SubTaskStart` 的关键阶段（找关卡 / 开始行动 / 战斗中 / 结算）、
+   `ExceededLimit`（重试到上限）和 `OperProgressDetail/Summary`（培养结果）。
+   开技能 15 秒内只说一次、同一个干员只报一次部署，避免刷屏。
+
+   `SubTaskStart` 的 `subtask` 字段只是插件类名（`ProcessTask` /
+   `BattleProcessTask`），真正能给人看的阶段在 **`first[0]`**（`maacore._translate`
+   取它），形如 `Copilot@WaitUntilEndOfAction` / `BattleStartAll`。注意名字有的
+   本来就带 `<TaskChain>@` 前缀、有的不带（后者会被补上前缀），所以
+   `_subtask_label()` 按裸名查表，两种都能命中。这张表**必须按
+   `<MAA>/debug/asst.log` 里实际出现的 `first[0]` 统计来写**，不能照源码猜——
+   第一版猜成 `Copilot@BattleStartPreFlag`，跟真实日志全对不上，战斗过程依旧
+   一片空白。按真实日志校准后关键阶段覆盖率 93.8%，剩下 6% 是
+   `BattleProcessTask` / `StartGameTask` 这类插件类名，静默跳过才不刷屏。
+   `CopilotAction` 里白名单外的动作（`Output` / `SkillUsage`）同样不写。
+2. **日志侧**（`maalog.py`）：MAA 有些话只写 `debug/asst.log`
+   （`confirm stage name failed … stage name: MN-EX-6`、`unknown oper name`），
+   不走回调。`maalog.Tap` 用 `asstlog.Tail` 从**当前文件末尾**开始增量读
+   （`Tail.seek_end()`，不重放几十 MB 历史），只翻 `[ERR]/[WRN]` 里的有效行，
+   噪音（`roi is empty` / `Unknown task` / 缺 pipeline）一律丢，同一句 20 秒内
+   只说一次，输出成 `[MAA] …` 进同一条任务日志。
+3. **心跳**（`_wait_run`）：90 秒没有任何新日志就补一句「…还在跑：MN-EX-6
+   （已 3 分 20 秒）」。以前直接 `eng.wait(timeout=…)`，卡住和正常跑在面板上
+   长得一模一样。
+
+
 ## 依赖
 
 - Python 3.10+
@@ -409,3 +801,418 @@ MAA 运行时会周期性回写配置文件，所以必须先关进程再改，�
 - 打包用 `pyinstaller`
 
 其余全部是标准库。
+
+## run_core 直跑模式 noNav（2026-11-17 晚）
+
+skill_fight 默认**不唤醒不导航**：spec 带 `'noNav': True` 时，run_core 会把
+core_tasks 强制补进来的 StartUp 摘掉（`seq = [(t,p) for t,p in seq if t !=
+'StartUp']`），并且跳过 `elif first:` 的导航分支——Copilot 从当前界面直接
+接手（当期活动 MAA 自己认路；老活动要调用方先到位）。skill_fight 里
+`wakeup=true` / `navigate=true` 参数可以退回全套流程。skip_story / weekly
+不带 noNav，行为不变（它们依赖导航）。用户实测吐槽「skill 化了怎么还在
+唤醒+导航」就是这条缺的口子。
+
+### skill_fight 空队列（noNav 第二坑）
+
+core_tasks 的 Copilot 分支要求 spec['copilotList'] 非空否则 continue；skill_fight
+以前只传 stages，队列里只剩强制补的 StartUp → noNav 摘掉后报「没有可执行的
+任务」。修复：skill_fight 在 mode=copy 时自动把 stages 转成 copilotList——
+按代号搜作业站取第一个作业（_prepare_ops → copilot.search + prepare_copilot），
+也接受调用方直接给 ops / copilotList。fight 纯刷关走 Fight 任务，不需要作业。
+
+### /api/skill/try（联调测试，2026-11-17）
+
+`POST` body `{text, skill?, run?}` → `{text, said, picked, args, matched, taskId, note}`。
+不建会话、不摆确认卡；`run=true` 直接跑并返回 taskId。实现见
+`agent.try_skill`（PROBE_SYSTEM 强调别自作主张补唤醒/导航）。
+
+## skill_navigate 的输入规范化（2026-11-17 深夜）
+
+用户实测：助手说「导航愚人号」，两次都报「没进到活动地图（活动可能已结束）」。
+日志 `导航到「act1d3」：活动第 1 个区域` 说明**模型把活动 id 当关卡号传下来**，
+`event_of()` 认不出（正则要求 `PREFIX-数字`），`zone_rows_of()` 又对未知串兜底成
+「第 1 区」，于是掉进「当期活动」分支去点活动大图——老活动当然进不去。
+
+修法（三层）：
+1. `skills.norm_stage(raw)`：中文活动名 / 活动 id（act25side）/ 关卡 id
+   （act25side_01）/ 代号前缀（CW）/ 关卡号（MN-EX-1）统一换成真实关卡代号，
+   逐个 `resolve`；认不出就报错并列出近期活动名。`skill_navigate` 的 stage 与
+   activity 两个参数都过这里。
+2. `stagenav.goto_stage_list`：开头加形态闸。不是 `PREFIX-数字` 形态的输入，
+   纯前缀（CW）自动补成 `CW-1`，其余**直接返回明确错误**，不再拿原始串去
+   `zone_rows_of` 兜底乱点。
+3. 助手侧：`skill_navigate` 工具描述强调「直接传中文名」，
+   `search_stages` 返回补 `prefix` / `activity`（EVENTS 反查），SYSTEM 硬规矩
+   加「活动代号一律查，不许凭记忆换算（孤星=CW，覆潮之下=SV，愚人号=SN）」。
+
+真机验证（dev 环境、灰bao 官服、游戏停在主界面）：
+`POST /api/skill/run {"skill":"navigate","params":{"stage":"孤星"}}` →
+`「孤星」→ CW-1（孤星（29 关））` → 走曲谱 → 第 9 屏命中（1.5 分）→ 进图，
+落图确认是孤星关卡地图（CW-1/CW-2/CW-ST-1 + 右下三个区域）。全程约 2.5 分钟。
+模型侧：`/api/skill/try`「帮我导航到孤星」→ `skill_navigate{"stage":"孤星"}`；
+「停在主页，导航到孤星，不要唤醒」→ 同样只调 navigate，没有多带 wakeup。
+
+另外 `skill_navigate` 加了游戏存活检查：`game_alive()` 为假时直接报
+「游戏没在跑——先调 skill_wakeup」，不再白转一分钟恢复循环后含糊报「回不到主界面」。
+
+## 乐章收录网格的四个坑（2026-11-18 凌晨）
+
+用户实测密林悍将归来（`RI`）导航失败，现场截图停在网格的「完成进度」标签上。
+顺着挖出四个坑，全部落在 `stagenav.goto_story_activity`：
+
+1. **进网格必须点一下「默认进度」**（`tabProgress`，1280 口径 (741,45)，1920 口径
+   (1111,67)）。这一页会记住上次选的标签，停在「完成进度」/「奖励进度」时每张卡
+   左上角都盖着进度徽章（38/39 那种蓝菱形 + 勾），卡片图被改掉一块，模板匹配从
+   5 分涨到 20 分以上——整轮扫描白跑，最后报「翻到底没找到」。现在点完「乐章收录」
+   先用 `in_score_grid()` 确认真的进了网格（判据：顶部三个标签必有一个是蓝字 +
+   蓝下划线，实测蓝像素占比 网格 0.035 / 时间轴 0.000，阈值 0.008），再点标签，
+   没进网格会重试一次、还不行就明确报错，不会傻翻 40 屏。
+2. **截图要等滑动惯性停住**。`input swipe` 之后画面要 1.8~2.2 秒才停
+   （逐帧差 22 → 11 → 3.8 → 2.1 → 1.6），1.4 秒时截到的还是拖影帧（卡片被拉成
+   两半、顶部多一条半透明标题带），匹配分数虚高。`_settled_shot()` 现在固定等
+   2.2 秒拍一帧；整屏连一个候选都没有（999，多半是缩略图还没加载）时补拍一帧。
+   拖影帧本身也有兜底——步长 240 小于卡片在屏内的可见高度，同一张卡在相邻 3~4
+   屏里都会完整出现，糊掉一屏不影响。
+   **别改成「连拍两帧比差」**：卡片有呼吸/闪光动画，同一位置连拍两帧也有 1.76 的
+   差，判据只能定到 2.5，几乎每屏都判「还在动」，每屏白多等 1.5 秒（实测 7.8 秒/屏）。
+3. **到顶要甩够、到底要停**。整页约 15 屏（顶部还有「主题曲」EP 网格，约 5400px /
+   1080 口径，以前按「40 屏」估会导致到底后空转）。旧的「16 × 440」只走 10560px（720 口径），从列表底部出发到不了顶，
+   扫描就从中间开始，上半部分的卡（RI 在第 13 屏）永远扫不到——`_scroll_top()`
+   改成 12 × 800 的快速拖拽。反过来，以前靠固定 56 屏兜底，到底后还在原地空转
+   40 屏（一屏 4 秒，白烧三分钟）；现在连着两屏「画面没动」（差 < 3.0）就判定到底。
+4. **`IW`（将进酒）的卡片模板过期了**。离线全量评估（40 张网格截图 × 46 张模板）
+   只有它 18.6 分掉出阈值 12，其余全部 ≤ 7。原因是早期裁图带进了周边背景、
+   尺寸也和现在的 296×150 卡片对不上。按当前卡片中心重裁一张（避开左上进度徽章、
+   NEW! 角标）：自匹配 0.0，同一张卡换个滚动位置 2.6。
+
+顺带修的两处性能账（导航一屏要多次 adb，每次进程启动就是 0.5~0.8 秒）：
+`Touch.swipe` 不再补发 `_release()`——滑动自带抬起，那两条 `sendevent` 每条
+0.25 秒，翻十几屏就是十几秒白烧；扫描前不再单独「预滚一遍」（20 屏 30 秒），
+图片加载竞态改由逐屏 2.2 秒等待 + 999 补拍兜住。
+
+顺带加了「卡片位置缓存」（`config/navcache.json` 的 `cardOffset`）：扫到卡时记下
+它离网格顶部多少像素（1080 口径），下次导航回顶后**按记录翻到那一屏的前一屏**，
+从那里接着往下扫——少翻一屏是必要的：回顶那一甩结束时的回弹会把紧接着的第一下
+拖拽吃掉一截，实测正好差一屏。缓存只当提示：一路扫到底还没命中就回顶重扫一遍，
+永远以模板匹配为准。
+
+另外 `really_home()` 的收尾判定要**复用循环里的结果**：原来循环里判到主界面就
+break，循环后再调一次 `really_home()`——两次之间隔着几百毫秒，页面正好在切页
+动画里就会翻脸判 False，日志表现为「4 秒就 FAIL：回不到主界面」，而游戏其实
+好端端在主界面（2026-11-18 RI 实测踩到）。现在循环结果存进 `home`，不成立时
+等 1.2 秒再复核一次。
+
+真机复验（dev 环境、灰bao 官服）：
+`RI-1` → 第 13 屏命中 4.4 分 → 进图；`IW-1` → 第 8 屏命中 2.6 分 → 进图
+（重裁模板前是翻到底 17.9 分 FAIL）；`CV-1`（靠底部）第 15 屏命中 1.1 分 →
+进图，全程 2 分 36 秒。走缓存的第二次 `RI-1`：回顶 → 直接翻到第 12 屏 → 第 14 屏
+命中 5.4 分，全程 1 分 26 秒；网格本来就停在目标卡上时「当前这一屏就找到了
+（1.2 分）」，全程 48 秒。
+
+
+## 活动内的「分区图标」（EX / S / MO 导航，2026-11-18 凌晨）
+
+用户实测后指出：活动地图右下角**不是一个 EX 开关，是一排分区图标**（2~4 个：
+基础关 / EX / S / MO），点哪个切哪个，EX 也不总在右边——DM 的「破败前线」、
+BB、MT 的「谒见神祇」、PV 的「彩车游行」都在中间。老实现只有一个点
+`exSwitch=[1199,620]`，只有「2 个图标、EX 在最右」的活动能蒙对；S / MO 更是
+压根没实现（`is_extra()` 只认 EX，`BB-S-1` / `MT-S-2` / `DM-MO-1` 会被当成
+普通关，进基础区后 MAA 找不到关卡，表现是「导航成功但打不了」）。
+
+现在的分工：
+
+| 事情 | 谁负责 | 依据 |
+|---|---|---|
+| 这是什么分区 | `zone_kind()` | 代号后缀：`-EX-` / `-HX-` / `-S-` / `-MO-` / `-ST-` / `-F`（HX 归一成 ex） |
+| 它在第几格 | `zone_rows_of()` | 资源库 `zoneId` 排序（`act17d5_zone2` → 1），**和界面左右顺序一致**；个别活动用 `zoneRowByCode` 硬指 |
+| 格子在哪 | `zone_icons_of()` | `DEFAULT_POINTS['zoneIcons']`，逐活动标定，`config/nav.json` 可覆盖 |
+| 单 EX 按钮在哪 | `ex_point()` | `exSwitchByEvent`，只适用于「基础区 + 一个 EX 按钮」的活动 |
+| 点击与校验 | `goto_subzone()` | 先点第 1 格归位 → 点目标格 → 画面变化 + 再点一次稳定性 |
+
+要点：
+
+1. **先归位再切**。游戏会记住上次停在哪个分区，只点目标格的话「本来就在」
+   和「点空了」都表现为画面不变，判不清；先点第 1 格就变成确定性动作。
+2. **坐标不是硬信**。`_snap_icon()` 在点击前用当前画面重新找图标列：图标是
+   花纹密集的徽记，逐列算灰度标准差会出现峰，背景是平滑插画没有峰。只接受
+   ±3% 屏宽（≈58px / 1920）内的微调——离线拿 10 个活动的截图试过，全局找峰
+   最远会偏 108px（那是隔壁图标），宁可不校正。
+3. **没标定的活动不许瞎点**：EX 退回老单点（历史行为，日志会写明），S / MO
+   直接报错让补坐标。已标定 35 个（第一批 DM/WD/BB/GO/GA/HE/MT/BI/RS/PV/MN，
+   第二批 NL/HS/OR/CW/DV/MB，第三批 SV/BP/EP/TW/LE/ZT/FC/EA/OF/RI/DH/IC/SL/
+   AS/AT/CB/CV/AD），CW 只标前 2 格（S 分区是另一套 UI，MAA 跑不了，故意留空）。
+4. **`OF-EX1` 这类写法以前进不了导航**：形态闸 `_STAGE_CODE_RE` 要求 EX 与
+   数字之间有横杠，火蓝之心（OF）/ 喧闹法则（CB）写成 `OF-EX1`，在形态闸就被
+   判「不是关卡代号」。正则改成 `(?:-[A-Za-z]+)?-?\d+`，两种写法都放行。
+5. `skill_weekly` 的每个战斗批次开打前会先 `skill_navigate` 一次（`nav` 参数
+   可关）：老活动 MAA 没有寻路，Copilot 只有在「已经站在正确分区的地图上」时
+   OCR 才找得到关卡名，不导航的话 EX / S 批次必报找不到关卡。
+6. **不是所有活动都是方格栏**。WR / WB / IW / GT 这类老活动的右下角是「左边一个
+   EX 按钮 + 右边一块活动名/副标题」，没有整齐的格子，按分区下标点会点到副标题。
+   它们的坐标记在 `exSwitchByEvent`，`goto_subzone` 走单点分支：点一下 → 比对
+   画面变化，没变就报「EX 按钮没反应」，不假装成功（也**不做归位**，界面上没有
+   基础格可归）。
+7. **`GT-HX-*` 不是新分区**。GT-EX-1~3 与 GT-HX-1~3 在资源库里都是
+   `act13d2_zone2`，共用一个「EX」图标，所以 `zone_kind()` / `stageplan.kind_of()`
+   把 HX 归一成 ex，分区下标、排序、预检前置展开都按 EX 走。
+8. **第三批（老故事集剩下的 18 个活动）踩到的坑**：
+   - **资源库分组要按 `zoneId` 前缀，不能按 `stageId`**。火蓝之心（OF）的
+     stageId 是 `a003_ex01` 这种老式 id，和 `act11d7_zone3` 对不上，老代码
+     `sid.startswith('act')` 直接滑到兜底分支，`OF-EX1` 被算成第 2 格
+     （实际是第 3 格），点了切到 ② 页、MAA 找不到关卡。现在按 zoneId 前缀
+     分组；主线/磨难关（stageId `main_*` / `hard_*`，zoneId 却是
+     `act2mainss_zone1`）要排除掉，否则 `15-3`、`H15-1` 会被判成「活动第 1 区」。
+     改完做了全量对比：3032 个代号里只有 OF / IC-P 这两族的结果变了。
+   - **`OF-F1~4` 是第二个「地区切换」页**，`zone_kind()` 新增 `f`；不认的话
+     `zone_rows_of` 走兜底返回 None，导航会当成「不是活动关」直接不切页。
+   - **`SV` 复刻过**：资源库里原版 `act10d5_zone1` 和复刻 `act11sre_zone1`
+     都收着，同一活动排出 3 个 zone，`SV-EX-1` 被算成第 3 格（界面只有两格）。
+     这类「界面格数和资源库分区数对不上」的，用 `zoneRowByCode` 按代号前缀
+     硬指（`SV-EX` → 1、`IC-P` → 0）。前缀按整段匹配，`IC-P` 不会误吞 `IC-PX`。
+   - **「基础区」也是一格，必须标**：`goto_subzone` 每次先点第 1 格归位。
+     SV / RI / EA / BP / LE / FC / AD 的基础区是「左边一块活动横牌 + 右边 EX
+     按钮」，横牌本身就当一格点（MB 的「超狱计划」先例）。
+   - 标定这 18 个活动时，红框检测改用**纯红竖边（每列 ≥70 个红像素）**找左右
+     边界，再用 `_snap_icon` 离线过一遍：44 个新点一个都没被改点。
+
+标定方法（新增活动时，2026-11-18 用这套标了三批共 35 个）：进活动地图截全屏（带窗口
+标题栏也行）→ 用户在图上框出目标分区图标 → 程序按「纯红竖边」找框的左右边界
+（每列红色像素数 ≥70 才算，能滤掉背景红），框中心 ÷1.5 就是 1280 口径的 x；
+**相邻图标的 y 统一取 608**（图标行高度一致，徽记高约 110px，608 对应 1920 的
+950，落在 900~1000 都能点中）。同活动内图标等距，两个锚点就能定整排。
+`tools/zone_calib.py` 的列标准差找峰在插画复杂的图上会混进地图关卡标签，只适合
+当交叉验证。写完跑 `python tools/smoketest/smoke_test.py`，B35 会校验图标数量、
+坐标范围、左右间距和「进地图后必须调 goto_subzone」。
+
+## 打关预检：这号能打哪几关（2026-11-18）
+
+用户实测：助手把 BB-S-1~4 直接排进队列，账号练度不够，MAA 跑 8 分钟
+「0/1 个账号正常结束」，第一关就过不去，后面三关根本没解锁——用户只看到
+失败，不知道卡在哪、也不知道该补什么。之前 `_prepare_ops` 是「搜到作业就
+排第一份」，完全不看这号能不能抄。
+
+现在分成「预检」和「执行」两段，实现在 `backend/core/stageplan.py`：
+
+| 环节 | 做法 | 依据 |
+|---|---|---|
+| 顺序 | 同活动按 `resources.flow_key` 排（基础 → EX → S → MO） | 资源库自家流程表，不另造 |
+| 前置 | **默认不补**（`autoPrereq` 默认 `false`）；补的时候只补同分区前面的关，且**只打普通** | `BB-S-3` → 不传参数就只排 S-3；传 `autoPrereq=true` 才加 S-1、S-2 |
+| 练度 | 取作业站的作业，用 `copilot.req_met` 比对账号干员 | 四档：ready / borrow / train / blocked |
+| 连锁 | 某关 train / blocked，同活动后面的关一律「前置未通」 | 前一关没过，后面在游戏里是灰的 |
+| 收尾 | `run_core` 回报 `failed_stage` / `stage_trail` | 从 `CopilotListLoadTaskFileSuccess` 的文件名反查代号 |
+
+### 四档结论
+
+- `ready` 干员齐、练度够 → 直接抄
+- `borrow` 差一人，可借助战顶上 → 也排（`support_unit_usage=1`）
+- `train` 有干员但练度不够 → **不排**，日志写「谁 需 精二60 专三，你有 精一70」
+- `blocked` 缺干员且借不到 / 这关没作业 → **不排**
+
+只有前两档进 `copilotList`；后两档连带把后面同活动的关标「前置未通」。
+`skill_fight` 拿到的 `playable` 就是真正要排的关，`blocked` 原样返回给调用方
+（助手会在确认卡和回话里说清楚）。
+
+**全都被判「缺干员」时不拒绝**（2026-11-19）：作业站最新的作业常常用当期新
+干员，这号一比对就全缺人，但缺人可以借助战（`support_unit_usage=1`），用户
+手动跑 MAA 明明是能打的。所以 `blocked` 全是「缺」且不含「练度」时，改成
+警告 + 照排（`预检说这几关缺干员…照排试试`）；「练度不足 / 这关没作业」仍然
+一关都不排、直接报错。
+
+### 几个刻意的选择
+
+1. **默认不补前置（2026-11-19 改）**：`expand(['BB-S-3'])` 默认仍是链，但
+   `skill_fight` 传的 `with_prereq` 默认 `False`——**用户点名的关就是全部**。
+   起因是他只点名 S-3、S-4，程序把 S-1、S-2 也从头打了一遍（还按突袭打）。
+   不补时 `notes` 里写「S-4 前面还有 S-1、S-2、S-3，没打过的话是锁着的」，
+   助手把这句转述给用户，他同意再传 `autoPrereq=true`。
+   补进来的关一律 `prereq=True`，`_select_ops` 见到它 **只排普通作业**
+   （打通就解锁，打突袭白烧一倍理智）。
+   主线关不展开：`chain('1-7')` 只返回自己（`zoneType=ACTIVITY` 才认活动，
+   老活动 `a003_01` 这种 stageId 不带 act 前缀，按前缀判会漏）。
+2. **剧情关不挡后面的战斗关**：`BB-ST-1` 没看过，`BB-S-1` 照样能打，
+   所以 ST 不进连锁判定，只提示「交给 skill_skip_story」。
+3. **作业查询有 10 分钟缓存**：预检查一次、下载作业再查一次就是双倍请求；
+   缓存键用**账号文件名**（不是 `id(snap)`，每次 review 都新建 dict，用 id
+   永远打不中）。
+4. **查不到 ≠ 打不了**：作业站抽风（`_lookup` 抛异常）时这关标 `unknown`
+   照排，只写一句原因；账号快照读不到就只判「有没有作业」，不判练度。
+   `skills.skill_fight` 外面还有一层 try/except，预检整个挂掉也照原计划开打。
+
+### 真开打之后
+
+`maaplan.run_core(spec)` 多返回三个字段：`failed_stage`（卡在哪关）、
+`failed_why`（MAA 原文）、`stage_trail`（按顺序打过的关）。`skill_fight` 用
+`stageplan.explain_failure()` 把 `why` 翻成人话（未解锁 / 打不过 / 理智不够 /
+找不到关卡），并写明「后面 X、Y 没打」。`skill_weekly` 的每个战斗批次现在
+遇到 `blocked` 或 `failed` 会**立刻停**并带上原因抛给上层——周目是按解锁顺序
+走的，这一关过不去，后面的 EX / S 排了也是白跑。
+
+### 兜底超时
+
+`skill_fight` 给 `run_core` 传默认两小时超时（`timeout` 参数可覆盖）。
+用户截图里出现过「等了 480 分钟还没跑完」——MAA 卡在编队/加载界面时不会
+自己停，而 `run_core` 不传超时就是 8 小时兜底。现在到点 `AsstStop`，返回值
+带 `timed_out=true`，日志写「跑满 120 分钟还没结束，已停下；最后一关是 X」。
+
+### 已知边界
+
+- `mode=fight`（纯刷关）没有作业可比，判不了练度：预检只给顺序，全部标
+  `unknown`，靠运行时失败即停。
+- S / MO 分区在游戏里还需要先通关该活动全部 EX 关，这一点资源库没有逐关
+  解锁关系，只能在预检提示里写明；没通的话到那一步会报「找不到关卡」。
+- 本地没有关卡进度数据，判断不了「哪几关已经通关」。以前靠自动补前置兜底，
+  结果是每次把前置关重打一遍；现在默认不补，解锁交给用户在
+  「要不要一起补」里决定（`autoPrereq=true`）。
+- 资源包（`resources/arknights.json`）落后于游戏时，当期活动新开的 EX / S
+  分区不在表里——靠 `resources.infer_stage()` 按代号规则推（见下一节），
+  推出来的关**没有流程序**：`chain()` 只返回自己，前置提示走 `prereq_codes()`。
+- 周目（`skill_weekly`）现在按**分区断批**：基础 / EX / S / MO 各自一次
+  navigate + 一次 Copilot。以前只在 ST 关处断批，活动没有 ST 时整个活动挤成
+  一批，MAA 站在基础关地图上找 EX 关，必然「找不到」。
+
+## 资源包缺分区 + 突袭不降级（2026-11-19）
+
+用户实测：「还是不会选突袭，说的和实际给我选择的关不一样」。三处连环：
+
+**① 资源包没有当期活动的 EX / S 关。** 包是 2026.10.29 的，TL 活动只有
+`TL-1~TL-10`，`TL-S-1~S-4` 不在表里。于是 `resources.resolve('TL-S-4')`
+返回 `unknown`，`copilot.search` 走到最后那条兜底：
+
+```python
+pool = _pull({'document': keyword})       # 全文搜
+sid = pool[0]['content']['stage_name']    # 拿第一条的 stage_name 顶
+```
+
+全文搜「TL-S-4」的第一条是 `act55side_s02` 的作业——**挂 S-4，抄的是 S-2
+的打法**，突袭行自然也拿不到（作业站按 stageId 分普通/突袭两行）。
+
+现在改成 `resources.infer_stage(code)`：
+
+| 输入 | 推断 | 依据 |
+|---|---|---|
+| `TL-S-4` | `act55side_s04` | 同活动基础关 `TL-1` 的 stageId 是 `act55side_01`，前缀 `act55side` |
+| `TL-EX-3` | `act55side_ex03` | 同上，分区代号小写 + 两位序号 |
+| `TL-MO-1` | `act55side_mo01` | 同上 |
+| `TL-1` / `胡言乱语` | `None` | 不是「活动-分区-序号」格式，不瞎推 |
+
+- 推断行标 `inferred=True`、`raid=True`（EX/HX/MO/S 都有突袭难度，F 除外），
+  zone 字段全部继承基础关。
+- `resolve()` 在「代号精确」「stageId 精确」之后、前缀展开之前插这一步；
+  `copilot.search` 的兜底改成「推不出来就如实说搜不到」——**宁可搜不到，
+  也不能挂错关**。
+- 推断出来的关**不进 `stage_index`**（没有流程序，进了会把 `chain()` 算乱）。
+  `stageplan.row_of()` 单点兜底 infer，`chain()` 对 `flow` 缺失（序号 1e9）
+  的关直接返回自己；前置提示另走 `prereq_codes()`（纯代号规则）。
+
+**② 突袭作业判「缺干员」时偷偷降级成普通。** `_select_ops` 以前要求
+`raid_ok`（`mode in ready/borrow/unknown`）才排突袭，否则打印一行小字就改排
+普通——用户要突袭，看到的是普通。现在只要**这关有突袭作业**就照排
+（`_note` 会如实告警「缺 X，照排有可能打不过」），只有「作业站这关压根没有
+突袭作业」才退回普通。
+
+**③ 名单核对靠 `expand()`，资源包缺分区时收不拢。** `_tidy_stage_list`
+现在先用代号规则自己算白名单（同前缀、同分区、序号 ≤ 点名最大序号），
+再并上 `expand()` 的链——资源包没有 S 关也能把多余的 `TL-S-5` 剔掉。
+
+## 开跑前的环境闸（`envcheck.py`，2026-11-18）
+
+用户要求：每次跑任务前先确认模拟器在不在，**路径优先从 MAA 的配置里读**；
+检测本身不要显示出来，只有真没启动、真替他启动了才说话。
+
+### 为什么放在 `run_skill` 而不是各 skill 里
+
+所有 skill 最终都要连模拟器，而「模拟器没开」的反面反馈是最难看懂的那种：
+MaaCore 只会报 `adb 连不上`，用户第一反应是程序坏了。放一处前置闸，
+`wakeup / navigate / fight / skip_story / weekly` 全覆盖；`signin` 走森空岛
+网页，用 `skills._NEEDS_GAME` 排除掉——不然用户只想签个到，却被要求开模拟器。
+
+### 路径从哪来
+
+| 顺序 | 来源 | 说明 |
+|---|---|---|
+| 1 | `settings.emulatorPath` | 用户手动指定，最高优先（MAA 里没配 / 想指另一个实例时用） |
+| 2 | MAA `config/gui.new.json` | 当前配置的 `Gui.ConnectSettings`：`Config`（LDPlayer / MuMuEmulator12 / BlueStacks / Nox / MEmu）、`AdbPath`、`Address`、`Extras.<Config>.EmulatorPath`、`InstanceIndex` |
+| 3 | adb 路径反推 | `AdbPath` 是 `<模拟器目录>/adb.exe` 时，上一级就是安装目录 |
+| 4 | 常见安装位置 | 只在提示里用，不拿它启动 |
+
+### 判断「开着没有」
+
+先 `adb devices`：目标地址是 `device` 就算通；地址对不上但**有别的在线设备**
+也放行（`emulator-5554` 和 `127.0.0.1:5555` 是同一台机器的两个名字，
+`stagenav.Touch.ready` 也是这么自愈的）。
+
+不通再看进程。雷电多一层 `ldconsole list2`：那一行第 5 个字段是「安卓是否
+已启动」，能精确到实例——只看进程名的话，用户多开时实例 1 开着、MAA 配的是
+实例 0，会误判「已在启动中」，白等 45 秒还连不上。
+
+### 启动
+
+按模拟器类型挑启动器，前面的不存在就换后面：
+
+| 类型 | 启动器 | 参数 |
+|---|---|---|
+| LDPlayer | `ldconsole.exe` | `launch --index <实例>` |
+| MuMuEmulator12 | `shell/MuMuManager.exe` | `control -v <实例> launch` |
+| BlueStacks | `HD-Player.exe` | — |
+| Nox | `Nox.exe` | 首个实例空参；多开 `-clone:Nox_<实例>` |
+| MEmu | `MEmuConsole.exe` | `-v <实例>` |
+
+只负责「点着火」，不等它开完机：之后轮询 `adb devices`，最多 90 秒
+（`wait` 参数可覆盖），期间每 15 秒往日志写一句进度。真机实测雷电 14
+从冷启动到 `emulator-5554 device` 是 **20.7 秒**。
+
+### 日志口径（用户要的「不显示出来」）
+
+| 情况 | 日志 | 返回值 |
+|---|---|---|
+| adb 已通 | **一行都不写** | `(True, 'adb 正常（…）')` |
+| 进程在、adb 还没通 | `已经在跑了，等 adb 就绪…` | 等到通 → True；超时 → False |
+| 没启动、自动启动开 | `…没启动，正在帮你启动…` + `启动命令已发出…` + `已启动，adb 就绪` | True |
+| 没启动、自动启动关 | 无 | False，提示自己开 |
+| 起不来 / 目录不存在 / 类型不认识 | 无（只在返回值里） | False，写明原因 |
+
+返回 False 时 `run_skill` 直接把任务置为 error（`环境没准备好：…`），不往下
+走到「翻了几十屏没找到卡片」那种更误导人的报错。读不到 MAA 配置（还没引导）
+时放行——宁可放过，不能因为检测本身有问题把所有任务堵死。
+
+### 已知边界
+
+- 只查模拟器，不查游戏进程。游戏要谁拉起是 `wakeup` / MAA `StartUp` 的事。
+- `describe()` 是只读诊断入口（类型 / 目录 / 实例 / adb 现状），不启动任何东西。
+- 沙箱里 `Popen` 出去的模拟器会随命令会话结束被回收（实测），所以「启动后
+  保持运行」只能在常驻进程（dev 服务 / exe）里验。
+
+## 设置页改版后的两个「能动账号文件」的入口（2026-11-18）
+
+设置弹窗从「一列到底」改成左 tab + 右内容（账号 / MAA / 版本 / 助手 /
+数据与日志 / 黑名单）。界面本身在 `docs/frontend.md`，这里只记后端口径——
+新增的两个入口都会直接改账号 json，错一点就是数据事故。
+
+### token：默认只读，失效才解锁
+
+| 情况 | 界面 | 依据 |
+|---|---|---|
+| 有 token、`check` 通过 | `修改` 置灰，只能看 | 凭证没坏，允许改等于给「粘错号」开门 |
+| 有 token、`check` 明确返回失效 | 解锁，改成「修改」 | 唯一真正需要换 token 的场景 |
+| 没存过（MAA 导入建号） | 解锁，文案是「添加」 | 不是「失效」，别用失效话术误导 |
+| `broken`（密文本机解不开） | 解锁，文案是「重填」 | 换电脑/换用户后必然发生，重新粘一次就好 |
+
+`/api/account/token/check` 用 `sklogin.verify_token()`（`grant` 换码），
+网络问题一律抛异常而不是回 `ok:false`——**一断网就把所有账号解锁**是最糟
+的默认值，用户会在没坏的时候重粘一遍 token。
+
+写回走 `/api/account/token/set`，中间多一道 uid 核对：`Skland(token)` 登录
+→ `bindings()` 取 uid（终末地再补 `gacha.endfield_roles()` 的 uid / roleId）
+→ 和账号文件里的 uid 比。对不上就拒绝，并提示用「添加账号」——否则粘错一个
+别的号的 token，下次同步会静默多出一个账号、原账号还是失效状态，非常难查。
+
+`accounts.set_token()` 只重写 `skd` 段（`alias` 保留、`addedAt` 刷新），
+练度 / 进度 / `maa` 绑定全部原样：用户是来换凭证的，不是来重新同步的。
+
+### 切号名：`api_account_maa` 里统一归一
+
+`accountName` 现在可以直接在设置 → MAA 路径里按账号填。规则不在这儿重写，
+一律 `acctname.check(nm, channel)`：能吃 `5505` / `136` / `23****45` /
+`181****5505` / 全角与带横线的写法；官服只拦「填了昵称」（MAA 拿昵称去
+账号列表里子串匹配，死找几十次后超时，整轮挂机废掉）。**空串放行**——
+「还没填」和「填错了」是两件事，用 `check()` 原文会把清空输入框也拦下。
