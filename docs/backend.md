@@ -629,6 +629,13 @@ EX-1 之后又往后补了一关凑数，白烧一整轮理智。预检会把前
         'ex':   {'tpl': 'TL_z2.png', 'label': '长冬初青', ...},
         's':    {'tpl': 'TL_z3.png', 'label': '世纪之春', ...},
     },
+    # 同一屏上的两个「入口节点」：小游戏和活动商店（点进去不是关卡列表）
+    'tools': {
+        'minigame': {'tpl': 'TL_mini.png', 'label': '战时新闻委员会',
+                     'roi': [40, 165, 200, 130], 'tap': [127, 227], 'wait': 3.0},
+        'shop':     {'tpl': 'TL_shop.png', 'label': '炮火所掩埋的',
+                     'roi': [880, 120, 200, 130], 'tap': [975, 185], 'wait': 3.0},
+    },
 }
 ```
 
@@ -648,6 +655,52 @@ EX-1 之后又往后补了一关凑数，白烧一整轮理智。预检会把前
 **「最新活动」怎么落到代号**：`eventnav.match_name` 认活动名 / 代号 /
 「最新活动、当期活动、新活动…」，`skills.norm_stage` 和助手工具
 `list_activities`（返回里的 `current`）都走它，所以助手不用猜 TL 是哪个活动。
+
+**`tools` 是同一屏上的另外两个入口**：小游戏（战时新闻委员会）和活动商店
+（炮火所掩埋的）。它们和分区节点长在同一张活动地图上，但点进去不是关卡列表，
+所以单独列一格。`eventnav.run_tool(touch, 'minigame'|'shop')` 只负责把界面点
+到门口（`_to_map` 到活动地图 → 点节点），点完的画面校验是软的：商店/小游戏
+页面偏静态，`_moved` 硬判会误报，真正认页面的是后面的 MaaCore 任务。
+
+## MAA 小工具（牛杂，`maatools.py`，2026-11-19）
+
+MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列里**，但 MaaCore
+认：它们都是 `Custom` 任务。对着 asst.log 试出来的两种参数：
+
+```python
+# 战时新闻委员会（活动小游戏）
+{"task_names": ["MiniGame@WartimePressCommittee@Begin"]}
+
+# 活动商店
+{"task_names": ["SS@Store@Begin"],
+ "params": {"event_shop": {"blacklist": ["数据增补条", "数据增补", "龙门币", "家具零件"]}}}
+```
+
+黑名单的三个坑（都实测过，别改）：
+
+| 写法 | 结果 |
+|------|------|
+| 挂在 `params.event_shop.blacklist`，非空字符串数组 | ✅ `Parsed and registered EventShop task: SS@Store@Begin` |
+| 挂到顶层 / 塞进 params 字符串 | ❌ 静默忽略，**把无限池一起买光** |
+| 空数组 `[]` | ❌ 不注册插件，同样买无限池 |
+| 元素是数字 | ❌ `set_params failed, event shop blacklist item is not string` |
+
+所以 `maatools.build_params('event_shop', [])` 直接抛错，宁可失败也不买无限池。
+
+**执行**：`maaplan.run_custom(spec)` —— 不复用 `run_core`。那条链是给抄作业
+写的（强制补 StartUp、关卡导航、排 Copilot、失败重挂），牛杂一项都用不上。
+`run_custom` 只做「关 GUI → 连接 → append Custom → start → 等 → 收尾」，顺带
+把 asst.log 里活动商店那几句话翻成人话（跳过黑名单商品 / 选中商品 / 到无限池
+收工 / 代币不够）。
+
+**卡教程**：小游戏第一次进要过一段教程，MAA 认不出教程对话，会安静地重试同一
+个节点。`run_custom` 每 10 秒看一次「多久没新事件」，超过 120 秒就把
+`spec['tutorial']` 那句话打进日志 —— 用户才知道要手动过一遍教程再挂。
+
+**入口**：`skill_tool({'name': 'wartime_press'|'event_shop', 'account': ...,
+'blacklist': [...]})`，助手工具同名。导航和 MAA 都跑在同一个后台任务里，
+`tid` 透传给 `run_custom`，日志落在同一条任务上。
+
 
 ## 培养干员 skill（`train`，2026-11-18）
 
@@ -943,7 +996,7 @@ BB、MT 的「谒见神祇」、PV 的「彩车游行」都在中间。老实现
 | 环节 | 做法 | 依据 |
 |---|---|---|
 | 顺序 | 同活动按 `resources.flow_key` 排（基础 → EX → S → MO） | 资源库自家流程表，不另造 |
-| 前置 | EX / S / MO 自动补同分区前置（`chain()`），基础关默认不补 | `BB-S-3` → 先 `S-1`、`S-2`；`BB-7` 不补 1~6 |
+| 前置 | **默认不补**（`autoPrereq` 默认 `false`）；补的时候只补同分区前面的关，且**只打普通** | `BB-S-3` → 不传参数就只排 S-3；传 `autoPrereq=true` 才加 S-1、S-2 |
 | 练度 | 取作业站的作业，用 `copilot.req_met` 比对账号干员 | 四档：ready / borrow / train / blocked |
 | 连锁 | 某关 train / blocked，同活动后面的关一律「前置未通」 | 前一关没过，后面在游戏里是灰的 |
 | 收尾 | `run_core` 回报 `failed_stage` / `stage_trail` | 从 `CopilotListLoadTaskFileSuccess` 的文件名反查代号 |
@@ -959,15 +1012,22 @@ BB、MT 的「谒见神祇」、PV 的「彩车游行」都在中间。老实现
 `skill_fight` 拿到的 `playable` 就是真正要排的关，`blocked` 原样返回给调用方
 （助手会在确认卡和回话里说清楚）。
 
+**全都被判「缺干员」时不拒绝**（2026-11-19）：作业站最新的作业常常用当期新
+干员，这号一比对就全缺人，但缺人可以借助战（`support_unit_usage=1`），用户
+手动跑 MAA 明明是能打的。所以 `blocked` 全是「缺」且不含「练度」时，改成
+警告 + 照排（`预检说这几关缺干员…照排试试`）；「练度不足 / 这关没作业」仍然
+一关都不排、直接报错。
+
 ### 几个刻意的选择
 
-1. **基础关默认不补前置**：`expand(['BB-7'])` 只有 BB-7，但 `notes` 里会写
-   「BB-7 前面还有 BB-1~BB-6，没打过的话是锁着的（要补就传 autoPrereq=true）」。
-   理由是刷材料：用户说「刷 BB-7」时把六关一起排进去纯属白烧理智。EX / S /
-   MO 分区只有 1~8 关，且是「没通就锁着」的高频场景，默认补（`autoPrereq`
-   默认 `'auto'`，`true` 连基础关也补，`false` 一关不补）。
-   `mode=fight`（纯刷关）默认一关都不补——刷 S-3 的材料不该顺手打 S-1、S-2。
-   主线关同样不展开：`chain('1-7')` 只返回自己（`zoneType=ACTIVITY` 才认活动，
+1. **默认不补前置（2026-11-19 改）**：`expand(['BB-S-3'])` 默认仍是链，但
+   `skill_fight` 传的 `with_prereq` 默认 `False`——**用户点名的关就是全部**。
+   起因是他只点名 S-3、S-4，程序把 S-1、S-2 也从头打了一遍（还按突袭打）。
+   不补时 `notes` 里写「S-4 前面还有 S-1、S-2、S-3，没打过的话是锁着的」，
+   助手把这句转述给用户，他同意再传 `autoPrereq=true`。
+   补进来的关一律 `prereq=True`，`_select_ops` 见到它 **只排普通作业**
+   （打通就解锁，打突袭白烧一倍理智）。
+   主线关不展开：`chain('1-7')` 只返回自己（`zoneType=ACTIVITY` 才认活动，
    老活动 `a003_01` 这种 stageId 不带 act 前缀，按前缀判会漏）。
 2. **剧情关不挡后面的战斗关**：`BB-ST-1` 没看过，`BB-S-1` 照样能打，
    所以 ST 不进连锁判定，只提示「交给 skill_skip_story」。
@@ -1000,11 +1060,59 @@ BB、MT 的「谒见神祇」、PV 的「彩车游行」都在中间。老实现
   `unknown`，靠运行时失败即停。
 - S / MO 分区在游戏里还需要先通关该活动全部 EX 关，这一点资源库没有逐关
   解锁关系，只能在预检提示里写明；没通的话到那一步会报「找不到关卡」。
-- 已经打过的前置关会被再打一遍（本地没有关卡进度数据）。要避免就用
-  `autoPrereq=false`，代价是目标关可能还没解锁。
+- 本地没有关卡进度数据，判断不了「哪几关已经通关」。以前靠自动补前置兜底，
+  结果是每次把前置关重打一遍；现在默认不补，解锁交给用户在
+  「要不要一起补」里决定（`autoPrereq=true`）。
+- 资源包（`resources/arknights.json`）落后于游戏时，当期活动新开的 EX / S
+  分区不在表里——靠 `resources.infer_stage()` 按代号规则推（见下一节），
+  推出来的关**没有流程序**：`chain()` 只返回自己，前置提示走 `prereq_codes()`。
 - 周目（`skill_weekly`）现在按**分区断批**：基础 / EX / S / MO 各自一次
   navigate + 一次 Copilot。以前只在 ST 关处断批，活动没有 ST 时整个活动挤成
   一批，MAA 站在基础关地图上找 EX 关，必然「找不到」。
+
+## 资源包缺分区 + 突袭不降级（2026-11-19）
+
+用户实测：「还是不会选突袭，说的和实际给我选择的关不一样」。三处连环：
+
+**① 资源包没有当期活动的 EX / S 关。** 包是 2026.10.29 的，TL 活动只有
+`TL-1~TL-10`，`TL-S-1~S-4` 不在表里。于是 `resources.resolve('TL-S-4')`
+返回 `unknown`，`copilot.search` 走到最后那条兜底：
+
+```python
+pool = _pull({'document': keyword})       # 全文搜
+sid = pool[0]['content']['stage_name']    # 拿第一条的 stage_name 顶
+```
+
+全文搜「TL-S-4」的第一条是 `act55side_s02` 的作业——**挂 S-4，抄的是 S-2
+的打法**，突袭行自然也拿不到（作业站按 stageId 分普通/突袭两行）。
+
+现在改成 `resources.infer_stage(code)`：
+
+| 输入 | 推断 | 依据 |
+|---|---|---|
+| `TL-S-4` | `act55side_s04` | 同活动基础关 `TL-1` 的 stageId 是 `act55side_01`，前缀 `act55side` |
+| `TL-EX-3` | `act55side_ex03` | 同上，分区代号小写 + 两位序号 |
+| `TL-MO-1` | `act55side_mo01` | 同上 |
+| `TL-1` / `胡言乱语` | `None` | 不是「活动-分区-序号」格式，不瞎推 |
+
+- 推断行标 `inferred=True`、`raid=True`（EX/HX/MO/S 都有突袭难度，F 除外），
+  zone 字段全部继承基础关。
+- `resolve()` 在「代号精确」「stageId 精确」之后、前缀展开之前插这一步；
+  `copilot.search` 的兜底改成「推不出来就如实说搜不到」——**宁可搜不到，
+  也不能挂错关**。
+- 推断出来的关**不进 `stage_index`**（没有流程序，进了会把 `chain()` 算乱）。
+  `stageplan.row_of()` 单点兜底 infer，`chain()` 对 `flow` 缺失（序号 1e9）
+  的关直接返回自己；前置提示另走 `prereq_codes()`（纯代号规则）。
+
+**② 突袭作业判「缺干员」时偷偷降级成普通。** `_select_ops` 以前要求
+`raid_ok`（`mode in ready/borrow/unknown`）才排突袭，否则打印一行小字就改排
+普通——用户要突袭，看到的是普通。现在只要**这关有突袭作业**就照排
+（`_note` 会如实告警「缺 X，照排有可能打不过」），只有「作业站这关压根没有
+突袭作业」才退回普通。
+
+**③ 名单核对靠 `expand()`，资源包缺分区时收不拢。** `_tidy_stage_list`
+现在先用代号规则自己算白名单（同前缀、同分区、序号 ≤ 点名最大序号），
+再并上 `expand()` 的链——资源包没有 S 关也能把多余的 `TL-S-5` 剔掉。
 
 ## 开跑前的环境闸（`envcheck.py`，2026-11-18）
 

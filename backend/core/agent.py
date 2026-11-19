@@ -422,9 +422,10 @@ TOOLS = [
            'wakeup': {'type': 'boolean',
                       'description': 'true=连唤醒+导航一起跑（默认 false 直跑）'},
            'autoPrereq': {'type': 'boolean',
-                          'description': 'true=基础关的前置也一起补。默认只自动补 '
-                                         'EX/S/MO 的前置；mode=fight 纯刷关默认一关'
-                                         '都不补（刷材料时补上就是白烧理智）'},
+                          'description': '默认 false=不补前置，点名的关就是全部。'
+                                         'true=把前置关也补进计划（补进来的只打普通）'
+                                         '。用户说「S-3 点不开/没解锁，把前置一起补」'
+                                         '时才传 true，别自己默认补'},
            'raid': {'type': 'string', 'enum': ['auto', 'both', 'normal'],
                     'description': '没写 @ 后缀的关怎么打：auto（默认）=有突袭'
                                    '作业就只打突袭；both=普通+突袭都打（普通还没'
@@ -520,6 +521,25 @@ TOOLS = [
            'accountName': {'type': 'string',
                            'description': '切号名（官服=手机号后 4 位）'}},
           ['stage']),
+    _tool('skill_tool',
+          '**MAA 小工具（牛杂）**：跑 MAA「小工具 → 牛杂」里的功能。会自动导航到'
+          '当期活动地图 → 点对应入口 → 交给 MAA 跑。现在接了两项：\n'
+          '- `name="wartime_press"` 战时新闻委员会（活动小游戏，第一次要手动过教程）\n'
+          '- `name="event_shop"` 活动商店（按黑名单买，不碰无限池）\n'
+          '用户说「挂一下牛杂里的战时新闻委员会」「把活动商店买掉」时用它。'
+          '**活动商店要给黑名单**（不给就用默认四个：数据增补条 / 数据增补 / '
+          '龙门币 / 家具零件）。返回 taskId。',
+          {'name': {'type': 'string', 'enum': ['wartime_press', 'event_shop'],
+                    'description': 'wartime_press=战时新闻委员会小游戏；'
+                                   'event_shop=活动商店'},
+           'account': _ACC,
+           'blacklist': {'type': 'array', 'items': {'type': 'string'},
+                         'description': '活动商店黑名单（商品名，子串匹配）。'
+                                        '不传就用默认四个；**别传空数组**，'
+                                        '空着 MAA 会把无限池也买掉'},
+           'prefix': {'type': 'string',
+                      'description': '活动代号（TL / SV…），默认当期活动'}},
+          ['name']),
 ]
 
 
@@ -1237,9 +1257,9 @@ def _precheck_fight(args):
     except Exception:                       # noqa: BLE001 没账号就当匿名预检
         file = ''
     try:
-        auto = args.get('autoPrereq', 'auto')
+        # 和 skill_fight 保持一致：默认不补前置，确认卡上列的就是真正要打的关
+        auto = args.get('autoPrereq', False)
         mode = args.get('mode') or 'copy'
-        # 纯刷关默认不补前置（补上就变成每关打一遍，理智白花在已通关的关上）
         rep = stageplan.review(stages, file, mode=mode,
                                with_prereq=(auto is not False) and
                                (mode == 'copy' or auto is True),
@@ -1360,6 +1380,10 @@ def _tool_skill_sweep(args, session=None):
     return _skill_via_guard('sweep', args, session)
 
 
+def _tool_skill_tool(args, session=None):
+    return _skill_via_guard('tool', args, session)
+
+
 _HANDLERS = {
     'list_accounts': _tool_list_accounts,
     'list_activities': _tool_list_activities,
@@ -1388,6 +1412,7 @@ _WRITE_HANDLERS = {
     'skill_weekly': _tool_skill_weekly,
     'skill_train': _tool_skill_train,
     'skill_sweep': _tool_skill_sweep,
+    'skill_tool': _tool_skill_tool,
 }
 
 
@@ -1542,6 +1567,13 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - skill_sweep：**一键扫图**——普通关 → EX 普通 → EX 突袭 → S 关，逐段重新
   导航 + 挂机。用户说「这个活动从头打到尾」「EX 和 S 都清了」就用它，
   比 skill_weekly 更适合「只要战斗、不要剧情编排」的场景
+- skill_tool：**MAA 小工具（牛杂）**——`name="wartime_press"` 战时新闻委员会
+  小游戏、`name="event_shop"` 活动商店。两项都自己导航到当期活动地图再点入口。
+  活动商店必须给黑名单（默认四个：数据增补条 / 数据增补 / 龙门币 / 家具零件），
+  **空黑名单会把无限池也买掉**，别传空数组。
+  小游戏第一次进要过教程，MAA 不会点教程对话：任务里 `stuck` / 超时的时候，
+  明确告诉用户「先在模拟器里手动把教程过一遍，过完再让我挂一次」，不要说
+  「任务失败请重试」这种空话
 
 **什么时候用 skill 而不是 build_run**：
 - 用户要「从唤醒开始，剧情关也帮我过，一口气打完」→ skill_weekly。
@@ -1555,6 +1587,7 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   分段导航、每关失败换作业重挂，不用一段段手动调 skill_navigate + skill_fight
 - 签到 → skill_signin
 - **培养干员**（升精二 / 技能 7 / 专精几技能）→ skill_train
+- **小游戏 / 活动商店**（MAA 牛杂里那两项）→ skill_tool，别自己写 Custom 任务
 
 **「帮我把泥岩精二、二技能专三」**
 1. 先跟用户确认：哪个号、哪些干员、各自练度目标（别说「帮你练一下」就开跑）
@@ -1593,10 +1626,13 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
   比对这号练度。返回里有 `precheck` 且列了「练度不足 / 缺干员 / 前置未通」时，
   **必须先把「哪几关打不了、为什么」原样告诉用户**（练度不够要点出差哪个干员），
   再说能打的几关已在后台跑。一关都打不了时工具会直接返回 error，别改口说"开打了"。
-- **别把没解锁的关排进队列**：前一关没通，后面的关在地图上是灰的（用户实测：
-  S1/S2 没打，S3 连解锁都不行，排下去只是白等 8 分钟）。用户点名要 S3 时，
-  skill_fight 会自动把 S1、S2 补进计划；只想打指定的那关就传 autoPrereq=false，
-  并在回话里说清「这关可能还没解锁」。
+- **stages 只写用户点名的关，一个都不许自己加**：用户说「挂 S-3、S-4」就传
+  `["TL-S-3@raid","TL-S-4@both"]`，**不要自己补 S-1、S-2 这种前置**（用户
+  2026-11-19 实测：「我让他挂的关卡和他给我挂的关卡不一致」）。补前置是
+  `autoPrereq: true` 才会做的事，默认关；要补也在回话里先说清补了哪几关。
+- **别把没解锁的关排进队列**：前一关没通，后面的关在地图上是灰的。用户点名
+  要 S3 而 S1/S2 没打时，日志会写「不补前置：S3 要先通前面的关」，把这句话
+  转述给用户，问他「要不要一起补」，他同意再传 `autoPrereq: true`。
 - **活动代号一律查，不许凭记忆换算**：用户说「孤星」就搜 search_stages("孤星")
   或直接把中文名交给 skill_navigate，**不要自己猜成 SV**（孤星=CW，
   覆潮之下=SV，愚人号=SN，不义之财=CV）。猜错一次就是几轮白跑。

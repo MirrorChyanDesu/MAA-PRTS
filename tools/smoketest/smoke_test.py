@@ -3113,6 +3113,16 @@ def check_stage_precheck(tmp):
                                 'account': 'x.json'}, lambda *_: None)
         except ValueError:
             pass
+        # 2026-11-19 用户口径：默认「点名的关就是全部」，copy 模式也不再
+        # 自动补前置（他要打 S-3、S-4，结果 S-1、S-2 也被打了一遍）
+        assert cap.get('with_prereq') is False, cap
+        cap.clear()
+        try:
+            skills.skill_fight({'stages': ['BB-S-3'], 'mode': 'copy',
+                                'autoPrereq': True,
+                                'account': 'x.json'}, lambda *_: None)
+        except ValueError:
+            pass
         assert cap.get('with_prereq') is True, cap
     finally:
         stageplan.review = orig_rev
@@ -4223,6 +4233,284 @@ def check_event_nav(tmp):
     assert got2 == ['SV-EX-1'], got2
     assert any('SV-EX-2' in x and '没在计划里' in x for x in logs2), logs2
 
+def check_stage_infer(tmp):
+    """B45：资源包缺分区（当期活动 EX/S）时的四件事
+
+    2026-11-19 用户实测：「还是不会选突袭，说的和实际给我选择的关不一样」。
+    查下来是三处连环：
+      1) 资源包只有 TL-1~TL-10，没有 TL-S-4，于是搜索走「全文搜第一条的
+         stage_name」兜底，把 TL-S-4 认成 act55side_s02 —— 挂 S-4 抄 S-2 的
+         作业，突袭行也拿不到；
+      2) 预检默认补前置，用户只点名 S-3/S-4，S-1、S-2 也被从头打一遍；
+      3) 突袭作业判「缺干员」时程序默默降级成普通，用户看到的就是「不打突袭」。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import resources, stageplan, skills
+    from core import copilot as cp
+
+    # ① 代号推断：资源包里没有的分区按同活动基础关推 stageId
+    assert resources.resolve('TL-1')['stages'], 'TL 基础关应该在资源包里'
+    inf = resources.infer_stage('TL-S-4')
+    assert inf and inf['stageId'] == 'act55side_s04', inf
+    assert inf['raid'] is True and inf['difficulty'] == 'normal', inf
+    assert resources.infer_stage('TL-EX-3')['stageId'] == 'act55side_ex03'
+    assert resources.infer_stage('TL-MO-1')['stageId'] == 'act55side_mo01'
+    assert resources.infer_stage('TL-1') is None, '基础关不瞎推'
+    assert resources.infer_stage('胡言乱语') is None
+    rep = resources.resolve('TL-S-4')
+    assert rep['mode'] == 'stage' and rep['stages'][0]['code'] == 'TL-S-4', rep
+    assert rep['stages'][0]['stageId'] == 'act55side_s04', rep
+
+    # ② 预检认识推断出来的关：能算前置、能排序、默认不展开
+    assert (stageplan.row_of('TL-S-4') or {}).get('stageId') == 'act55side_s04'
+    assert stageplan.prereq_codes('TL-S-4') == [
+        'TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4'], stageplan.prereq_codes('TL-S-4')
+    assert [i['code'] for i in stageplan.expand(['TL-S-4'], with_prereq=False)] \
+        == ['TL-S-4']
+    assert [i['code'] for i in stageplan.expand(['TL-S-4'], with_prereq=True)] \
+        == ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4']
+
+    # ③ 名单核对：多出来的 S-5 剔掉，S-1~S-4（同分区前面的关）留着
+    got = skills._tidy_stage_list(
+        ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4', 'TL-S-5'],
+        ['TL-S-3', 'TL-S-4'], lambda *_: None)
+    assert got == ['TL-S-1', 'TL-S-2', 'TL-S-3', 'TL-S-4'], got
+
+    # ④ 突袭作业判「缺干员」也照排突袭；补进来的前置关只打普通；@both 两条
+    orig = cp.search
+
+    def fake_search(code, snap=None, **kw):
+        return {'mode': 'stage', 'stages': [
+            {'stage': {'code': code, 'variant': 'normal'},
+             'ops': [{'copilotId': 11, 'mode': 'ready', 'rating': 9, 'title': 'n'}]},
+            {'stage': {'code': code, 'variant': 'raid'},
+             'ops': [{'copilotId': 12, 'mode': 'blocked', 'missing': ['甲'],
+                      'rating': 9, 'title': 'r'}]}]}
+    cp.search = fake_search
+    try:
+        logs = []
+        picks, pool = skills._select_ops(['TL-S-3'], '', logs.append, raid='auto')
+        assert picks == [{'copilotId': 12, 'stageCode': 'TL-S-3',
+                          'variant': 'raid'}], picks
+        assert any('缺干员' in x for x in logs), logs
+
+        picks, _ = skills._select_ops(['TL-S-1'], '', logs.append, raid='auto',
+                                      prereq={'TL-S-1'})
+        assert picks and picks[0]['variant'] == 'normal', picks
+        assert any('补的前置关' in x for x in logs), logs
+
+        picks, _ = skills._select_ops(['TL-S-3'], '', logs.append, raid='auto',
+                                      wants={'TL-S-3': 'both'})
+        assert [p['variant'] for p in picks] == ['normal', 'raid'], picks
+
+        # 这关压根没有突袭作业时才退回普通
+        cp.search = lambda code, snap=None, **kw: {
+            'mode': 'stage', 'stages': [
+                {'stage': {'code': code, 'variant': 'normal'},
+                 'ops': [{'copilotId': 21, 'mode': 'ready', 'rating': 9,
+                          'title': 'n'}]}]}
+        picks, _ = skills._select_ops(['TL-S-2'], '', logs.append, raid='auto')
+        assert picks and picks[0]['variant'] == 'normal', picks
+    finally:
+        cp.search = orig
+
+    # ⑤ 预检全判「缺干员」时不拒绝（缺人能借助战），判「练度不足」才拒绝
+    orig_rev, orig_prep, orig_run, orig_acc = (
+        stageplan.review, skills._prepare_ops,
+        skills.maaplan.run_core, skills._account_file)
+    orig_dir = skills._default_maa_dir
+    try:
+        skills._account_file = lambda n: 'x.json'
+        skills._default_maa_dir = lambda: 'MAA'
+        skills._prepare_ops = lambda *a, **k: ([], {})
+        skills.maaplan.run_core = lambda *a, **k: {
+            'ok': True, 'stages_ok': [], 'stages_failed': [], 'swaps': []}
+
+        def fake_review(stages, *a, **k):
+            return {'plan': [{'code': 'TL-S-3', 'prereq': False,
+                              'state': 'blocked', 'reason': '缺干员',
+                              'notes': [], 'story': False, 'kind': 's'}],
+                    'playable': [], 'ops': {}, 'notes': [],
+                    'blocked': [{'code': 'TL-S-3', 'reason': '缺干员且借不到',
+                                 'notes': []}],
+                    'summary': 'x', 'requested': list(stages)}
+        stageplan.review = fake_review
+        res = skills.skill_fight({'stages': ['TL-S-3'], 'account': 'x'},
+                                 lambda *_: None)
+        assert res['ok'] and res['stages'] == ['TL-S-3'], res
+
+        stageplan.review = lambda *a, **k: dict(
+            fake_review(['TL-S-3']),
+            blocked=[{'code': 'TL-S-3', 'reason': '练度不足', 'notes': []}])
+        try:
+            skills.skill_fight({'stages': ['TL-S-3'], 'account': 'x'},
+                               lambda *_: None)
+        except ValueError as e:
+            assert '一关都打不了' in str(e), e
+        else:
+            raise AssertionError('练度不足也不该硬排')
+    finally:
+        (stageplan.review, skills._prepare_ops, skills.maaplan.run_core,
+         skills._account_file) = (orig_rev, orig_prep, orig_run, orig_acc)
+        skills._default_maa_dir = orig_dir
+
+
+def check_maa_tool(tmp):
+    """B46：MAA 小工具（牛杂）—— 战时新闻委员会 / 活动商店
+
+    ① 两个入口模板都在包里，`tools` 结构合法（roi/tap/wait）
+    ② `run_tool` 先到活动地图、再点入口节点，点位用的是 tools 里的配置
+    ③ `maatools.resolve` 认中文名 / 别名 / 键
+    ④ 活动商店黑名单**只能**挂在 `params.event_shop.blacklist`，且非空全字符串
+       （挂错地方 / 空数组 = 静默买光无限池，这条是实测踩出来的）
+    ⑤ 空黑名单直接报错，不给「悄悄买无限池」的机会
+    ⑥ `skill_tool` 串起来：导航 → run_custom，卡住时把教程那句话带给用户
+    """
+    _reset_config(tmp)
+
+    from core import eventnav, maaplan, maatools, skills
+
+    # ① 模板 + 结构
+    ent = eventnav.ENTRIES['TL']
+    assert set(ent['tools']) == {'minigame', 'shop'}, ent['tools']
+    for k, v in ent['tools'].items():
+        p = eventnav._tpl_path(v['tpl'])
+        assert p and os.path.isfile(p), (k, v['tpl'])
+        assert len(v['tap']) == 2 and len(v['roi']) == 4, (k, v)
+    # 小游戏在左上、商店在右上，识别区域不能互相盖住
+    a, b = ent['tools']['minigame']['roi'], ent['tools']['shop']['roi']
+    assert a[0] + a[2] <= b[0], (a, b)
+
+    # ② run_tool：先到活动地图，再点入口
+    calls = []
+
+    class Shot:
+        def __init__(self):
+            self.n = 0
+
+        def shot(self):
+            self.n += 1
+            return b'\x89PNG' + bytes([self.n]) * 8
+
+    orig_map, orig_tap, orig_sleep = (eventnav._to_map, eventnav._tap,
+                                      eventnav.time.sleep)
+    eventnav._to_map = lambda touch, pre, e, log: (
+        calls.append(('map', pre)) or (True, b'\x89PNG-0', '活动地图'))
+    eventnav._tap = lambda touch, data, spec, log, what: (
+        calls.append(('tap', what)) or True)
+    eventnav.time.sleep = lambda *_: None
+    try:
+        ok, why = eventnav.run_tool(Shot(), 'minigame', log=lambda *_: None)
+        assert ok and why, (ok, why)
+        assert calls[0] == ('map', 'TL'), calls
+        assert calls[1][0] == 'tap' and '战时新闻委员会' in calls[1][1], calls
+        ok2, _ = eventnav.run_tool(Shot(), 'shop', log=lambda *_: None)
+        assert ok2
+        # 没配入口要说清楚，而不是默默点到别的地方
+        ok3, why3 = eventnav.run_tool(Shot(), 'nope', log=lambda *_: None)
+        assert not ok3 and 'nope' in why3, why3
+    finally:
+        eventnav._to_map, eventnav._tap = orig_map, orig_tap
+        eventnav.time.sleep = orig_sleep
+
+    # ③ 名字 → 键
+    assert maatools.resolve('战时新闻委员会')[0] == 'wartime_press'
+    assert maatools.resolve('小游戏')[0] == 'wartime_press'
+    assert maatools.resolve('活动商店')[0] == 'event_shop'
+    assert maatools.resolve('shop')[0] == 'event_shop'
+    try:
+        maatools.resolve('抽卡')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('不认识的名字该报错')
+
+    # ④ Custom 参数：黑名单的位置和类型
+    p = maatools.build_params('wartime_press')
+    assert p == {'task_names': ['MiniGame@WartimePressCommittee@Begin']}, p
+    p = maatools.build_params('event_shop')
+    assert p['task_names'] == ['SS@Store@Begin'], p
+    bl = p['params']['event_shop']['blacklist']
+    assert bl and all(isinstance(x, str) for x in bl), bl
+    assert '龙门币' in bl and '数据增补条' in bl, bl
+    # 顶层不许出现 blacklist（挂错位置会被 MaaCore 静默忽略）
+    assert 'blacklist' not in p and 'params' in p, p
+    # 自定义名单
+    p2 = maatools.build_params('event_shop', ['固源岩'])
+    assert p2['params']['event_shop']['blacklist'] == ['固源岩'], p2
+
+    # ⑤ 空黑名单必须炸
+    try:
+        maatools.build_params('event_shop', [])
+    except ValueError as e:
+        assert '无限池' in str(e), e
+    else:
+        raise AssertionError('空黑名单会把无限池买掉，必须报错')
+
+    # ⑥ skill_tool：导航 → run_custom（打桩，不连模拟器）
+    seen = {}
+
+    class Touch:
+        def ready(self):
+            return True, 'ok'
+
+        def game_alive(self):
+            return True
+
+    orig_conn = maaplan._connection
+    orig_run_custom = maaplan.run_custom
+    orig_acc = skills._account_file
+    orig_dir = skills._default_maa_dir
+    orig_touch = skills.stagenav.Touch
+    orig_run_tool = eventnav.run_tool
+    try:
+        skills._account_file = lambda n: 'x.json'
+        skills._default_maa_dir = lambda: 'D:/fake-maa'
+        skills.stagenav.Touch = lambda *a, **k: Touch()
+
+        def fake_run_tool(t, tool, prefix=None, log=None):
+            seen['nav'] = tool
+            return True, '已进入'
+
+        eventnav.run_tool = fake_run_tool
+        maaplan._connection = lambda d, profile=None: {
+            'adb_path': 'adb', 'address': '127.0.0.1:5555',
+            'config': 'General', 'touch': 'MiniTouch', 'maa_dir': d}
+
+        def fake_run_custom(spec, tid=None, timeout=None):
+            seen['spec'] = spec
+            seen['timeout'] = timeout
+            return {'ok': False, 'stuck': 'idle', 'timed_out': False,
+                    'tutorial': spec.get('tutorial') or '',
+                    'error': ''}
+
+        maaplan.run_custom = fake_run_custom
+        logs = []
+        r = skills.skill_tool({'name': 'wartime_press', 'account': 'x'},
+                              logs.append)
+        assert seen['nav'] == 'minigame', seen
+        assert seen['spec']['task'] == {
+            'task_names': ['MiniGame@WartimePressCommittee@Begin']}, seen['spec']
+        assert seen['spec']['tutorial'], seen['spec']
+        assert seen['timeout'] >= 600, seen['timeout']
+        # 卡住时必须把「手动过教程」这句话带给用户
+        assert not r['ok'] and r['stuck'] == 'idle', r
+        assert '教程' in (r.get('hint') or ''), r
+        assert any('教程' in m for m in logs), logs
+
+        r2 = skills.skill_tool({'name': 'shop', 'account': 'x',
+                                'blacklist': '龙门币,固源岩'}, logs.append)
+        bl2 = seen['spec']['task']['params']['event_shop']['blacklist']
+        assert bl2 == ['龙门币', '固源岩'], bl2
+        assert r2['tool'] == 'event_shop', r2
+    finally:
+        maaplan._connection = orig_conn
+        maaplan.run_custom = orig_run_custom
+        skills._account_file = orig_acc
+        skills._default_maa_dir = orig_dir
+        skills.stagenav.Touch = orig_touch
+        eventnav.run_tool = orig_run_tool
+
 
 # ---------------------------------------------------------------- 入口
 
@@ -4287,6 +4575,8 @@ def main():
         r.check('B42 工具调用断链自愈 + 点名作业真的生效', lambda: check_agent_tool_chain(tmp))
         r.check('B43 逐关战报 + 失败换作业重挂 + 分段扫图', lambda: check_battle_retry(tmp))
         r.check('B44 当期活动导航（有效期/指代/模板/点结算页/名单核对）', lambda: check_event_nav(tmp))
+        r.check('B45 资源包缺分区（EX/S 推断/默认不补前置/突袭不降级）', lambda: check_stage_infer(tmp))
+        r.check('B46 牛杂小工具（小游戏/活动商店/黑名单位置/卡教程提示）', lambda: check_maa_tool(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

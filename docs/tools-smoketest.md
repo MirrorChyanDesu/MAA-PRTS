@@ -175,6 +175,44 @@ MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度，
 离线核对模板（不连模拟器也能验）：把用户截图喂给 `find_card_bytes`，四张模板
 都拿 0.0 分、命中位置就是红框中心。
 
+### B45 资源包缺分区（2026-11-19）
+
+用户实测：「还是不会选突袭，说的和实际给我选择的关不一样」。资源包是
+2026.10.29 的，当期活动只有 `TL-1~TL-10`，没有 `TL-S-4`，于是搜索拿
+「全文搜第一条的 stage_name」顶上，把 S-4 认成了 `act55side_s02`。
+
+- 推断：`infer_stage('TL-S-4') → act55side_s04`、`TL-EX-3 → act55side_ex03`、
+  `TL-MO-1 → act55side_mo01`；`TL-1` 和乱码返回 `None`（不瞎推）；
+  `resolve('TL-S-4')` 必须 `mode='stage'` 且 stageId 正确
+- 预检：`row_of('TL-S-4')` 认得出；`prereq_codes('TL-S-4')` 是
+  `S-1~S-4`；`expand(with_prereq=False)` 只出自己
+- 名单核对：`['TL-S-1'...'TL-S-5']` 对点名 `['TL-S-3','TL-S-4']` → 剔掉 S-5，
+  S-1~S-4 留着（同分区前面的关算前置）
+- 突袭不降级：突袭作业 `mode='blocked'` 时首轮仍排 `variant='raid'`
+  （日志告警但不改普通）；`prereq` 里的关只排普通；`@both` 出 normal + raid
+  两条；这关压根没有突袭作业时才退回普通
+- 预检全判「缺干员」时不拒绝（缺人能借，照排）；判「练度不足」时仍然报
+  「一关都打不了」
+
+### B46 牛杂小工具（2026-11-19）
+
+两个入口（战时新闻委员会小游戏 / 活动商店）都长在当期活动地图上，点进去之后
+交给 MAA 的 `Custom` 任务。测试不连模拟器，全部打桩：
+
+- 模板：`TL_mini.png` / `TL_shop.png` 都在包里，`roi` + `tap` 齐全，
+  两个识别区域不能互相盖住（小游戏在左上、商店在右上）
+- `run_tool`：先 `_to_map` 到活动地图，再点 `tools` 里配的节点；日志里带的
+  是节点的中文名（「战时新闻委员会」）；没配的入口要明确报错，不能乱点
+- 名字：中文名 / 别名（「小游戏」「商店」）/ 键 都能解析，认不出抛错
+- **黑名单只能挂在 `params.event_shop.blacklist`**：顶层出现 `blacklist`、
+  空数组、或元素不是字符串，都会被 MaaCore 静默忽略（等于买光无限池），
+  所以只认 `params.event_shop.blacklist` 且非空全字符串
+- 空黑名单 `build_params('event_shop', [])` 必须抛错
+- `skill_tool` 串联：导航用的是 `ent['nav']`（minigame/shop）；`spec['task']`
+  就是 maatools 拼的那份；黑名单支持逗号串（`'龙门币,固源岩'`）
+- **卡教程**：`run_custom` 返回 `stuck` 时，`skill_tool` 的结果里要带
+  `hint` 并在日志里出现「教程」二字（用户口径：告诉他手动过一遍再挂）
+
 ## 什么时候跑
 
 - 改了 `vault.py` / `accounts.py` / `settings.py` / `main.py` 之后
