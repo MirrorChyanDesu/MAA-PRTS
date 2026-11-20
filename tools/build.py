@@ -237,6 +237,16 @@ def build():
         return 1
     stale = count_stale(fresh, pkg_dir)
 
+    # GPL 要求随二进制一并分发许可证全文（§4/§5），README 里是 token 获取与
+    # 常见问题，第三方组件清单在 THIRD_PARTY.md，三个都放进发布包根目录。
+    for name in ('LICENSE', 'THIRD_PARTY.md', 'README.md'):
+        src = os.path.join(HERE, name)
+        if os.path.isfile(src):
+            try:
+                shutil.copy2(src, os.path.join(pkg_dir, name))
+            except PermissionError:
+                print('warn: %s is locked, license file not updated' % name)
+
     # 每次构建都是 --clean 全量重建，中间产物没有复用价值，成功即删
     shutil.rmtree(work_dir, ignore_errors=True)
 

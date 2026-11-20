@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 MAA-PRTS contributors
+// 本文件的写法参考第三方独立版宿主 farm-ui.mjs（GPL-3.0-or-later）改写，
+// 按 GPL-3.0-or-later 发布；第三方组件清单与对核心的改动见仓库根目录 THIRD_PARTY.md。
+//
 // 卫戍协议·策略刻章速刷 —— MAA-PRTS 子进程宿主
 //
 // 由 backend/core/garrison.py 按账号懒启动（一个账号一个进程，多账号天然并行）：
