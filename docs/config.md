@@ -216,6 +216,7 @@ WR=画中人        ZT=崔林特尔梅之金
 ```jsonc
 {
   "maaDir": "D:\\2.game\\MAA-ALL\\MAA-ARK\\MAA-v6.20.1-win-x64",
+  "maaEndDir": "",
   "maaDirs": ["D:\\2.game\\MAA-ALL\\MAA-ARK\\MAA-v6.20.1-win-x64"],
   "autoStartMaa": true,
   "autoUpdatePack": true,
@@ -228,6 +229,7 @@ WR=画中人        ZT=崔林特尔梅之金
 | 字段 | 说明 |
 |---|---|
 | `maaDir` | 全局默认 MAA 根目录（含 `MAA.exe` 与 `config/gui.new.json`）。写入路径时会自动规范化斜杠 |
+| `maaEndDir` | 明日方舟终末地那一栏的 MAAEND 根目录。设置里按游戏分了 tab，两套路径互不覆盖；MAAEND 的任务链还没接，这项先留着位 |
 | `maaDirs` | 用过的 MAA 根目录历史（添加账号时「已存过」列表的数据源） |
 | `autoStartMaa` | 写完作业后是否自动启动 MAA |
 | `autoUpdatePack` | 启动后是否自动下载新的游戏资源包（新关卡 / 新干员 / 新活动），默认开。关掉不影响使用，只是要等发新版才有新数据 |
@@ -242,6 +244,37 @@ WR=画中人        ZT=崔林特尔梅之金
 手改坏了 JSON 也不会丢数据：启动时会把坏文件改名成
 `settings.json.broken-<时间戳>` 保住原件，程序按默认设置继续运行。
 
+## schedule.json（定时任务）
+
+设置 → 定时任务整页存在这个文件里，跟 `settings.json` 分开：任务列表改得频繁，
+还要带运行记录，混进偏好设置里会让那份文件越来越难手改。
+
+```jsonc
+{
+  "version": 1,
+  "conflict": "stop",        // stop=停掉在跑的 / skip=跳过本次
+  "onChainFail": "continue", // continue=继续后续 / stop=停掉整条链
+  "tasks": [
+    {
+      "id": "s1a2b3c4",
+      "enabled": true,
+      "name": "早上挂长草",
+      "mode": "time",        // time=按时间，chain=接在上一条后面
+      "time": "08:00",
+      "weekdays": [1, 2, 3, 4, 5, 6, 7],   // 1=周一 … 7=周日
+      "program": "D:\\tools\\autostart-138.exe",
+      "args": "--autostart --instance 138",
+      "cwd": "",             // 空 = 程序所在目录
+      "timeout": 0,          // 秒，0=不限
+      "notify": true
+    }
+  ]
+}
+```
+
+删掉这个文件等于清空全部定时任务；程序运行中读的是内存缓存，改完要重启或
+在界面上再保存一次才生效。
+
 ## 账号文件（<昵称> <服务器>.json）
 
 schemaVersion 2 快照（`backend/core/updater.py` 的 `build_snapshot`）加一段
@@ -251,7 +284,10 @@ schemaVersion 2 快照（`backend/core/updater.py` 的 `build_snapshot`）加一
 {
   "schemaVersion": 2,
   "account": { "uid": "…", "nickName": "…", "channelName": "官服", /* … */ },
-  "maa":  { "dir": "D:\\…", "profile": "", "note": "" },  // 该账号绑定的 MAA 目录
+  "maa":  { "dir": "D:\\…",            // 该账号绑定的 MAA 目录（空=用全局默认）
+            "profile": "moren",         // 该账号用的 MAA 配置档案名（切号名从它读）
+            "accountName": "181****5505", // 切号名（MAA StartUp 的 AccountName）
+            "accountNameFrom": "profile" }, // profile=跟着档案走 / manual=用户手填
   "skd":  { "alias": "大号",                               // 备注（添加时填的）
             "addedAt": "2026-11-05T07:40:00",              // 添加时间
             "data": "AQAAANCMnd8BFdERjHoAwE…" },           // base64(DPAPI(token))
@@ -264,6 +300,11 @@ schemaVersion 2 快照（`backend/core/updater.py` 的 `build_snapshot`）加一
 `maa.dir` 与 `skd` 同处一个账号文件：一个账号用哪个 MAA、拿哪个 token，
 删文件即整体清除。从 MAA 导入干员识别结果（界面的「从 MAA 导入干员信息」）
 也是改这份文件——只覆盖 `chars/stats/missing/sync`，其余原样保留。
+
+`maa.profile` 只是**记名字**：选了档案，`acctbind.resolve()` 会去那份档案的
+`TaskQueue[0]`（StartUp）读 `AccountName` 当切号名，**不写回** MAA 的
+`gui.new.json`。`accountNameFrom=manual` 表示用户手填过，这时以账号里的
+`accountName` 为准，档案里的旧值不会盖回来。
 
 ### 终末地账号
 

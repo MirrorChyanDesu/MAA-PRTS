@@ -9,7 +9,8 @@ import urllib.parse
 
 from . import (accounts, agent, appupdate, asstlog, copilot, gacha, garrison,
                maa, maaplan, multiacct, operbox, packsync, paradox, resources,
-               settings, signin, skills, sklogin, tasks, updater, version, watch)
+               scheduler, settings, signin, skills, sklogin, tasks, updater,
+               version, watch)
 
 WEB = settings.static_dir()
 
@@ -156,10 +157,17 @@ def api_account_maa(_q, body):
         patch['dir'] = settings._norm_dir(patch.get('dir') or '')
         if patch['dir']:
             settings.remember_maa_dir(patch['dir'])
+    if 'profile' in patch:
+        # 配置文件（MAA 的 Configuration）：只记名字，**不读写用户的档案内容**。
+        # 切号名优先按这份档案里「开始唤醒」的 AccountName 来（acctbind.resolve）。
+        patch['profile'] = str(patch.get('profile') or '').strip()[:60]
+    if 'accountNameFrom' in patch:
+        v = str(patch.get('accountNameFrom') or '').strip().lower()
+        patch['accountNameFrom'] = v if v in ('manual', 'profile') else ''
     if 'accountName' in patch:
         # 切号名统一走 acctname：用户给「5505」「181 5505」「181****5505」
-        # 都能吃下，官服填了昵称则当场拦下——这一格填错的代价是 MAA 在
-        # 账号列表里死找、4 分钟超时后整轮挂机废掉。
+        # 「157****3635」都能吃下，官服填了昵称则当场拦下——这一格填错的
+        # 代价是 MAA 在账号列表里死找、4 分钟超时后整轮挂机废掉。
         # 留空是合法状态（还没填 / 想清掉），不能当成「填错」拦下。
         from . import acctname
         raw = (patch.get('accountName') or '').strip()
@@ -170,6 +178,9 @@ def api_account_maa(_q, body):
             if why:
                 raise ValueError('切号名不对：%s' % why)
             patch['accountName'] = name
+            # 没明说来源的一律按手填：老调用方（CLI/脚本）给的值不能被
+            # 绑定的配置文件悄悄盖回去
+            patch.setdefault('accountNameFrom', 'manual')
         else:
             patch['accountName'] = ''
     return {'maa': accounts.save_maa_meta(body['file'], patch)}
@@ -440,11 +451,20 @@ def api_skland_login_cancel(_q, _body):
 
 
 def api_maa_probe(q, _body):
-    """检测一个目录是不是 MAA 根目录（首次引导 / 设置里用）"""
+    """检测一个目录是不是 MAA / MAAEND 根目录（首次引导 / 设置里用）
+
+    kind=endfield 时按 MAAEND 的主程序名去找：终末地那套是另一个程序，
+    主程序可能叫 MaaEnd.exe 或 mxu.exe（三月七脚本里两种都出现过）。这一步
+    只是把路径先管起来，MAAEND 的任务链还没接。
+    """
     d = (q.get('dir') or '').strip()
     if not d:
         raise ValueError('缺少目录参数')
-    exe = os.path.join(d, 'MAA.exe')
+    kind = (q.get('kind') or 'arknights').strip().lower()
+    names = (['MaaEnd.exe', 'MAAEND.exe', 'mxu.exe', 'MAA.exe']
+             if kind == 'endfield' else ['MAA.exe'])
+    exe_name = next((n for n in names if os.path.isfile(os.path.join(d, n))), '')
+    exe = os.path.join(d, exe_name or names[0])
     cfg_path = os.path.join(d, 'config', 'gui.new.json')
     profiles = []
     if os.path.isfile(cfg_path):
@@ -457,7 +477,8 @@ def api_maa_probe(q, _body):
     ob = operbox.probe(d)
     return {
         'dir': d,
-        'exeExists': os.path.isfile(exe),
+        'exeExists': bool(exe_name),
+        'exeName': exe_name,
         'configExists': os.path.isfile(cfg_path),
         'profiles': profiles,
         'operbox': ob['exists'],
@@ -847,6 +868,22 @@ def api_export(_q, body):
     return {'path': path, 'count': len(data)}
 
 
+def api_schedule_status(q, _body):
+    return scheduler.status(q.get('since') or 0)
+
+
+def api_schedule_save(_q, body):
+    return scheduler.save(body or {})
+
+
+def api_schedule_run(_q, body):
+    return scheduler.run_now((body or {}).get('id') or '')
+
+
+def api_schedule_stop(_q, _body):
+    return scheduler.stop_current()
+
+
 ROUTES = {
     '/api/bootstrap': bootstrap,
     '/api/settings': api_settings,
@@ -917,6 +954,11 @@ ROUTES = {
     '/api/maa/capabilities': api_maa_capabilities,
     '/api/maa/profile': api_maa_profile,
     '/api/maa/build': api_maa_build,
+    # 定时任务（时间触发 / 链式启动）
+    '/api/schedule/status': api_schedule_status,
+    '/api/schedule/save': api_schedule_save,
+    '/api/schedule/run': api_schedule_run,
+    '/api/schedule/stop': api_schedule_stop,
     # 内置助手（M4）
     '/api/agent/status': api_agent_status,
     '/api/agent/config': api_agent_config,
