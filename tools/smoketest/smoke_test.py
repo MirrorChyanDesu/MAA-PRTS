@@ -636,6 +636,110 @@ def check_maa_import_level_only():
     assert 'skill_level' not in detail[0]['req'], detail[0]['req']
 
 
+def check_copilot_substitution():
+    """干员替换（#92）：塞1 由 黍1 顶替——匹配判可用 + 写 MAA 重写 + 边界不触发
+
+    规则表见 copilot.SUB_RULES（force 档：账号有黍且按塞雷娅条目的要求判
+    「等价练度」即换，塞雷娅自己有没有、达不达标都不看）。匹配侧与写入侧
+    必须同一个判定（sub_rule_for），两边口径不能漂。
+    """
+    from core import copilot
+
+    def own(name, elite=2, level=60, main=7, mastery=(3, 0, 0), skill_known=True):
+        c = {'charId': 'x', 'name': name, 'rarity': 6, 'elite': elite,
+             'level': level, 'skillLevel': main, 'favor': 0, 'skin': None,
+             'skills': ([{'id': 's%d' % (i + 1), 'name': '', 'mastery': m}
+                         for i, m in enumerate(mastery)]
+                        if skill_known else []),
+             'modules': []}
+        return copilot.build_owned({'chars': [c]})
+
+    saria1 = {'name': '塞雷娅', 'skill': 1,
+              'requirements': {'elite': 2, 'level': 60, 'skill_level': 7}}
+    content = {
+        'stage_name': 'act55side_s01',
+        'opers': [dict(saria1)],
+        'groups': [{'name': '奶', 'opers': [dict(saria1)]}],
+        # 两条动作都按名字点名塞雷娅：替换后名字要跟着改（无坐标的动作
+        # MaaCore 拿名字去场上找人，不改就指空）
+        'actions': [{'type': 'UseSkill', 'name': '塞雷娅'},
+                    {'type': 'Deploy', 'name': '塞雷娅', 'location': [4, 4],
+                     'direction': 'Right'}],
+    }
+    shu = own('黍')
+
+    # ① 没有 黍：塞雷娅 缺卡，顶层 + 组各计一个 missing → blocked
+    m, miss, tr, _t, detail, _s, _w = copilot.match_operation(content, {})
+    assert m == 'blocked' and len(miss) == 2, (m, miss)
+    assert all(d.get('sub') is None for d in detail)
+
+    # ② 有等价练度的 黍：整份作业判 ready（缺卡/练度不足都不再计），detail
+    #    带替换标记给前端在详情里标注「由黍1替换塞1」
+    m, miss, tr, _t, detail, _s, _w = copilot.match_operation(content, shu)
+    assert m == 'ready' and not miss and not tr, (m, miss, tr)
+    assert detail[0]['sub'] == {'name': '黍', 'skill': 1}, detail[0]['sub']
+    assert detail[0]['ok'] is True and detail[0]['owned'] is False
+    assert detail[1]['group'] is True and detail[1]['ok'] is True
+
+    # ③ 写入侧重写：顶层与干员组里的塞雷娅都换成黍，requirements 原样保留，
+    #    原始 content 不被改动（预取缓存跨账号共用，不能就地污染）
+    out, notes = copilot.apply_substitutions(content, shu)
+    assert out is not content and content['opers'][0]['name'] == '塞雷娅', \
+        '原始 content 不能被就地改掉'
+    assert out['opers'][0]['name'] == '黍' and out['opers'][0]['skill'] == 1
+    assert out['opers'][0]['requirements'] == saria1['requirements']
+    assert out['groups'][0]['opers'][0]['name'] == '黍'
+    assert all(a['name'] == '黍' for a in out['actions']), out['actions']
+    assert content['actions'][0]['name'] == '塞雷娅'   # 原始 content 未被改动
+    assert notes and '黍' in notes[0], notes
+    _assert_maa_parsable(out)
+    # 没命中时不拷贝直接原样返回
+    out2, notes2 = copilot.apply_substitutions(content, {})
+    assert out2 is content and not notes2
+
+    # ④ 边界：不换的几种情况
+    #    黍练度不到（精一 60 ≠ 精二 60）
+    weak = own('黍', elite=1, level=60)
+    assert copilot.sub_rule_for(saria1, weak) is None
+    #    专三要求但 黍1 没专精
+    m3 = {'name': '塞雷娅', 'skill': 1,
+          'requirements': {'skill_level': 9}}
+    assert copilot.sub_rule_for(m3, own('黍', mastery=(0, 0, 0))) is None
+    assert copilot.sub_rule_for(m3, shu) is not None, '黍1 专三该顶专三要求'
+    #    技能号不是 1 不换（MaaCore 里 skill 缺省 0 = 不指定，也不算塞1）
+    for sk in (0, 2, 3):
+        assert copilot.sub_rule_for({'name': '塞雷娅', 'skill': sk}, shu) is None, sk
+    #    黍已被作者写进阵容：再换会出现同名重复条目，不换
+    both = {'stage_name': 'x', 'actions': [],
+            'opers': [dict(saria1), {'name': '黍', 'skill': 1}]}
+    assert copilot.sub_rule_for(saria1, shu,
+                                siblings=['塞雷娅', '黍']) is None
+    m, miss, *_ = copilot.match_operation(both, shu)
+    assert len(miss) == 1 and miss[0] == '塞雷娅', (m, miss)
+    outb, notesb = copilot.apply_substitutions(both, shu)
+    assert not notesb and outb is both
+    #    干员组内已有黍：组内成员不换（顶层无塞雷娅，整份不动）
+    gonly = {'stage_name': 'x', 'actions': [], 'opers': [],
+             'groups': [{'name': '奶', 'opers': [dict(saria1),
+                                                 {'name': '黍', 'skill': 1}]}]}
+    outg, notesg = copilot.apply_substitutions(gonly, shu)
+    assert not notesg and outg is gonly
+
+    # ⑤ force 档：塞雷娅 自己有且达标也照样换（黍是上位替代）
+    bothok = {**shu, **own('塞雷娅')}
+    r = copilot.sub_rule_for(saria1, bothok)
+    assert r is not None and r['kind'] == 'force'
+    dop = copilot.detail_opers({'opers': [dict(saria1)]}, bothok)
+    assert dop[0]['owned'] is True and dop[0]['ok'] is True
+    assert dop[0]['sub'] == {'name': '黍', 'skill': 1}
+
+    # ⑥ MAA 识别导入的账号（无技能数据）：只比精英化/等级，替换同样成立
+    maa_shu = own('黍', skill_known=False)
+    assert copilot.sub_rule_for({'name': '塞雷娅', 'skill': 1}, maa_shu) is not None
+    # 没带账号上下文的详情不判替换（前端不标）
+    assert copilot.detail_opers({'opers': [dict(saria1)]})[0]['sub'] is None
+
+
 def _assert_maa_parsable(content):
     """按 MaaCore CopilotConfig::parse 的致命校验复检，非法就抛 AssertionError
 
@@ -3375,9 +3479,25 @@ def check_settings_panel(tmp):
     m = api.api_account_maa({}, {'file': 'smoke-acc.json',
                                  'patch': {'accountName': '181 5505'}})['maa']
     assert m['accountName'] == '181****5505', m
+    assert m['accountNameFrom'] == 'manual', '没写来源的按手填存'
+    # 前 3 位 + 后 4 位（2026-11-22 用户要求）：157 3635 / 157****3635 都归一
+    for raw in ('157 3635', '1573635', '157****3635'):
+        m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                     'patch': {'accountName': raw}})['maa']
+        assert m['accountName'] == '157****3635', (raw, m)
     m = api.api_account_maa({}, {'file': 'smoke-acc.json',
                                  'patch': {'accountName': ''}})['maa']
     assert m['accountName'] == '', '清空切号名是合法操作，不能拦'
+    # 配置文件：只记名字（不校验存在性——MAA 没装也能先存），来源跟着改
+    m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'profile': ' moren ',
+                                           'accountName': '1573635',
+                                           'accountNameFrom': 'profile'}})['maa']
+    assert m['profile'] == 'moren' and m['accountNameFrom'] == 'profile', m
+    # 来源字段只认两个值，乱传一律清空（别把脏值写进账号文件）
+    m = api.api_account_maa({}, {'file': 'smoke-acc.json',
+                                 'patch': {'accountNameFrom': 'whatever'}})['maa']
+    assert m['accountNameFrom'] == '', m
     try:
         api.api_account_maa({}, {'file': 'smoke-acc.json',
                                  'patch': {'accountName': '冒烟'}})
@@ -3600,15 +3720,14 @@ def check_oper_train(tmp):
     assert (maaplan._subtask_label('Copilot@BattleQuickFormationRole-Caster')
             == '编队·按职业筛选')
 
-    # 8) 切号名唯一来源 = 账号绑定的 maa.accountName；**绝不读用户的 MAA
-    #    配置档案**（2026-11-18 用户口径：agent 模式跑临时配置=StartUp 任务
-    #    参数，不碰用户的 gui.new.json）。以前这里会退回读 MAA 当前档案的
-    #    AccountName / 纯数字档案名来猜——档案和账号对不上号，猜错切号名
-    #    MAA 会在账号列表里死找 4 分钟。昵称也绝不能顶——官服切号认手机号。
+    # 8) 切号名来源（2026-11-22 改）：没绑配置文件时**完全不碰**用户的 MAA
+    #    配置；绑了配置文件（用户点名的那份）才读它 StartUp 的 AccountName。
+    #    手填过的值（accountNameFrom=manual）优先，档案里的旧号码不许盖回去。
+    #    全程只读——`_save_cfg` 必须一次都没被调用。
     from core import maa as maa_mod
 
     def _forbidden(*a, **k):
-        raise AssertionError('不许读用户的 MAA 配置档案')
+        raise AssertionError('没绑配置文件时不许读用户的 MAA 配置')
 
     orig_load = maa_mod._load_cfg
     maa_mod._load_cfg = _forbidden
@@ -3620,7 +3739,35 @@ def check_oper_train(tmp):
             '账号绑定的切号名要能读到'
     finally:
         maa_mod._load_cfg = orig_load
-        accounts.save_maa_meta('smoke-acc.json', {'accountName': ''})
+
+    fake_cfg = {'Current': 'moren',
+                'Configurations': {'moren': {'TaskQueue': [
+                    {'TaskType': 'StartUp', 'AccountName': '157****3635',
+                     'AccountSwitchEnabled': True}]}}}
+
+    def _no_write(*a, **k):
+        raise AssertionError('读配置档案时不许写回用户的 gui.new.json')
+
+    orig_save = maa_mod._save_cfg
+    maa_mod._load_cfg = lambda *a, **k: fake_cfg
+    maa_mod._save_cfg = _no_write
+    try:
+        accounts.save_maa_meta('smoke-acc.json', {'profile': 'moren',
+                                                  'accountName': '5505',
+                                                  'accountNameFrom': 'profile'})
+        assert skills._account_name_tail('smoke-acc.json') == '157****3635', \
+            '选了配置文件就要按档案里的 AccountName 来'
+        # 用户在设置里手改过 → 以他填的为准
+        accounts.save_maa_meta('smoke-acc.json', {'accountName': '5505',
+                                                  'accountNameFrom': 'manual'})
+        assert skills._account_name_tail('smoke-acc.json') == '5505', \
+            '手填的切号名不能被档案里的旧号码盖回去'
+    finally:
+        maa_mod._load_cfg = orig_load
+        maa_mod._save_cfg = orig_save
+        accounts.save_maa_meta('smoke-acc.json',
+                               {'profile': '', 'accountName': '',
+                                'accountNameFrom': ''})
 
     # 9) Engine.wait 的启动宽限：AsstStart 异步生效，刚 start 完 AsstRunning
     #    还是 False——以前这里直接 return，把「还没开始跑」当「跑完」，
@@ -4562,7 +4709,7 @@ def check_garrison(tmp):
 
     _write_maa('MuMuEmulator12', '127.0.0.1:16416', r'C:\MuMu\adb.exe')
     o, src = garrison.defaults('g-acc.json')
-    assert o == {'device': 'mumu', 'mode': 'quick', 'speed': 1.5, 'medalWins': 3,
+    assert o == {'device': 'mumu', 'mode': 'quick', 'goal': 'medal', 'speed': 1.5, 'medalWins': 3,
                  'adbAddress': '127.0.0.1:16416', 'adbPath': r'C:\MuMu\adb.exe',
                  'screenshotMethod': 'fast', 'pcUiScale': 90}, o
     assert src['kind'] == 'MuMuEmulator12' and src['profile'] == 'P1', src
@@ -4582,10 +4729,16 @@ def check_garrison(tmp):
     bad = garrison.sanitize({'device': 'hack', 'mode': 'zzz', 'medalWins': '6',
                              'speed': '99', 'screenshotMethod': 'x',
                              'adbAddress': '  ', 'pcUiScale': '120'})
-    assert bad == {'device': 'mumu', 'mode': 'quick', 'medalWins': 6,
+    assert bad == {'device': 'mumu', 'mode': 'quick', 'goal': 'medal',
+                   'medalWins': 6,
                    'speed': 5.0, 'adbAddress': '127.0.0.1:16384',
                    'adbPath': '', 'screenshotMethod': 'auto',
                    'pcUiScale': 90}, bad
+    # goal 白名单：非法值回 medal，合法叠层目标透传
+    ok_goal = garrison.sanitize({'goal': 'task-3', 'device': 'mumu'})
+    assert ok_goal['goal'] == 'task-3', ok_goal
+    bad_goal = garrison.sanitize({'goal': 'hack'})
+    assert bad_goal['goal'] == 'medal', bad_goal
 
     # 5) 空环境 status：缺核心 → ready=False + needsDownload + 下载状态机初值；
     #    路由也挂上了
@@ -4615,7 +4768,7 @@ def check_garrison(tmp):
     assert cands and cands[-1]['version'] == garrisondl.FALLBACK['version'], cands
     assert garrisondl.FALLBACK['sha256'] and garrisondl.FALLBACK['bytes'] > 0
     try:
-        garrisondl._download('https://static.max-c.com/heybox/desktop/nonexistent.hbext',
+        garrisondl._download('http://127.0.0.1:1/nonexistent.hbext',
                              os.path.join(tmp, 'x.hbext'), attempts=1, timeout=10)
         raise AssertionError('坏 URL 居然下载成功了')
     except RuntimeError as e:
@@ -4661,8 +4814,15 @@ def check_garrison(tmp):
         d = os.path.join(pkg, 'medal-farm-v%s' % v, 'core')
         os.makedirs(d, exist_ok=True)
         open(os.path.join(d, 'service.mjs'), 'w').close()
-    snap = garrisondl.start()
-    assert snap['stage'] == 'done', snap
+    _real_cands8 = garrisondl.candidates
+    garrisondl.candidates = lambda: [
+        {'version': '1.1.4', 'url': 'x', 'sha256': None, 'bytes': None,
+         'files': None, 'source': 'test'}]
+    try:
+        snap = garrisondl.start()
+        assert snap['stage'] == 'done', snap
+    finally:
+        garrisondl.candidates = _real_cands8
     # 版本号不能写死：下载器按小黑盒记录装的是上游最新版（v1.1.5），探测必须
     # 扫 medal-farm-v* 取最高版本——旧版只认 v1.1.4，装好新版却报「没核心」，
     # 前端于「已下载 + 仍要下载」之间无限重试，一直停在「核心就绪，正在启动…」
@@ -4709,8 +4869,299 @@ def check_garrison(tmp):
     with open(svc, encoding='utf-8') as f:
         assert f.read() == 'untouched core', '脱靶时一个字节都不能动'
 
+    # 9) 速刷选项按账号持久化：save_opts 只存差异键、defaults 生效 overlay、
+    #    改回默认自动剔除——用户「调了 2.5×/6 胜重启全回默认」的病根
+    assert '/api/garrison/opts' in api.ROUTES
+    _write_maa('MuMuEmulator12', '127.0.0.1:16416')
+    r = garrison.save_opts('g-acc.json', {'mode': 'standard', 'speed': 2.5,
+                                          'medalWins': 6})
+    assert set(r['saved']) == {'mode', 'speed', 'medalWins'}, r['saved']
+    with open(acc, encoding='utf-8') as f:
+        snap = json.load(f)
+    assert snap['garrisonOpts'] == r['saved'], snap.get('garrisonOpts')
+    # 重启语义：重新读账号（defaults）就能拿回用户改动，未改的键跟随 MAA
+    d2, _src = garrison.defaults('g-acc.json')
+    assert d2['mode'] == 'standard' and d2['speed'] == 2.5 and d2['medalWins'] == 6, d2
+    assert d2['device'] == 'mumu' and d2['screenshotMethod'] == 'fast'
+    assert d2['adbAddress'] == '127.0.0.1:16416', d2
+    # 改回默认值的键自动剔除
+    r = garrison.save_opts('g-acc.json', {'mode': 'quick', 'speed': 2.5, 'medalWins': 6})
+    assert set(r['saved']) == {'speed', 'medalWins'}, r['saved']
+    assert '/api/garrison/opts' in api.ROUTES
+
+    # 10) 保持最新：_pick_candidate 选「适配表内且比已装新」的目标——
+    #     记录只有表外新版（1.1.6）时回退表内最新（1.1.5）；start 短路/升级
+    #     路径；表外版本零字节下载（monkeypatch candidates 做全链隔离）
+    real_cands = garrisondl.candidates
+    real_records = garrisondl.record_candidates
+    try:
+        # 隔离重置：前面各节可能留下了 _DL 状态/_RUNNING 标志
+        with garrisondl._LOCK:
+            garrisondl._RUNNING[0] = False
+            garrisondl._DL.update(stage='idle', done=0, total=0, files=0,
+                                  filesTotal=0, source='', version='', error='',
+                                  startedAt=None, endedAt=None)
+        adapted = garrisondl._adapted_versions()
+        assert adapted and '1.1.4' in adapted and '1.1.5' in adapted
+        assert '1.1.7' in adapted, adapted
+        assert garrisondl._is_adapted('1.1.5') and not garrisondl._is_adapted('1.1.6')
+
+        # 已最新（候选=已装）→ start() 短路 done，不起线程
+        old_svc = os.path.join(garrisondl.garrison_dir(), 'medal-farm-v1.1.4', 'core')
+        os.makedirs(old_svc)
+        open(os.path.join(old_svc, 'service.mjs'), 'w').close()
+        garrisondl.candidates = lambda: [
+            {'version': '1.1.4', 'url': 'x', 'sha256': None, 'bytes': None,
+             'files': None, 'source': '小黑盒扩展记录'}]
+        snap = garrisondl.start()
+        assert snap['stage'] == 'done', snap
+
+        # 有可升目标（1.1.5，URL 不可达）→ 升级链走完报错；不落盘、旧版保留
+        garrisondl.candidates = lambda: [
+            {'version': '1.1.5',
+             'url': 'http://127.0.0.1:1/nonexistent-1.1.5.hbext',
+             'sha256': None, 'bytes': None, 'files': None, 'source': '小黑盒扩展记录'}]
+        snap = garrisondl.start()
+        assert snap['stage'] != 'done', snap
+        for _ in range(150):   # 3 次重试 ×(1.5+3)s 退避，留足余量
+            if garrisondl.state()['stage'] == 'error':
+                break
+            time.sleep(0.3)
+        st = garrisondl.state()
+        assert st['stage'] == 'error' and '1.1.5' in (st['error'] or ''), st
+        assert not os.path.exists(os.path.join(garrisondl.garrison_dir(),
+                                               'medal-farm-v1.1.5')), '失败版本不能落盘'
+        assert os.path.isfile(os.path.join(old_svc, 'service.mjs')), '旧版必须原样保留'
+
+        # _pick_candidate（真实直链链）：记录只有表外 1.1.6 → 选表内最新 1.1.5
+        garrisondl.candidates = real_cands
+        garrisondl.record_candidates = lambda: [
+            {'version': '1.1.6', 'url': 'x', 'sha256': None, 'bytes': None,
+             'files': None, 'source': '小黑盒扩展记录'}]
+        assert garrisondl._pick_candidate('1.1.4')['version'] == '1.1.7', '表外新版应回退表内最新'
+        assert garrisondl._pick_candidate('')['version'] == '1.1.7'
+        assert garrisondl._pick_candidate('1.1.7') is None
+        # check_update：候选只剩表外新版（连直链一起屏蔽）→ 不起线程零流量；
+        # （真实链路里记录 1.1.6 + 已装 1.1.4 会经直链升 1.1.5——上面
+        #   _pick_candidate 断言已覆盖该选版，这里不再真下载）
+        garrisondl.candidates = lambda: [
+            {'version': '1.1.6', 'url': 'x', 'sha256': None, 'bytes': None,
+             'files': None, 'source': '小黑盒扩展记录'}]
+        with garrisondl._LOCK:
+            garrisondl._DL['stage'] = 'done'
+        garrisondl.check_update()
+        time.sleep(1.5)
+        assert not garrisondl._RUNNING[0], '表外版本不应起下载线程'
+
+        # 全新安装且候选只剩表外版本（连直链一起屏蔽）：零字节下载直接报无源
+        shutil.rmtree(garrisondl.garrison_dir(), ignore_errors=True)
+        with garrisondl._LOCK:
+            garrisondl._DL.update(stage='idle', done=0, total=0)
+        garrisondl.candidates = lambda: [
+            {'version': '1.1.6', 'url': 'x', 'sha256': None, 'bytes': None,
+             'files': None, 'source': '小黑盒扩展记录'}]
+        garrisondl.start()
+        for _ in range(20):
+            if garrisondl.state()['stage'] == 'error':
+                break
+            time.sleep(0.3)
+        st = garrisondl.state()
+        assert st['stage'] == 'error' and '1.1.6' not in (st['error'] or ''), st
+        assert st['error'].startswith('所有下载源都失败了'), st['error'][:30]
+        assert st['done'] == 0, '表外版本一个字节都不该下载'
+    finally:
+        garrisondl.candidates = real_cands
+        garrisondl.record_candidates = real_records
+        shutil.rmtree(garrisondl.garrison_dir(), ignore_errors=True)
+
+
+def check_scheduler(tmp):
+    """定时任务（设置 → 定时任务）：清洗 / 下次运行 / 链式串接 / 参数解析
+
+    只测纯逻辑，不起线程、不真跑程序：冒烟进程里挂一个常驻调度线程会在
+    后面的用例中间随机拉起进程，难查。真正执行由用户在界面上验。
+    """
+    import datetime
+    from core import scheduler
+
+    _reset_config(tmp)
+    scheduler._cache = None
+    scheduler._fired.clear()
+
+    # 1) 保存清洗：时间补零、星期去重排序、坏值回落、未知字段丢掉
+    cfg = scheduler.save({'conflict': 'skip', 'onChainFail': 'stop', 'tasks': [
+        {'name': ' 早上 ', 'mode': 'time', 'time': '8:5',
+         'weekdays': [7, 3, 3, 9, 'x', True, 1], 'program': 'C:/x/a.exe',
+         'args': '  --a 1  ', 'timeout': -5, 'notify': 1, 'evil': 'x'},
+        {'name': '', 'mode': 'weird'},
+        {'name': '链', 'mode': 'chain', 'program': 'b.exe'},
+    ]})
+    assert cfg['conflict'] == 'skip' and cfg['onChainFail'] == 'stop'
+    t0, t1, t2 = cfg['tasks']
+    assert t0['time'] == '08:05', t0['time']
+    assert t0['weekdays'] == [1, 3, 7], t0['weekdays']
+    assert t0['args'] == '--a 1' and t0['timeout'] == 0 and t0['notify'] is True
+    assert 'evil' not in t0
+    assert t1['name'] == '未命名任务' and t1['mode'] == 'time'
+    assert t2['mode'] == 'chain' and t2['enabled'] is True
+    assert len({t['id'] for t in cfg['tasks']}) == 3
+
+    # 2) 落盘读回（清缓存＝模拟重启）
+    scheduler._cache = None
+    again = scheduler.load()
+    assert [t['name'] for t in again['tasks']] == ['早上', '未命名任务', '链']
+    assert os.path.isfile(scheduler._path())
+
+    # 3) 时间点只认当前分钟，不回看上一分钟（关着的时候错过的点不补跑）
+    mon = datetime.datetime(2026, 11, 23, 8, 5, 20)      # 周一
+    assert scheduler._due_slot(t0, mon.timestamp()) == '2026-11-23 08:05'
+    assert scheduler._due_slot(t0, mon.replace(minute=6).timestamp()) == ''
+    tue = mon.replace(day=24)                            # 周二不在 [1,3,7]
+    assert scheduler._due_slot(t0, tue.timestamp()) == ''
+    assert scheduler.next_run_ts(t0, mon.replace(minute=4).timestamp()) == \
+        int(mon.replace(second=0, microsecond=0).timestamp())
+    nxt = scheduler.next_run_ts(t0, mon.replace(minute=6).timestamp())
+    assert datetime.datetime.fromtimestamp(nxt).strftime('%Y-%m-%d %H:%M') == \
+        '2026-11-25 08:05', datetime.datetime.fromtimestamp(nxt)
+
+    # 4) 链式串接：中间夹一条 time 任务就断链
+    assert scheduler._chain_after(t0, cfg['tasks']) == []
+
+    cfg2 = scheduler.save({'tasks': [
+        {'name': 'A', 'mode': 'time', 'time': '07:00', 'program': 'a.exe'},
+        {'name': 'B', 'mode': 'chain', 'program': 'b.exe'},
+        {'name': 'C', 'mode': 'chain', 'program': 'c.exe', 'enabled': False},
+        {'name': 'D', 'mode': 'chain', 'program': 'd.exe'},
+        {'name': 'E', 'mode': 'time', 'time': '09:00', 'program': 'e.exe'},
+    ]})
+    names = [t['name'] for t in scheduler._chain_after(cfg2['tasks'][0], cfg2['tasks'])]
+    assert names == ['B', 'D'], names       # 停用的 C 跳过，D 还在链上
+
+    # 5) 参数解析：引号里的空格不能拆开
+    assert scheduler._split_args('--a "b c"') == ['--a', 'b c']
+    assert scheduler._split_args('') == []
+
+    # 6) 程序存在性 / 批处理走 cmd
+    try:
+        scheduler._argv({'program': '', 'args': ''})
+        assert False, '没填程序不该通过'
+    except ValueError:
+        pass
+    bat = os.path.join(tmp, 'demo.bat')
+    with open(bat, 'w', encoding='utf-8') as f:
+        f.write('@echo off\n')
+    argv = scheduler._argv({'program': bat, 'args': '--x 1'})
+    assert argv[1:3] == ['/d', '/c'], argv
+    assert argv[3].endswith('demo.bat --x 1'), argv
+
+    # 7) status 形状：界面依赖 nextRun / running / log
+    st = scheduler.status()
+    assert st['ok'] and st['running'] is None
+    assert st['conflict'] in scheduler.CONFLICTS
+    assert all('nextRun' in t and 'index' in t for t in st['tasks'])
+    assert isinstance(st['log'], list) and isinstance(st['seq'], int)
+
 
 # ---------------------------------------------------------------- 入口
+
+
+def check_account_bind(tmp):
+    """B50：切号名绑定（配置文件优先 / 手填优先 / 助手存尾号）
+
+    2026-11-22 用户要求三件事，这里各钉一条：
+
+    ① 账号绑了 MAA 配置文件，切号名就从那份档案读（**只读**，不写回）；
+    ② 用户手改过的值（`accountNameFrom=manual`）优先，档案里的旧号码不许盖；
+    ③ 助手新增 `set_account_name`：用户报尾号（后 4 位或前 3 + 后 4）就存进
+       对应账号的设置，多账号时先问是哪个号。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import accounts, acctbind, acctname, agent, multiacct
+
+    _reset_config(tmp)
+    cfg = os.path.join(tmp, 'config')
+
+    def dump(name, obj):
+        with open(os.path.join(cfg, name), 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False)
+
+    dump('大号.json', {'account': {'uid': '1', 'nickName': '大号',
+                                   'channelName': '官服', 'game': 'arknights'}})
+    dump('小号.json', {'account': {'uid': '2', 'nickName': '小号',
+                                   'channelName': '官服', 'game': 'arknights'}})
+
+    # 1) 尾号归一：后 4 位 / 前 3 + 后 4 / 掩码都收
+    for raw, want in (('5505', '5505'), ('1573635', '157****3635'),
+                      ('157 3635', '157****3635'), ('157****3635', '157****3635')):
+        assert acctname.check(raw, '官服')[0] == want, (raw, want)
+
+    # 2) 助手存尾号：只填一个账号时不用再问是哪个号
+    out = agent.run_tool('set_account_name', {'account': '大号',
+                                              'accountName': '157 3635'})
+    assert out.get('ok') and out['accountName'] == '157****3635', out
+    maa = accounts.get_account('大号.json')['maa']
+    assert maa['accountName'] == '157****3635', maa
+    assert maa['accountNameFrom'] == 'manual', '手填必须打 manual 标记'
+    # 官服填昵称要拦（拿昵称切号 = MAA 死找 4 分钟）
+    bad = agent.run_tool('set_account_name', {'account': '大号',
+                                             'accountName': '大号'})
+    assert bad.get('error'), bad
+    # 多个账号又没指定 → 让模型先问用户
+    ask = agent.run_tool('set_account_name', {'accountName': '5505'})
+    assert ask.get('need_info') == 'account' and len(ask['accounts']) == 2, ask
+
+    # 3) 配置文件优先：造一份 MAA 配置，账号绑上它，切号名跟着档案走
+    md = os.path.join(tmp, 'fakemaa')
+    os.makedirs(os.path.join(md, 'config'), exist_ok=True)
+    with open(os.path.join(md, 'config', 'gui.new.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({'Current': 'moren', 'Configurations': {
+            'moren': {'TaskQueue': [
+                {'$type': 'StartUpTask', 'TaskType': 'StartUp',
+                 'AccountName': '181****5505', 'AccountSwitchEnabled': True}]},
+            '136': {'TaskQueue': [
+                {'$type': 'StartUpTask', 'TaskType': 'StartUp',
+                 'AccountName': '136'}]},
+        }}, f, ensure_ascii=False)
+    accounts.save_maa_meta('大号.json', {'dir': md, 'profile': 'moren',
+                                         'accountName': '',
+                                         'accountNameFrom': 'profile'})
+    nm, src = acctbind.resolve('大号.json')
+    assert (nm, src) == ('181****5505', 'profile'), (nm, src)
+    # 助手看到的账号列表也要是生效值，否则模型还会再问一遍
+    lc = agent._tool_list_accounts({})
+    row = next(a for a in lc['accounts'] if a['file'] == '大号.json')
+    assert row['accountName'] == '181****5505' and row['maaProfile'] == 'moren', row
+    cand = next(c for c in multiacct.candidates() if c['file'] == '大号.json')
+    assert cand['accountName'] == '181****5505', cand
+
+    # 4) 手填优先：档案里是 181****5505，用户写 5505 就按 5505 跑
+    accounts.save_maa_meta('大号.json', {'accountName': '5505',
+                                         'accountNameFrom': 'manual'})
+    assert acctbind.resolve('大号.json')[0] == '5505'
+    # 档案被删 / 换了目录读不到：回落手填值，不抛
+    accounts.save_maa_meta('大号.json', {'dir': os.path.join(tmp, 'nope'),
+                                         'accountName': '5505',
+                                         'accountNameFrom': 'profile'})
+    assert acctbind.resolve('大号.json')[0] == '5505', '读不到档案要回落手填值'
+
+    # 5) 读档案绝不能写回用户的 gui.new.json
+    from core import maa as maa_mod
+
+    def _no_write(*a, **k):
+        raise AssertionError('解析切号名时不许写 MAA 配置')
+
+    orig_save = maa_mod._save_cfg
+    maa_mod._save_cfg = _no_write
+    try:
+        accounts.save_maa_meta('大号.json', {'dir': md, 'profile': '136',
+                                             'accountName': '',
+                                             'accountNameFrom': 'profile'})
+        assert acctbind.resolve('大号.json')[0] == '136'
+    finally:
+        maa_mod._save_cfg = orig_save
+        accounts.save_maa_meta('大号.json', {'profile': '', 'accountName': '',
+                                             'accountNameFrom': ''})
 
 
 def main():
@@ -4776,6 +5227,9 @@ def main():
         r.check('B45 资源包缺分区（EX/S 推断/默认不补前置/突袭不降级）', lambda: check_stage_infer(tmp))
         r.check('B46 牛杂小工具（小游戏/活动商店/黑名单位置/卡教程提示）', lambda: check_maa_tool(tmp))
         r.check('B47 卫戍协议（核心检测/版本目录扫描/状态兜底/MAA 连接默认值/选项清洗/核心补丁）', lambda: check_garrison(tmp))
+        r.check('B48 干员替换（塞1←黍1：匹配/写入/干员组/不触发边界）', check_copilot_substitution)
+        r.check('B49 定时任务（清洗/下次运行/链式串接/参数解析）', lambda: check_scheduler(tmp))
+        r.check('B50 切号名绑定（配置文件优先/手填优先/助手存尾号）', lambda: check_account_bind(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

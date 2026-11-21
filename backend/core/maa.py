@@ -286,10 +286,16 @@ def _safe(name):
     return SAFE.sub('_', name).strip() or 'stage'
 
 
-def apply_plan(items, profile=None, mode='replace', auto_start=True, tid=None, maa_dir=None):
-    """items: [{copilotId, stageCode, title}] → 写入 MAA 多作业列表"""
+def apply_plan(items, profile=None, mode='replace', auto_start=True, tid=None, maa_dir=None,
+               account=None):
+    """items: [{copilotId, stageCode, title}] → 写入 MAA 多作业列表
+
+    account 是账号文件名：给了就按该账号练度做干员替换（#92，见
+    copilot.SUB_RULES），落盘的作业里塞雷娅这类条目会被练度等价的替补顶掉。
+    """
     log = tasks.log_factory(tid) if tid else (lambda *_: None)
     d = _dir(maa_dir)
+    owned = copilot.owned_of(account)
 
     log('MAA 目录：%s' % d)
     # 先校验配置可读、档案存在，再关进程：目录配错 / gui.new.json 损坏时
@@ -371,6 +377,10 @@ def apply_plan(items, profile=None, mode='replace', auto_start=True, tid=None, m
             log('[%d/%d] 复用已就绪的作业 #%s %s' % (idx, len(items), cid, it.get('title') or ''))
         else:
             content, flags, sname = fetched[cid]
+            if owned:
+                content, sub_notes = copilot.apply_substitutions(content, owned)
+                for n in sub_notes:
+                    log('    替换：%s' % n)
             fname = '%s_%s.json' % (_safe(stage_code), cid)
             os.makedirs(_copilot_dir(d), exist_ok=True)
             fpath = os.path.join(_copilot_dir(d), fname)
@@ -424,13 +434,14 @@ def apply_plan(items, profile=None, mode='replace', auto_start=True, tid=None, m
             'added': len(new_entries), 'files': files, 'started': started}
 
 
-def start_apply(items, profile=None, mode='replace', auto_start=True, maa_dir=None):
+def start_apply(items, profile=None, mode='replace', auto_start=True, maa_dir=None, account=None):
     title = '写入 MAA（%d 份作业）' % len(items or [])
     holder = {}
 
     def go():
         try:
-            res = apply_plan(items, profile, mode, auto_start, holder['tid'], maa_dir=maa_dir)
+            res = apply_plan(items, profile, mode, auto_start, holder['tid'],
+                             maa_dir=maa_dir, account=account)
             tasks.finish(holder['tid'], result=res)
         except Exception as e:
             import traceback
@@ -507,6 +518,28 @@ def profiles(maa_dir=None):
             'copilot': len(((c.get('Copilot') or {}).get('TaskList')) or []),
         })
     return {'current': cfg.get('Current') or '', 'profiles': out}
+
+
+def profile_account_name(profile, maa_dir=None):
+    """读某个配置档案「开始唤醒」里的 AccountName（只读，不改用户配置）
+
+    设置 → MAA 路径里选了「配置文件」之后，切号名就优先按这里的值来：
+    用户自己的档案（moren / 136 / 157…）本来就在 MAA 里配好了账号切换，
+    再让他手抄一遍纯属重复劳动。**只读**——写回用户的档案是另一条路
+    （``set_tasklist`` / ``apply_plan``），这里一个字段都不许动。
+
+    读不到（MAA 没装、档案被删、配置坏）就返回空串，调用方回落手填值。
+    """
+    name = str(profile or '').strip()
+    if not name:
+        return ''
+    cfg = _load_cfg(maa_dir)
+    conf = (cfg.get('Configurations') or {}).get(name)
+    if not isinstance(conf, dict):
+        return ''
+    su = next((t for t in (conf.get('TaskQueue') or [])
+               if isinstance(t, dict) and t.get('TaskType') == 'StartUp'), None)
+    return str(((su or {}).get('AccountName') or '')).strip()
 
 
 def tasklist(profile=None, maa_dir=None):

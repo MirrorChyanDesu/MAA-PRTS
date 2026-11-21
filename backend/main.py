@@ -295,6 +295,24 @@ class Bridge:
         except Exception as e:
             return {'path': None, 'error': str(e)}
 
+    def choose_file(self, title='选择程序', initial=''):
+        """选一个文件（定时任务里挑要启动的 exe / bat）。没有 pywebview 时返回空。"""
+        import webview
+        try:
+            res = webview.windows[0].create_file_dialog(
+                webview.OPEN_DIALOG,
+                directory=initial or '',
+                allow_multiple=False,
+                file_types=('可执行文件 (*.exe;*.bat;*.cmd)', '所有文件 (*.*)'),
+            )
+            if not res:
+                return {'path': None}
+            if isinstance(res, (list, tuple)):
+                return {'path': res[0] if res else None}
+            return {'path': res}
+        except Exception as e:
+            return {'path': None, 'error': str(e)}
+
     def open_path(self, path):
         """用系统默认方式打开文件/文件夹"""
         try:
@@ -400,6 +418,20 @@ def main():
     # 先完成初始化再起 HTTP：窗口期打进来的 /api/app/install 会因 quit hook
     # 未装而「前端收到已拉起安装、进程永远不退」（#61）
     settings.ensure_dirs()          # config/ 与 debug/ 在启动时才建（import 不建）
+    # 卫戍协议核心「保持最新」：启动时看一眼本机小黑盒记录，有新版就后台
+    # 升级（幂等；下载校验失败不动已装版本）
+    try:
+        from core import garrisondl as _gdl
+        threading.Thread(target=_gdl.check_update, daemon=True,
+                         name='garrison-upd-check').start()
+    except Exception:
+        pass
+    # 定时任务：时间触发 + 链式启动。线程自己 sleep 轮询，起不来不影响主流程
+    try:
+        from core import scheduler as _sched
+        _sched.start()
+    except Exception:
+        log('[警告] 定时任务没起来\n' + traceback.format_exc())
     # 程序自更新：装完后由 api 层调 install()，需要让整个进程退出，
     # 而 api 不能 import main，所以反过来把退出函数注册进去
     appupdate.set_quit_hook(lambda reason: _quit(0, reason))
