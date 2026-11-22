@@ -47,7 +47,7 @@ import re
 import threading
 import time
 
-from . import acctname, maa, maalog, settings, tasks
+from . import acctname, maa, maalog, multiproc, settings, tasks
 
 PROFILE_PREFIX = 'PRTS-'
 _SAFE = re.compile(r'[\\/:*?"<>|]')
@@ -57,6 +57,9 @@ _SAFE = re.compile(r'[\\/:*?"<>|]')
 # 物品，也不会关掉关卡选择」，取中心点用。翻车重挂前必须先点掉结算页，
 # 否则新作业集排下去 Copilot 在结算页上认不出关卡名（2026-11-19 用户实测）。
 _RESULT_TAP = (1135, 45)
+
+#: 多开时几条线程都会往 report 里加行，加锁免得丢（也顺手把日志顺序稳住）
+_GROUPS_LOCK = threading.Lock()
 
 # 任务清单：key → (TaskType, 中文名, 说明, 是否需要关卡)
 # 顺序即「一键长草」里的推荐顺序，也是默认队列的顺序
@@ -704,7 +707,7 @@ def _connection(maa_dir, profile=None):
     }
 
 
-def _navigate(conn, stage, log, client=None):
+def _navigate(conn, stage, log, client=None, strict=False):
     """把界面带到关卡列表，返回 ``(ok, 说明)``
 
     导航要连点好几下，而 MaaCore 的 ``AsstAsyncClick`` 一次连接只能点中第一下
@@ -717,7 +720,8 @@ def _navigate(conn, stage, log, client=None):
     try:
         from . import stagenav
         touch = stagenav.Touch(conn['adb_path'], conn['address'], log,
-                               package=stagenav.game_package(client))
+                               package=stagenav.game_package(client),
+                               strict=strict)
         # 先打一发 get-state：打包版里子进程没带 CREATE_NO_WINDOW 时 adb 会开出
         # 一串黑框、命令还静默失败（2026-11-17 用户报的），不先自检就会一路点空，
         # 最后误报「翻了几十屏没找到这张卡片」。
@@ -764,6 +768,9 @@ def run_core(spec, tid=None, timeout=None):
             raise RuntimeError('MAA 关不掉，请手动退出后重试')
 
     conn = _connection(d, spec.get('profile'))
+    # 多开：用户/批量任务点名的模拟器地址优先（账号档案里可能写着同一台）
+    if spec.get('adbAddress'):
+        conn = dict(conn, address=spec['adbAddress'])
     log('连接 %s（%s）…' % (conn['address'], conn['config']))
     # 抄作业时 MAA 每换一份作业就发一条 CopilotListLoadTaskFileSuccess，
     # 文件名是我们自己按代号存的（BB-S-3_10531.json）。记下来就能知道
@@ -910,8 +917,9 @@ def run_core(spec, tid=None, timeout=None):
                 eng.stop()
                 time.sleep(1.0)
                 log('MAA 已停下，开始我们的导航')
-                nav_ok, nav_why = _navigate(conn, first, log,
-                                            client=spec.get('clientType'))
+                nav_ok, nav_why = _navigate(
+                    conn, first, log, client=spec.get('clientType'),
+                    strict=bool(spec.get('profile') or spec.get('adbAddress')))
                 if not nav_ok:
                     # 老故事集/自建模板的关卡，MAA 自己 100% 找不到（它的入口
                     # 模板在当前 UI 上全失效，只会横向滑主线）。这种情况宁可
@@ -933,8 +941,9 @@ def run_core(spec, tid=None, timeout=None):
             # 没有 StartUp 的任务链（core_tasks 会强制补，正常走不到）：
             # 先导航再跑，结果必须检查——游戏没开时导航失败要立刻暴露。
             # noNav 直跑模式例外：不导航，Copilot 从当前位置自己接手。
-            nav_ok, nav_why = _navigate(conn, first, log,
-                                        client=spec.get('clientType'))
+            nav_ok, nav_why = _navigate(
+                conn, first, log, client=spec.get('clientType'),
+                strict=bool(spec.get('profile') or spec.get('adbAddress')))
             if not nav_ok:
                 from . import stagenav, eventnav
                 if (stagenav.tpl_path_of(first) or stagenav.event_of(first)[0]
@@ -984,7 +993,10 @@ def run_core(spec, tid=None, timeout=None):
         for c in bad:
             if not state.get('pause'):
                 log('[失败] %s %s' % (c['chain'], c.get('why') or ''))
-        ok_list, still = _tally(state.get('results') or [])
+        # 逐关成败**不再统计**（2026-11-22 用户口径）：MaaCore 在 Copilot 任务里
+        # 只报「换了哪份作业」和任务链成败，没有逐关结果，硬算出来的「成功 0 关」
+        # 是假消息。这里只给「跑过哪些关」（trail）+ 真实的任务链失败。
+        _, still = _tally(state.get('results') or [])
         failed_stage = state['stage'] if bad else ''
         failed_why = next((c.get('why') for c in bad if c.get('why')), '') if bad else ''
         return {'ok': (finished and not bad) or bool(state.get('pause')),
@@ -994,13 +1006,13 @@ def run_core(spec, tid=None, timeout=None):
                 'failed_stage': failed_stage,
                 'failed_why': failed_why,
                 'stage_trail': state['trail'],
-                'stages_ok': ok_list,
                 'stages_failed': still,
                 'swaps': swapped,
                 'paused': state.get('pause') or '',
                 'pauseDetail': state.get('pause_detail') or '',
                 'trained': state.get('done') or {},
                 'trainSummary': state.get('summary') or {},
+                'stageReport': 'trail',   # 告诉调用方：这是「跑过的关」，不是成败
                 'error': '; '.join(eng.errors) or eng.error or ''}
     finally:
         tap_stop.set()
@@ -1044,6 +1056,9 @@ def run_custom(spec, tid=None, timeout=None):
             raise RuntimeError('MAA 关不掉，请手动退出后重试')
 
     conn = _connection(d, spec.get('profile'))
+    # 多开：用户/批量任务点名的模拟器地址优先（账号档案里可能写着同一台）
+    if spec.get('adbAddress'):
+        conn = dict(conn, address=spec['adbAddress'])
     log('连接 %s（%s）…' % (conn['address'], conn['config']))
 
     state = {'last': time.time(), 'node': '', 'node_log': 0.0, 'warned': 0,
@@ -1486,10 +1501,13 @@ def _on_core_event(ev, log, tid, state=None):
             if name:
                 log('关卡：%s' % name)
         elif what == 'StageDrops':
+            # 2026-11-22 起这里**不再拿掉落当「这关成功」的证据**：实测这台
+            # MAA（6.20.1）在 Copilot 任务里根本不发 StageDrops 回调
+            # （asst.log 里 250 多条 SubTaskExtraInfo 全是 CopilotAction /
+            # BattleFormation，一条 StageDrops 都没有），拿它判成功等于永远
+            # 「一关都没挂」。留着这段只为万一某个版本又发了：有就写掉落明细，
+            # 不写「战斗成功」。
             items = data.get('stats') or []
-            # 「这一关过了」的唯一硬信号：结算掉落。先记结果再写掉落明细，
-            # 这样日志顺序是「✔ X 战斗成功（掉落…）」
-            _mark_clear(data, log, state)
             if items:
                 log('掉落：' + '、'.join(
                     '%s×%s' % (i.get('itemName'), i.get('addQuantity'))
@@ -1601,35 +1619,15 @@ def _stage_of_file(data, state=None):
 
 
 def _mark_clear(data, log, state):
-    """一关打完了（MaaCore 发 StageDrops）→ 记成功 + 日志「✔ X 战斗成功」
+    """**已废弃**：以前靠 StageDrops 判定「这关打完了」
 
-    用户 2026-11-19 的要求：「挂完一关就显示一关战斗成功」。以前一场仗
-    3 分钟只有「换作业」「掉落」两行，看不出这关到底过没过。
-    刷材料（Fight）时同一关会反复结算，只在该关第一次成功时喊一声。
+    2026-11-22 实测：MaaCore 6.20.1 在 Copilot 任务里不发 StageDrops 回调，
+    这个函数永远进不来，结果就是每次挂完都显示「一关都没挂」。现在改成只
+    报**跑过哪些关**（``CopilotListLoadTaskFileSuccess``，可靠）+ 任务链
+    结果是成功还是失败，不再假装知道逐关成败。保留这个空壳是为了让老调用方
+    （如果有）不炸，别再往里加判据。
     """
-    if state is None:
-        return
-    cur = (state.get('stage') or '').strip()
-    code = str(((data.get('stage') or {}).get('stage_code')) or '').strip()
-    name = cur or code
-    if not name:
-        return
-    key = name.upper()
-    first = key not in (state.get('cleared') or {})
-    state.setdefault('cleared', {})[key] = True
-    state.setdefault('results', []).append(
-        {'stage': name, 'ok': True, 'why': '', 'at': time.time(),
-         'cid': state.get('cur_cid') or 0})
-    if not first:
-        return
-    drops = []
-    for it in (data.get('stats') or [])[:3]:
-        nm = it.get('itemName') or ''
-        n = it.get('addQuantity')
-        if nm:
-            drops.append('%s×%s' % (nm, n) if n is not None else nm)
-    log('✔ %s 战斗成功%s'
-        % (name, ('（' + '、'.join(drops) + '）') if drops else ''))
+    return
 
 
 def _mark_fail(ev, log, state):
@@ -1768,13 +1766,23 @@ def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
     for k, v in (state.get('tried') or {}).items():
         attempted[k] = {v}
     swapped = []
+    # 从**失败的那一关**往下重排。以前拿 `cleared`（靠 StageDrops 判定）排除
+    # 已成功的关，但 MaaCore 在 Copilot 里根本不发这个回调，cleared 永远是
+    # 空的——那样会把前面打完的关全重打一遍，白烧理智。现在按「卡在哪一关」
+    # 定位一次：跑到 X 才失败，说明 X 之前的关都已经过去了，只重挂 X 及其
+    # 后面。**idx 在进循环前算好**：每轮重排后 state['stage'] 会被清空，第二轮
+    # 再算就会回到第 0 关，把前面的关又打一遍（这次踩过）。
+    cur = str(state.get('stage') or '').strip().upper()
+    start_idx = 0
+    if cur:
+        start_idx = next((i for i, o in enumerate(order)
+                          if o['stage'].upper() == cur), 0)
     for rnd in range(2, rounds + 1):
         left = deadline - time.time()
         if left <= 30:
             log('没时间再重挂了（总时长到上限），停下')
             break
-        ok_now = {str(k).upper() for k in (state.get('cleared') or {})}
-        pend = [o for o in order if o['stage'].upper() not in ok_now]
+        pend = order[start_idx:]
         if not pend:
             break
         new_ops, picked = [], []
@@ -1817,9 +1825,9 @@ def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
         _leave_result(conn, spec, pend[0]['stage'], log)
         eng.append('Copilot', _copilot_params(rows, spec))
         done_n = len(order) - len(pend)
-        log('第 %d 轮：重挂 %d 关%s'
-            % (rnd, len(new_ops),
-               '（已成功的 %d 关不重打）' % done_n if done_n else ''))
+        log('第 %d 轮：从「%s」起重挂 %d 关%s'
+            % (rnd, pend[0]['stage'], len(new_ops),
+               '（前面 %d 关不再重打）' % done_n if done_n else ''))
         if not eng.start():
             raise RuntimeError('重挂时 AsstStart 返回失败')
         if not _wait_run(eng, max(60.0, left), log, state):
@@ -1848,25 +1856,51 @@ def _wait_chain(eng, chain, log, timeout=300):
     return False
 
 
-def run_plan(rows, spec_base, tid=None):
-    """多账号串行跑：一个账号跑完再切下一个
+def plan_groups(rows, spec_base=None):
+    """按「MAA 目录 + adb 地址」把账号分组：同组=同一台模拟器
 
-    一个模拟器同一时刻只能登一个号，所以这里天然是串行的。每个账号都新建
-    Engine（``CopilotTask`` 在同一个实例上不能二次 set_params，会报
-    ``already set params``），跑完销毁，干净。
+    2026-11-22 用户要求：每个账号可以绑自己的 MAA（也就连着不同的模拟器）。
+
+    - **不同模拟器** → 各开一条线程，真正同时跑（多开）；
+    - **同一台模拟器** → 只能排队，一个号跑完切下一个（一台模拟器同一时刻
+      只能登一个号）。
+
+    返回 ``[(key, {'dir','address','rows'})]``，顺序按账号出现顺序。
+
+    ``r['address']``（用户点名的模拟器）优先于档案里的地址：MAA 里八份档案
+    可能全指向同一台，光看档案分不出两台（2026-11-22 用户实测）。
     """
-    log = tasks.log_factory(tid) if tid else (lambda *_: None)
-    d = spec_base.get('maaDir') or ''
+    spec_base = spec_base or {}
+    groups = {}
+    for r in rows or []:
+        d = str(r.get('maaDir') or spec_base.get('maaDir') or '').strip()
+        try:
+            conn = _connection(d, r.get('profile') or None)
+        except Exception:
+            conn = {'address': '', 'adb_path': ''}
+        addr = str(r.get('address') or conn.get('address') or '')
+        key = (os.path.normcase(os.path.abspath(d or '.')), addr)
+        g = groups.setdefault(key, {'dir': d, 'address': addr,
+                                    'rows': []})
+        g['rows'].append(r)
+    return list(groups.items())
+
+
+def _run_group(g, spec_base, tid, log):
+    """一个模拟器上的账号排队跑（组内串行）"""
+    out = []
+    d = g['dir'] or spec_base.get('maaDir') or ''
     # 同一个模拟器不能两个人同时戳：MAA 自己在跑就先关掉，否则两条 adb 连接
     # 互相抢截图，表现成「点了没反应」。
     if d and maa.running_in(d):
         log('MAA 正在运行，先关掉（否则两边抢模拟器）…')
         maa.close(d)
-    report = []
-    for i, r in enumerate(rows, 1):
-        log('=' * 34)
-        log('[%d/%d] %s（切号名 %s）' % (i, len(rows), r.get('name') or '',
-                                        r.get('accountName') or ''))
+    for i, r in enumerate(g['rows'], 1):
+        log('=' * 20 + ' [%d/%d] %s ' % (i, len(g['rows']),
+                                         r.get('name') or '') + '=' * 20)
+        log('模拟器 %s（%s）；切号名 %s'
+            % (g['address'] or '默认', d or '默认 MAA',
+               r.get('accountName') or '无'))
         cp = []
         if r.get('ops'):
             log('准备 %d 份作业…' % len(r['ops']))
@@ -1874,6 +1908,7 @@ def run_plan(rows, spec_base, tid=None):
                                  log=lambda m: log('  ' + m))
         spec = dict(spec_base)
         spec.update({
+            'maaDir': d,                    # 这个号的 MAA（run_core 按它连 adb）
             'accountName': r.get('accountName') or '',
             'switchAccount': True,
             'clientType': client_type_of(r.get('channel')),
@@ -1883,18 +1918,79 @@ def run_plan(rows, spec_base, tid=None):
         })
         try:
             res = run_core(spec, tid)
-            report.append({'name': r.get('name') or '',
-                           'ok': bool(res.get('ok')),
-                           'tasks': res.get('tasks'),
-                           'error': res.get('error') or ''})
+            out.append({'name': r.get('name') or '',
+                        'file': r.get('file') or '',
+                        'emulator': g['address'] or '',
+                        'ok': bool(res.get('ok')),
+                        'tasks': res.get('tasks'),
+                        'ran': res.get('stage_trail') or [],
+                        'error': res.get('error') or ''})
         except Exception as e:
             log('「%s」失败：%s: %s' % (r.get('name') or '', type(e).__name__, e))
-            report.append({'name': r.get('name') or '', 'ok': False,
-                           'error': '%s: %s' % (type(e).__name__, e)})
+            out.append({'name': r.get('name') or '', 'file': r.get('file') or '',
+                        'emulator': g['address'] or '',
+                        'ok': False, 'error': '%s: %s' % (type(e).__name__, e)})
+    return out
+
+
+def run_plan(rows, spec_base, tid=None):
+    """多账号挂机：同一台模拟器排队切号，不同模拟器并行多开
+
+    用户 2026-11-22 的口径：
+      - 五个号共用一个 MAA / 一台模拟器 → 一个号跑完切下一个；
+      - 两个号各自绑了不同 MAA（不同模拟器）→ 直接多开，两边同时动。
+
+    每个账号都新建 Engine（``CopilotTask`` 在同一个实例上不能二次
+    set_params，会报 ``already set params``），跑完销毁，干净。
+    """
+    log = tasks.log_factory(tid) if tid else (lambda *_: None)
+    groups = plan_groups(rows, spec_base)
+    if len(groups) > 1:
+        log('检测到 %d 台模拟器，多开并行：%s'
+            % (len(groups), '、'.join('%s（%d 个号）'
+                                     % (g['address'] or '默认', len(g['rows']))
+                                     for _, g in groups)))
+    report = []
+
+    def run_one(g):
+        got = _run_group(g, spec_base, tid, log)
+        with _GROUPS_LOCK:
+            report.extend(got)
+
+    def run_one_proc(idx, g):
+        """多开：这台模拟器交给独立进程（同进程两个 MaaCore 会抢命名管道，
+        见 multiproc 的模块注释——这是「说好并行、另一台不动」的真因）"""
+        _res, got = multiproc.run_group(
+            'plan', tid, idx, {'group': g, 'spec': spec_base}, log,
+            who=g.get('address') or '默认模拟器')
+        with _GROUPS_LOCK:
+            report.extend(got or [])
+        if not got:
+            with _GROUPS_LOCK:
+                for r in (g.get('rows') or []):
+                    report.append({'file': r.get('file'), 'name': r.get('name'),
+                                   'ok': False,
+                                   'error': '子进程异常（没交回结果）'})
+
+    if len(groups) <= 1:
+        for _, g in groups:
+            run_one(g)
+    else:
+        log('（每个模拟器一个独立进程）')
+        ths = []
+        for i, (_k, g) in enumerate(groups, 1):
+            th = threading.Thread(target=run_one_proc, args=(i, g), daemon=True,
+                                  name='plan-%s' % (g['address'] or 'emu'))
+            th.start()
+            ths.append(th)
+        for th in ths:
+            th.join()
     done = sum(1 for x in report if x['ok'])
     log('=' * 34)
-    log('跑完：%d/%d 个账号正常结束' % (done, len(report)))
-    return {'report': report, 'done': done, 'total': len(report)}
+    log('跑完：%d/%d 个账号正常结束（%d 台模拟器）'
+        % (done, len(report), len(groups)))
+    return {'report': report, 'done': done, 'total': len(report),
+            'groups': len(groups)}
 
 
 def _label_of(ttype):

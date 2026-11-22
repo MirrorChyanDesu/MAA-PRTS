@@ -30,7 +30,7 @@
 | `core/appupdate.py` | 程序本体自动更新（GitHub Releases）：查版本 → 下载校验 → 退出后由 install.ps1 替换 |
 | `core/maa.py` | MAA 进程控制、`gui.new.json` 读写、作业文件下载 |
 | `core/envcheck.py` | 开跑前的环境闸：模拟器开着没有、adb 通不通。路径优先从 MAA 的 `gui.new.json` 抄（`Config` 类型 / `AdbPath` / `Extras.<类型>.EmulatorPath` / `InstanceIndex`），再退到 `settings.emulatorPath` 和 adb 反推。没启动就替用户启动（`settings.emulatorAutoStart`，默认开），起来才放行。**不进 `SKILLS`**，所以 `/api/skill/list` 和助手工具表里都看不到它——它是每个任务的前置闸，`skills.run_skill` 起任务时自动调一次，正常时零日志 |
-| `core/tasks.py` | 内存任务表：状态、日志、结果，供前端轮询 |
+| `core/tasks.py` | 内存任务表：状态、日志、结果，供前端轮询。`owners` 记任务属于哪些账号（右栏按账号分栏用），`prefix` 让多开子进程的每行日志自动带 `[昵称]`；`_public()` 只吐可序列化字段——文件句柄绝不能出接口（2026-11-22「右边日志都消失了」就是它漏出去导致 `/api/task` 500） |
 | `core/progress.py` | 森空岛 `player/info` → 关卡进度：主线推到哪（含剧情关落点）、后续关卡、活动 zone 已打/总数、剿灭最高击杀、日常周常。只做 zone 级余量判断，不拿计数切关卡列表（两边口径含剧情关/突袭关，会错位） |
 | `core/asstlog.py` | MAA 日志观测：`debug/asst.log` 的回调 JSON + `debug/gui.log` 的 `Start/Completed Task Chain` → 结构化事件流；增量读、轮转识别、状态推导（idle/running/stalled/failed/done）、`failures()` 还原「跑过哪几关、哪几关没跑完」 |
 | `core/maalog.py` | 直连跑机时的 MAA 日志桥：`maalog.Tap` 从 `asst.log` **末尾**开始增量读（`Tail.seek_end()`，不重放历史），只把 `[ERR]/[WRN]` 里能解释问题的行翻成人话（认不出关卡名 / 干员不存在 / 参数不合法），噪行丢弃、同句 20 秒去重。回调 JSON 行不读——那部分由 `maacore` 回调负责，避免同一件事写两遍 |
@@ -111,7 +111,8 @@ main()
 | POST | `/api/maa/apply` | 写入作业集：关 MAA → 备份 → 下载 → 写 TaskList → 重启。返回 `taskId` |
 | POST | `/api/maa/clear` | 清空某配置的 `Copilot.TaskList`。**预留，无界面入口** |
 | GET | `/api/maa/tasklist?profile=` | 读 MAA 某配置当前的 `TaskList`。**预留，无界面入口** |
-| GET | `/api/task?id=&since=` | 后台任务状态与增量日志（`since` 是日志游标） |
+| GET | `/api/task?id=&since=` | 后台任务状态与增量日志（`since` 是日志游标），带 `owners`（属于哪些账号） |
+| GET | `/api/tasks?file=&limit=` | 某个账号相关的任务（新的在前，含完整日志），助手右栏切账号时回填用；任务 `owners` 为空 = 全局，所有 tab 可见 |
 | GET | `/api/gacha?file=` | 抽卡统计视图：读本地缓存算汇总（总抽数/星级/出率/保底），**不发网络请求** |
 | POST | `/api/gacha/sync` | 从森空岛拉抽卡记录并并入缓存（增量，按 `分类｜池｜干员｜时间戳｜pos` 去重）。返回 `taskId` |
 | POST | `/api/signin/run` | 森空岛签到：`{file}` 为空 = 全部账号（方舟 + 终末地），传账号文件 = 只签这一个。返回 `taskId`（日志在前端面板里刷） |
@@ -424,7 +425,9 @@ MAA 运行时会周期性回写配置文件，所以必须先关进程再改，�
 2026-11-17 把挂关流程拆成六个可独立调度的 skill，由 `run_skill(name, params)`
 统一跑成后台任务（`tasks.create`），返回 taskId 给前端 / 助手轮询 `/api/task`。
 API：`POST /api/skill/run`（body：`{"skill": ..., "params": {...}}`）、`GET /api/skill/list`。
-2026-11-18 增加第七个 `train`（培养干员）。
+2026-11-18 增加第七个 `train`（培养干员）；2026-11-19 加 `sweep` / `tool`；
+2026-11-22 加 `claim`（领活动奖励），并新增 `run_batch()` 把任意几项串成一条龙
+（见「多 MAA / 多模拟器 + 一条龙」）。
 
 | skill | 能力 | 实现依托 |
 |---|---|---|
@@ -435,14 +438,18 @@ API：`POST /api/skill/run`（body：`{"skill": ..., "params": {...}}`）、`GET
 | `signin` | 森空岛签到（单号 / 全部） | `signin.run` |
 | `weekly` | 周目编排：ST 关自动过剧情、连续战斗关合并成 fight 批次、EX 收尾；**任何一步失败立即停**并在日志写明卡在哪关 | 本文件 `_cycle_rows` + `_cycle_sort_key` |
 | `train` | 培养干员：精英化 / 技能基础等级 / 专精，可一次排多个；材料不足**暂停**并落盘剩下的计划 | `maaplan.run_core` 的 `OperProgress` 任务 |
+| `sweep` | 扫图：普通 → EX 普通 → EX 突袭 → S 关，段间自动重新导航 | 本文件 `_sweep_segments` |
+| `tool` | MAA 牛杂小工具（小游戏 / 活动商店） | `maatools` + `eventnav.run_tool` |
+| `claim` | 领活动奖励：进奖励页点「一键领取」（纯 adb，不连 MaaCore） | `eventnav.claim_reward` |
 
 排序规则（`_cycle_sort_key`）：`ST-N → 主线 1..N → EX`，正好是 MN 这类周目的
 推图顺序；关卡清单来自 `resources._stages(True)`（含 story=True 的 208 条剧情关，
 resolve 的默认视图查不到它们）。
 
-助手侧（`agent.py`）注册了对应工具：`skill_wakeup / skill_navigate / skill_signin`
-免确认直接跑；`skill_fight / skill_skip_story / skill_weekly / skill_train` 走 `_guard` 确认卡
-（确认标记 `_confirmed` 放进 pending args，重入直接跑不再二次确认）。
+助手侧（`agent.py`）注册了对应工具：`skill_wakeup / skill_navigate /
+skill_signin / skill_claim` 免确认直接跑；`skill_fight / skill_skip_story /
+skill_weekly / skill_train / skill_sweep / skill_tool / run_steps` 走 `_guard`
+确认卡（确认标记 `_confirmed` 放进 pending args，重入直接跑不再二次确认）。
 MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与助手都能看到卡在哪。
 
 ## 用户实测三连修（2026-11-18 晚）
@@ -537,21 +544,33 @@ MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与�
 
 ## 逐关战报 + 失败换作业重挂 + 分段扫图（2026-11-19）
 
+> **2026-11-22 修订：①「成功几关」这一项已经删掉。** MaaCore 在 Copilot 任务里
+> **不发 `StageDrops`**（本机 asst.log 里 255 条 `SubTaskExtraInfo` 全是
+> `CopilotAction` / `BattleFormation` / `CopilotListLoadTaskFileSuccess` /
+> `ExceededLimit`，`StageDrops` 0 条），所以 `_mark_clear()` 永远不触发、
+> `ok_list` 恒为空，界面就一直是「一关都没挂」。按用户口径「判断不出来就别统计」，
+> 现在 `_mark_clear()` 是个空实现（保留函数名 + docstring 说明原因），
+> `run_core` 不再返回 `stages_ok`，改为 `stageReport: 'trail'` +
+> `stage_trail`（`CopilotListLoadTaskFileSuccess` 记的「跑过哪些关」）。
+> 下面 ① 的原文留着当历史，别照着它去「修」成功数。
+> 失败那一半仍然有效：`_tally()` 只在有 `TaskChainError` 时记失败。
+
 用户提了四条，一次做完：
 
 1. 作业翻车要能看见**是哪一关**翻的
-2. 挂完一关就显示「一关战斗成功」
+2. 挂完一关就显示「一关战斗成功」（**已废，见上**）
 3. 某关失败就换作业集里**别的作业**重挂这一关，已成功的关不重排
 4. skill 联动：挂完普通 → 导航到突袭 → 挂突袭 → 导航到 S → 挂 S
 
 **① 逐关结果（`run_core` 的 `state['results']`）**
 
-- `StageDrops` 到达 = 这关打完了 → `_mark_clear()` 记成功并打
-  `✔ SV-EX-1 战斗成功（掉落…）`。刷材料（Fight）同一关反复结算只喊一次。
+- ~~`StageDrops` 到达 = 这关打完了 → `_mark_clear()` 记成功~~（Copilot 不发，
+  见上面的修订）
 - `chain_failed` 且链是 Copilot → `_mark_fail()` 打
   `✘ SV-EX-1 翻车：原因`。`maacore._translate` 的 chain_failed 事件为此补了
   `why` 字段（以前只有一句「失败：自动战斗」）。
-- `_tally()` 按关卡聚合：同一关先失败后成功算成功。
+- `CopilotListLoadTaskFileSuccess` → `state['trail']` 追加关卡名，收尾打
+  「跑过的关：…」。「打过哪些关」用它，别用掉落。
 
 **② 换作业重挂（`_retry_failed`）**
 
@@ -559,7 +578,12 @@ MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与�
   练度不足」排），`_prepare_ops` 返回 `(copilotList, retry)`，
   `retry = {'pool': {'SV-EX-1@raid': [41623, 41624, 46114]}, 'maxRounds': 3}`，
   由 `spec['retry']` 交给 `run_core`。
-- 一轮跑完只挑**没成功**的关；每关换候选池里**还没试过**的下一份，同一个
+- 一轮跑完从**失败的那一关**开始往后重排（`start_idx` 由 `state['stage']` 定位：
+  跑到 X 才翻车，说明 X 之前都过去了）。以前靠 `cleared` 排除已成功的关，但
+  那个集合永远为空（`StageDrops` 不来），会把前面打完的关全重打一遍白烧理智——
+  2026-11-22 改的。`start_idx` **必须在进循环前算好**：每轮重排后
+  `state['stage']` 会被清空，第二轮再算就回到第 0 关了。
+- 每关换候选池里**还没试过**的下一份，同一个
   Engine 直接 `append` 新的 Copilot 任务再 `start`——不重新 open / connect /
   导航，省掉每轮十几秒。`attempted` 记着试过哪些，#102→#202→#102 这种
   来回打转不会发生。
@@ -596,73 +620,320 @@ EX-1 之后又往后补了一关凑数，白烧一整轮理智。预检会把前
 - 段内 `_select_ops(strict=True)`：普通段不拿突袭作业顶，反之亦然。
 - 每段一次 `run_core`（带 retry 池），段与段之间靠导航衔接。
 
-## 当期活动导航（`eventnav.py`，2026-11-19）
+## 多 MAA / 多模拟器 + 一条龙（`plan_groups` / `run_batch`，2026-11-22）
+
+用户的原话：「每个账号都有自己的 maa 路径和配置文件，agent 要能读多个配置文件下的
+adb 路径；不同就多开并行；同一台就切号 → 普通 → 突袭 → S → 领奖 → 商店 → 下一个号」。
+
+**① 每个账号自己的 MAA 目录 / 档案**
+
+账号 json 的 `maa` 段现在有两个字段（都放在 `account['maa']` 里，别往别处加）：
+
+| 字段 | 含义 | 空的时候 |
+|---|---|---|
+| `dir` | 这个号归哪份 MAA 目录管 | 回落 `settings.maaDir` |
+| `profile` | 用哪份配置档案（`moren` / `136`…） | 回落 MAA `gui.new.json` 的 `Current` |
+
+解析只有一处：`acctbind.dir_of(file)` / `acctbind.profile_of(file)`。
+`skills._maa_dir_of(file)` / `_conn_of(file, d)` 都走它，所以唤醒、导航、
+战斗、培养、扫图、牛杂**每一项**都会连到「这个号自己那台模拟器」上，不再一律
+用全局那台。`envcheck.ensure(..., maa_dir=, profile=)` 也跟着改，判断模拟器开没
+开、要不要替用户启动，看的都是这个号的那份配置。
+
+**② 分组：同模拟器串行，不同模拟器并行**
+
+```python
+# maaplan.plan_groups(rows, spec_base)
+key = (os.path.normcase(os.path.abspath(d or '.')), str(conn.get('address') or ''))
+```
+
+- `d` 是这个账号的 MAA 目录，`address` 是那份档案里 adb 指向的模拟器地址
+  （雷电 `emulator-5554` / MuMu `127.0.0.1:16384` 之类）；
+- 同一个键 = 同一份 MAA + 同一台模拟器 → **组内串行**（两条 adb 同时戳同一台
+  会表现成「点了没反应」）；
+- 不同键 → 每组一个**独立进程并行**，这就是「多开」。
+
+`run_plan` 只在单组时保持原来的同步行为，多组才开线程（每组再起子进程），
+日志按组汇总。
+
+**②b 多开必须「一进程一台模拟器」（2026-11-22 真机定位，这是「另一台不动」的
+最后一层根因）**
+
+分组、档案、地址全对了，第二台还是不动。真机对着两份 `debug/asst.log` 才看清：
+
+```
+[ERR] CreateOverlappablePipe failed, err 231
+[WRN] Call ` D:\...\adb.exe devices ` failed
+[INF] ConnectionInfo ... "address":"emulator-5556",
+      "why":"Cannot connect: address appears to be serial number but device not found"
+```
+
+`err 231` = Windows「所有管道实例都忙」。MaaCore 调 adb 时用命名管道收输出，
+**同一个进程里两个 MaaCore 实例撞同一个管道名**，后到的那次直接失败，于是
+MaaCore 认为设备不存在。跟档案、地址、adb 路径都无关——5556 单独跑（只起一个
+Engine）一切正常，两台同时跑就只有 5554 能动。
+
+所以多开只能一个进程一台模拟器：
+
+- `backend/core/multiproc.py`：写 payload → `MAA-PRTS --skill-worker <payload>`
+  （源码模式跑 `python backend/main.py --skill-worker ...`）→ tail 子进程的
+  日志文件转发进任务日志 → 读回 `{results, report}`；
+- `backend/core/skillworker.py`：子进程入口，`kind` 分 `skill`（run_batch 一组）
+  和 `plan`（run_plan 一组），日志落到父进程指定的
+  `debug/tasks/<tid>-g<i>.log`，任务结束删 payload / 结果，日志留着排障；
+- `skills.run_batch` / `maaplan.run_plan` 在 `len(groups) > 1` 时全部走子进程；
+  单组仍就地跑（不起进程，省 1~2 秒，日志即时）。
+
+冒烟 B52 里 `multiproc.run_group` 被换成「就地执行」——否则测试里的假 skill
+不会出现在子进程里，会真的去连模拟器。
+
+**②c 官服 / b 服是两个包（2026-11-22）**
+
+b 服账号的渠道在 `snapshot['account']['channelName']` 里，值是 **`bilibili服`**
+（不是 `bilibili`）。以前两处都读错：
+
+- `skills._client_of()` 读的是**顶层** `channelName`（永远空）→ 一律当官服；
+- `stagenav.game_package()` 只认 `('bilibili','b','b服')`，`bilibili服` 两边
+  都不等 → 返回官服包名。
+
+结果 b 服那台模拟器上 MAA 去启动/查找**官服**客户端，登录失败后进入
+「game-restart loop」，表现还是「另一台没动静」。现在：
+
+- `_client_of` 先读 `account` 段，再退回顶层；
+- `game_package` 按「含 bili / b服」判，b 服走
+  `com.hypergryph.arknights.bilibili`；
+- `_profile_kw()` 顺带带 `clientType`（`maaplan.client_type_of('bilibili服')`
+  → `Bilibili`），所有 `run_core` 的 StartUp 都按账号自己的渠道跑。
+
+**②d 右栏日志按账号分栏（2026-11-22）**
+
+用户两条反馈一起处理：「右边日志都消失了」+「每个账号的日志只在自己的
+tab 里」。
+
+- **日志消失的根因在序列化**：给任务加日志落盘时把打开的文件句柄塞进了
+  任务 dict，`api_task` 直接 `json.dumps(tasks.get(...))` →
+  `TypeError: Object of type TextIOWrapper is not JSON serializable` → 接口
+  500 → 前端每 700ms 收一次失败，右栏只剩一行任务名。现在内部字段一律
+  下划线开头（`_fh` / `_prefix`），`_public()` 白名单只吐 9 个可序列化字段。
+  所有创建点都补了 `owners`：`run_batch` / `run_skill` / `run_plan` /
+  `multiacct` / `/api/multi/run`，单账号任务只挂在那个号名下。
+- **分栏靠「任务 owners + 行前缀」两级**：`tasks.for_owner(file)` 先挑出这个号
+  相关的任务（含 `owners` 为空的全局任务），前端 `chatSideSwitch()` 切号时
+  拉 `/api/tasks?file=` 回填；`paintSideLog()` 再逐行按 `sideOwnerOf()` 过滤
+  ——`[昵称] xxx` 归那个号、`[组 xxx]` 和没有前缀的汇总行是公共行、
+  匹配不上的前缀跟着「发起这个任务的号」走。单账号任务整块跳过别的 tab，
+  连前端合成的「✓ 完成」也不会留下一个孤零零的任务标题。
+- **多开两组的日志会被 tail 到同一个任务里交错**，所以子进程写日志时就要
+  带前缀。`tasks.create(prefix='[昵称]')` → `tasks.log()` 里的 `_decorate()`
+  统一补：无前缀行补上、`[组 emulator-5556]` 改写成 `[昵称]`、已有
+  `[昵称]` / `[MAA]` 原样。挂在 `tasks` 这一层而不是包装 worker 的 `log`
+  函数——`maaplan.run_core` 是**直接** `tasks.log_factory(tid)` 写「MaaCore
+  已加载 / 模拟器已连接」的，包装拦不到。一组多号时不硬塞（每行本来就有
+  各自的前缀）。真机回来两组日志每行都带 `[昵称]`，官服 tab 看不到 B 服。
+
+**③ `skills.run_batch(accounts, steps)`：一条龙**
+
+不写死流程，`steps` 是字符串列表，每项「skill 名 + 空格参数」：
+
+```python
+['wakeup 5505', 'navigate OS', "fight OS-EX-1~7", 'claim', 'tool 活动商店']
+```
+
+- `_norm_steps()` 把每项拆成 `(name, params)`：`fight` 后面那串当关卡/关键词，
+  `tool` 后面当工具名，`wait 60` 当等待；别名（`领奖` / `商店` / `导航` /
+  小游戏名）都认。
+- 每个账号把整串 steps 依次跑完；一个账号挂了不影响别的账号（各自 try/except），
+  最后汇总 `{ok, done: [...], failed: [...]}`。
+- 日志前缀 `[昵称]`（昵称取 `snap['account']['nickName']`，不是文件名——
+  第一版写错了，日志里全是 `.json`）。
+- 外层由 `tasks.create('批量任务（N 个账号 / M 台模拟器）')` 挂成一条任务，
+  前端右侧进度栏只有一个进度条。多组时每组一个**独立进程**（见 ②b），
+  父进程那条线程只负责 tail 日志、收结果，包了 try/except，崩了往日志写
+  「这一组出错」——组线程静默死掉，用户看到的就是「另一台没动静」。
+- 每个任务的日志**同时落盘** `debug/tasks/<tid>.log`（`tasks.py`）：以前只在
+  内存里，窗口一关现场就没了，用户报「只有一台在跑」时连哪组没启动都查不出。
+
+**③b 地址要真的传进 MaaCore（2026-11-22 修，这是「第二台不动」的根因）**
+
+分组对了不等于连得对：`run_core` / `run_custom` 原来只用
+`_connection(maaDir, spec['profile'])`，而各 skill 的 spec **没写 profile**，
+于是永远拿 MAA 的 `Current`。用户八份档案全指向 `emulator-5554`，b 服那份在
+另一台 MAA 目录里（`...-win-x64-1`，`Current` 指向 5556）——只有 b 服那组碰巧
+连对，别的全挤到同一台。
+
+现在：
+
+- 每个 skill 的 spec 都带 `'profile': acctbind.profile_of(file)`（`_profile_kw`）
+- `run_core` / `run_custom` 认 `spec['adbAddress']`，覆盖档案里的地址
+- `run_batch(..., emulators={账号: 'emulator-5556'})` 用线程局部 `_ADDR` 把地址
+  钉在组上，`_conn_of` / `_addr_kw` 都读它
+- `stagenav.Touch(strict=...)`：指定过地址的号，adb 自检连不上就**报错**，
+  不再「自动换第一台在线设备」——换了等于两组同时戳一台，另一台一动不动
+- `envcheck.ensure(address=...)`：多开时只查点名那台在不在线，不在就直说，
+  不会去启动档案里那台
+
+**④ 领奖 skill（`skill_claim`）**
+
+`eventnav.claim_reward(touch, prefix)` 早就有（进奖励页点「一键领取」），但只能
+手动点。现在包成 `SKILLS['claim']`：
+
+```python
+skill_claim({'account': ..., 'stage': 'OS', 'wakeup': False})
+```
+
+纯 adb 操作（不连 MaaCore），所以它不在 `_WRITE_HANDLERS` 里——和 `wakeup` /
+`navigate` 一样免确认。奖励页的「一键领取」按钮已领完也还在，点了没反应不算失败。
+
+## 当期活动导航（`eventnav.py`，2026-11-19 / 2026-11-22 改）
 
 新活动的入口 UI 和老的「曲谱 / 主界面活动大图」都不一样了，用户逐屏标注了
 步骤，这一段按他的步骤点：
 
     任意界面 --底部第1个tab「终端」--> 主界面
-    主界面   --固定位置点「终端」大卡---> 终端页（活动提示条 + 黄钻石进度）
-    终端页   --活动提示条（区域+图像识别）-> 活动地图（约 5 秒过场动画）
-    活动地图 --区域节点（残照终尽）------> 普通关卡界面（基础区）
-    关卡列表 --右下区域按钮（长冬初青）--> EX 关卡界面
-    关卡界面 --右下区域按钮（世纪之春）--> S 关卡界面
+    主界面   --固定位置点「终端」大卡---> 终端页
+    终端页   --左下横幅（当期活动）-----> 活动主页（约 5 秒过场动画）
+    终端页   --ATTENTION 区活动卡片-----> 活动地图（已结束的旧活动走这条）
+    活动主页 --节点（圣巡之旅）--------> 普通关卡界面（基础区）
+    活动主页 --节点（变革之路）--------> EX 关卡界面
+    活动主页 --节点（喀兰之心）--------> S 关卡界面
 
 到关卡列表就交给 Copilot 的 `ClickStageName` 自己 OCR 找关卡名。
 
+**分区是地图上的节点，必须直点**（2026-11-22 修）：`run()` 现在只点目标那一个
+节点（`OS-1` → 圣巡之旅、`OS-EX-1` → 变革之路、`OS-S-1` → 喀兰之心）。以前是
+「先点基础区进关卡列表、再点右下角区域按钮切 EX/S」——那是**上一代 UI** 的
+做法，在新地图上第一步就离开地图了，EX/S 的模板根本不在关卡列表那一页，
+`_find` 认不到就按标定坐标兜底点，那一戳可能正好点在关卡卡片上。
+`goto_stage_list` 也**不再退回老路径**：ENTRIES 里的活动，eventnav 失败就
+直接返回「当期活动导航没到位：…」，因为老 UI（主界面大图 → 主题页 → 区域
+列表）对新活动根本点不到，退化过去只会白点几下再报个更难懂的错。
+
+**两种入口并存**（2026-11-22 用户实测）：正在开的活动在终端页**左下横幅**上
+（`<雪山降临1101>活动已开放`）；活动结束之后横幅会被下一个活动占走，旧活动
+退到 ATTENTION 区第二格卡片、显示「作战已结束」，点卡片照样能进地图——但
+地图上的关卡分区已经关了，只剩商店（见下面的 `closed`）。
+
 **为什么不吃老路径**：老路径是「主界面大图 → 主题页 → 右下区域列表」，
-新活动的地图是散点式区域节点、分区靠关卡列表右下角那排区域名按钮切，
-老坐标（`themeZone` / `zoneRows`）全对不上。`goto_stage_list` 里 eventnav
+新活动的地图是散点式区域节点、分区靠地图上的节点图标切，老坐标
+（`themeZone` / `zoneRows`）全对不上。`goto_stage_list` 里 eventnav
 **排在曲谱和老路径前面**，认不了才退回去。
 
+**起点可能是任何一页，别盲点「终端」大卡**（2026-11-22 修）：连跑多关时，
+每关导航前游戏停在**上一关的关卡列表**（或结算页）上。`terminalCard` 这个
+固定坐标是按主界面量的（1280 口径 913,173），在关卡列表上正好压在关卡卡片
+上——一戳就打开关卡详情，接着点底部「终端」tab 又戳到列表底部，连跑几个号
+就会莫名多进一次关卡。现在的收敛过程分两段：
+
+- `_near_map()`：认得到基础区节点就说明**已经在活动地图上**，直接用（连跑
+  多关时省掉回主界面那一路，实测 22.8 秒降到 7.8 秒）。认不到但 `probe` 判成
+  `map`（关卡列表）就先按一下返回——这一下反正是回主界面的必经步骤，之后
+  可能停在活动主题页（不是地图，节点位置低一截、模板认不出）。
+- `_to_terminal()`：`at_home()` 判出「在主界面系」才点终端大卡；否则交给
+  `_to_home()` 一层层退（它会跳剧情、退化到 ESC、最后点左上角「<」）。
+  **返回键绝不能无条件按**：在主界面上会弹「退出游戏」确认框。
+
 **数据在 `ENTRIES`，一条活动一项，老的别删**（活动会复刻，UI 不变、模板还能
-用）。一项长这样：
+用）。两项长这样（OS 是复刻活动，TL 已结束只剩商店）：
 
 ```python
 'TL': {
     'name': '时间啊，向前！',
-    'until': '2026-11-25',          # 活动结束日
-    'wrote': '2026-11-19',
-    'entry': {'tpl': '_entry_track.png', 'roi': [80, 500, 300, 130],
-              'tap': [218, 551], 'offset': [0, -51], 'wait': 5.0},
+    'until': '2026-11-28',          # 关卡结束、商店还开着
+    'closed': True,                 # 关卡分区和小游戏入口都没了
+    'entry': {'tpl': 'TL_card.png', 'roi': [620, 300, 260, 150],
+              'tap': [753, 371], 'wait': 5.0},   # 点 ATTENTION 区那张卡片
+    'zones': {},                    # 关卡导航关闭
+    'tools': {'shop': {'tpl': 'TL_shop.png', 'label': '熄火所掩埋的', ...}},
+},
+'OS': {
+    'name': '雪山降临1101',
+    'until': '2026-12-02',
+    'reprint': True,                # 复刻：前端标「复刻」、助手会问突袭
+    # 左下横幅：roi 是 1280 口径，×1.5 就是真机上的 (150,804)~400×44。
+    # 这条**走定点比对**（_entry_here），不走整屏搜索，见下面的说明
+    'entry': {'tpl': 'OS_entry.png', 'roi': [100, 536, 267, 31],
+              'tap': [233, 551], 'wait': 5.0},
     'zones': {
-        'base': {'tpl': 'TL_z1.png', 'label': '残照终尽',
-                 'roi': [380, 540, 320, 180], 'tap': [532, 628]},
-        'ex':   {'tpl': 'TL_z2.png', 'label': '长冬初青', ...},
-        's':    {'tpl': 'TL_z3.png', 'label': '世纪之春', ...},
+        'base': {'tpl': 'OS_z1.png', 'label': '圣巡之旅',
+                 'roi': [869, 513, 113, 167], 'tap': [925, 596]},
+        'ex':   {'tpl': 'OS_z2.png', 'label': '变革之路',
+                 'roi': [992, 481, 134, 167], 'tap': [1059, 565]},
+        's':    {'tpl': 'OS_z3.png', 'label': '喀兰之心',
+                 'roi': [1120, 410, 130, 157], 'tap': [1185, 488]},
     },
-    # 同一屏上的两个「入口节点」：小游戏和活动商店（点进去不是关卡列表）
+    # 同一屏上的入口节点：小游戏 / 活动商店 / 活动奖励（点进去都不是关卡列表）
     'tools': {
-        'minigame': {'tpl': 'TL_mini.png', 'label': '战时新闻委员会',
-                     'roi': [40, 165, 200, 130], 'tap': [127, 227], 'wait': 3.0},
-        'shop':     {'tpl': 'TL_shop.png', 'label': '炮火所掩埋的',
-                     'roi': [880, 120, 200, 130], 'tap': [975, 185], 'wait': 3.0},
+        'minigame': {'tpl': 'OS_mini.png', 'label': '喀兰贸易技术研发部',
+                     'roi': [1102, 122, 136, 179], 'tap': [1170, 211]},
+        'shop':     {'tpl': 'OS_shop.png', 'label': '观测站后勤处',
+                     'roi': [113, 400, 120, 67], 'tap': [172, 460]},
+        'reward':   {'tpl': 'OS_reward.png', 'label': '神谕谜题',
+                     'roi': [288, 507, 123, 122], 'tap': [349, 568]},
     },
+    # 奖励页进去还要点「一键领取」，见 claim_reward()
+    'claim': {'tpl': 'OS_claim.png', 'label': '一键领取', ...},
 }
 ```
 
 - `roi` 是 1280 口径 `[x,y,w,h]`：**只在这个框里认模板**（同名按钮在别的位
-  置也出现过，框外命中当没认到）。
+  置也出现过，框外命中当没认到）。OS 的六个入口绕成一圈、图标长得像，ROI
+  必须各自限死，否则会认到隔壁去。
 - `tap` 是识别不到时的兜底坐标；`offset` 是「认出来的中心不是该点的地方」
-  时的偏移（TL 的活动提示条：认的是下半截黄钻石行，要点的是上面那行文字）。
+  时的偏移（老 TL 的活动提示条就这么用：认的是下半截黄钻石行，要点上面那行字）。
 - `until` 过期**只提示不失效**（日志会写「标定于 X，活动改过版的话要重新标
-  定」）。`eventnav.active()` 只返回没过去的，给助手看。
+  定」）。
+- `closed`：活动结束后关卡分区没了（TL）。`run()` 会在导航**之前**就返回
+  「已经结束了，关卡入口关了——只能进活动商店」，别白跑一趟地图再报错。
+- `reprint`：复刻活动。前端快捷栏挂「复刻」标记并钉在悖论模拟后面；助手据此
+  在用户要刷 EX / S 时先问「要不要打突袭、去年打过吗」（见 `docs/agent.md`）。
+- `active()` 把 `closed` 的活动排到后面，所以「最新活动」落到正在开的那期
+  （OS），不会给已结束的 TL。
 
 **模板**放 `backend/core/navtpl/events/`（用户配置目录
-`config/navtpl/events/` 同名文件优先，升级不覆盖），**1920 口径原样抠**，
-红框往里缩 6~8px 别把红线抠进去，`find_card_bytes` 会按屏幕宽度缩放。
-加一条新活动的流程：用户给带红框的截图 + 步骤 → 抠模板 → 往 `ENTRIES` 加一项
-→ 冒烟 B44 会检查模板在不在、ROI 有没有互相抢。
+`config/navtpl/events/` 同名文件优先，升级不覆盖），**1920 口径**、红框往里缩
+6~12px 别把红线抠进去，`find_card_bytes` 会按屏幕宽度缩放。加一条新活动的
+流程：用户给带红框的截图 + 步骤 → **用 `adb exec-out screencap -p` 抓真机
+1920×1080 截图、按红框原位裁** → 往 `ENTRIES` 加一项 →
+冒烟 B44 / B51 会检查模板在不在、ROI 有没有互相抢。
+
+**模板必须从真机截图原位裁**（2026-11-22 血的教训）：模板只能用
+`adb exec-out screencap -p` 抓的 **1920×1080** 图，在图上按红框原位裁。
+以前 OS 这套是拿用户的窗口截图（1176×700，还含 28px 标题栏）去掉标题栏再
+×1.633 放大出来的——**在真机上一张都认不出**（entry 22 分、base 20 分、
+ex 16 分、s 12.5 分、reward 17.5 分、claim 21~23 分，全都压着阈值 12 过不去），
+表现就是「还是用老导航 / 一个节点都点不到」。窗口截图经过一次缩放再放大，
+字形和 UI 边缘的亚像素对不上，模板匹配对这点差异极其敏感。重裁后同一批
+模板全是 0~8 分。
+
+**活动提示条走「定点比对」，别整屏搜**（2026-11-22）：`entry` 那条横幅
+（`<雪山降临1101>活动已开放`）位置是钉死的，`_entry_here()` 按 `roi` 的左上角
+±6 像素逐像素比一次（步长必须是 1，隔一格就差十来分：805 对 10 分、804 对
+13 分、806 对 21 分）。**不能用 `find_card_bytes` 整屏搜**：它是一行 400×44
+的长条字，缩到 1/4 粗扫后笔画几乎没了，粗扫会锁到背景渐变的谷底上，精修只在
+冠军附近几十像素内找，回不来——实测同一帧定点比 10 分，整屏搜报 22 分、
+坐标跑到下面别的行上，日志就变成「点了六次终端大卡都看不到提示条」白等
+二十多秒。阈值 `_ENTRY_MAX = 16`（真命中 0~11 分，别的页面上同一片区域
+59 分以上）。
+
+**`find_card_bytes` 粗扫留前 3 名**（2026-11-22）：同样是上面那个「细长低对比
+模板在 1/4 尺度上失真」的问题，现在粗扫排序后取相互隔开「半个模板」的前 3 个
+候选各自精修，命中 `_EARLY_STOP` 就提前收工。真命中本来就 0~6 分，早停，不多
+花钱；只有「看着有点像但位置不对」的帧才多算两份。
+
 
 **「最新活动」怎么落到代号**：`eventnav.match_name` 认活动名 / 代号 /
 「最新活动、当期活动、新活动…」，`skills.norm_stage` 和助手工具
-`list_activities`（返回里的 `current`）都走它，所以助手不用猜 TL 是哪个活动。
+`list_activities`（返回里的 `current`）都走它，所以助手不用猜活动代号。
 
-**`tools` 是同一屏上的另外两个入口**：小游戏（战时新闻委员会）和活动商店
-（炮火所掩埋的）。它们和分区节点长在同一张活动地图上，但点进去不是关卡列表，
-所以单独列一格。`eventnav.run_tool(touch, 'minigame'|'shop')` 只负责把界面点
-到门口（`_to_map` 到活动地图 → 点节点），点完的画面校验是软的：商店/小游戏
-页面偏静态，`_moved` 硬判会误报，真正认页面的是后面的 MaaCore 任务。
+**`tools` 是同一屏上的其他入口**：小游戏、活动商店、活动奖励。它们和分区节点
+长在同一张地图上，但点进去不是关卡列表，所以单独列一格。
+`eventnav.run_tool(touch, 'minigame'|'shop'|'reward')` 只负责把界面点到门口
+（`_to_map` 到活动地图 → 点节点），点完的画面校验是软的：商店/小游戏页面偏
+静态，`_moved` 硬判会误报，真正认页面的是后面的 MaaCore 任务。
+活动奖励页要自己领：`eventnav.claim_reward(touch, 'OS')` 进奖励页后点「一键
+领取」（`claim` 那格模板），已经领完时按钮还在，点了没反应也不报错。
+2026-11-22 起这层包成了 skill：`skills.skill_claim` / 助手工具 `skill_claim`
+（见上面「④ 领奖 skill」）。
 
 ## MAA 小工具（牛杂，`maatools.py`，2026-11-19）
 
@@ -670,13 +941,20 @@ MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列�
 认：它们都是 `Custom` 任务。对着 asst.log 试出来的两种参数：
 
 ```python
-# 战时新闻委员会（活动小游戏）
+# 战时新闻委员会（TL 的活动小游戏）
 {"task_names": ["MiniGame@WartimePressCommittee@Begin"]}
+
+# 喀兰贸易技术研发部（OS 的活动小游戏，2026-11-22 加）
+{"task_names": ["MiniGame@OS@Begin"]}
 
 # 活动商店
 {"task_names": ["SS@Store@Begin"],
  "params": {"event_shop": {"blacklist": ["数据增补条", "数据增补", "龙门币", "家具零件"]}}}
 ```
+
+> 任务名是从 MaaCore 二进制里 grep 出来的（`MiniGame@OS@Begin` /
+> `MiniGame@WartimePressCommittee@Begin` 都在），不是猜的。以后再加小游戏，
+> 先 `grep -a 'MiniGame@' MaaCore.dll` 找名字，再进 `maatools.TOOLS`。
 
 黑名单的三个坑（都实测过，别改）：
 
@@ -699,9 +977,20 @@ MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列�
 个节点。`run_custom` 每 10 秒看一次「多久没新事件」，超过 120 秒就把
 `spec['tutorial']` 那句话打进日志 —— 用户才知道要手动过一遍教程再挂。
 
-**入口**：`skill_tool({'name': 'wartime_press'|'event_shop', 'account': ...,
-'blacklist': [...]})`，助手工具同名。导航和 MAA 都跑在同一个后台任务里，
-`tid` 透传给 `run_custom`，日志落在同一条任务上。
+**入口**：`skill_tool({'name': 'wartime_press'|'os_rd'|'event_shop',
+'account': ..., 'blacklist': [...]})`，助手工具同名。导航和 MAA 都跑在同一个
+后台任务里，`tid` 透传给 `run_custom`，日志落在同一条任务上。
+
+**`prefix` 与「小游戏」这个泛称**（2026-11-22 加）：每一项可以带
+`'prefix': 'OS'` 表示「它只在 OS 的活动地图上」。于是有两个用法：
+
+- `name='喀兰贸易技术研发部'` / `'os小游戏'` → 直接选中 `os_rd`，导航用
+  `ent['prefix']` 去 OS 的地图，不会跑到当期活动上瞎找；
+- `name='小游戏'`（`_GENERIC` 里的泛称）→ 按 `prefix` 在那个活动下挑；不传
+  `prefix` 而小游戏不止一个时**报错并列出候选**（「「小游戏」里有好几个小游戏，
+  要哪一个：…」），不做默认猜测。
+
+`describe()` 也把 `prefix` 带出去，前端 / 助手能看出这一项属于哪期活动。
 
 
 ## 培养干员 skill（`train`，2026-11-18）

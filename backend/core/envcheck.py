@@ -138,20 +138,24 @@ def _ld_instance_up(emu_dir, index):
 
 
 # ---------------------------------------------------------------- 读配置
-def read_config():
-    """收集连接参数。读不到 MAA 配置时返回空壳，调用方据此跳过检查。"""
+def read_config(maa_dir=None, profile=None):
+    """收集连接参数。读不到 MAA 配置时返回空壳，调用方据此跳过检查。
+
+    多开时每个账号绑的是不同 MAA（也往往连不同模拟器），所以这里能指定
+    看哪一份 MAA 配置——不指定就看全局默认那份。
+    """
     out = {'adb': '', 'address': '', 'kind': '', 'emu_dir': '', 'index': 0,
            'name': '', 'source': ''}
 
     # 1) MAA 的 gui.new.json
     try:
         from . import maa
-        cfg = maa._load_cfg()
+        cfg = maa._load_cfg(maa_dir or None)
     except Exception:                           # noqa: BLE001 配置缺失不算错
         cfg = None
     if cfg:
         configs = cfg.get('Configurations') or {}
-        name = cfg.get('Current') or ''
+        name = profile or cfg.get('Current') or ''
         conf = (configs.get(name)
                 or (next(iter(configs.values())) if configs else {}) or {})
         cs = ((conf.get('Gui') or {}).get('ConnectSettings') or {})
@@ -301,15 +305,26 @@ def wait_ready(cfg, timeout=WAIT_DEFAULT, log=None, quiet_until=8.0):
 
 
 # ---------------------------------------------------------------- 对外
-def ensure(log=None, wait=None):
+def ensure(log=None, wait=None, maa_dir=None, profile=None, address=None):
     """开跑前确认环境，返回 ``(ok, 说明)``
 
     一切正常时**一行日志都不写**（用户要的是「别显示出来」，只在他没开
     模拟器的时候提示并代劳）。返回 False 时调用方应当直接停任务——连不上
     设备还往下跑，只会在几十秒后报一句更难懂的「找不到关卡」。
+
+    ``maa_dir`` / ``profile`` 指定看哪份 MAA 配置（多开时每个账号一份）。
+    ``address`` 是多开时点名的模拟器地址：只查这一台在不在线，不在就直说，
+    **不会**去启动档案里那台（启动错了等于让两组抢同一台设备）。
     """
     log = log or (lambda *_: None)
-    cfg = read_config()
+    cfg = read_config(maa_dir, profile)
+    if address:
+        devs = _devices(cfg['adb']) or {}
+        if devs.get(address) == 'device':
+            return True, 'adb 正常（%s）' % address
+        live = [a for a, s in devs.items() if s == 'device']
+        return False, ('指定的模拟器「%s」没在线（现在在线：%s）。'
+                       '先把它开起来再重跑' % (address, '、'.join(live) or '无'))
     if not cfg['adb'] and not cfg['emu_dir']:
         return True, '没读到 MAA 配置，跳过环境检查'
     if not _KINDS.get(cfg['kind']) and not cfg['emu_dir']:
