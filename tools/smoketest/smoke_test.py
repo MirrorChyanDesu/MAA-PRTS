@@ -3670,7 +3670,7 @@ def check_oper_train(tmp):
 
     # 6) 战斗过程要有日志：编队 / 部署 / 开技能各一条，重复的部署不刷屏
     out = []
-    st2 = {'actions': {}, 'deployed': []}
+    st2 = {'actions': {}, 'deployed': {}}
     for ev in ({'kind': 'extra', 'what': 'BattleFormation',
                 'data': {'formation': ['银灰', '泥岩']}},
                {'kind': 'extra', 'what': 'CopilotAction',
@@ -3680,7 +3680,8 @@ def check_oper_train(tmp):
                {'kind': 'extra', 'what': 'CopilotAction',
                 'data': {'action': 'UseSkill'}}):
         maaplan._on_core_event(ev, out.append, 't', st2)
-    assert out == ['编队：银灰、泥岩', '部署 银灰', '开技能'], out
+    assert out == ['[银灰, 泥岩]', '当前步骤: 部署 银灰',
+                   '当前步骤: 使用技能'], out
     # Output / SkillUsage 这类内部记账不该把英文原文写进面板
     out = []
     maaplan._on_core_event({'kind': 'extra', 'what': 'CopilotAction',
@@ -3700,7 +3701,7 @@ def check_oper_train(tmp):
         ({'first': ['Copilot@FullStageNavigation'], 'taskchain': 'Copilot'}, '找关卡'),
         ({'first': ['Copilot@StageNavigationSlowlySwipeLeft'],
           'taskchain': 'Copilot'}, '滑动找关卡'),
-        ({'first': ['BattleStartAll'], 'taskchain': 'Copilot'}, '开始行动'),
+        ({'first': ['BattleStartAll'], 'taskchain': 'Copilot'}, '已开始行动'),
         ({'first': ['BattleQuickFormation'], 'taskchain': 'Copilot'}, '快速编队'),
         ({'first': ['UseMedicine'], 'taskchain': 'Fight'}, '吃理智药'),
         ({'first': ['OperProgress@EliteUp'], 'taskchain': 'OperProgress'}, '精英化'),
@@ -3710,7 +3711,7 @@ def check_oper_train(tmp):
         assert ev and ev.get('kind') == 'node', (d, ev)
         out = []
         maaplan._on_core_event(ev, out.append, 't', {'nodes': {}})
-        assert out == ['· ' + want], (d, out)
+        assert out == [want], (d, out)   # MAA 面板里阶段就是单独一行，没有前缀
     # 插件类名节点（不是用户能看懂的阶段）静默
     ev = eng._translate(maacore.MSG_SUBTASK_START,
                         {'first': ['BattleProcessTask'], 'taskchain': 'Copilot'})
@@ -3931,7 +3932,9 @@ def check_raid_order(tmp):
     「普通 → 突袭」两条，用户看到的就是白打一次普通。
 
     这里钉六件事：
-    ① 默认 raid='auto'：有突袭作业的关**只排突袭**一条；
+    ① 默认 raid='auto'：**只排普通**（2026-11-23 改，原先是只排突袭——
+       用户说「挂 1 到 5 普通」却被排成突袭，第二关缺干员卡死 20 分钟）；
+       显式 raid='raid' 才只排突袭；
     ② raid='both'：普通 → 突袭两条，顺序不能反；
     ③ raid=False / 'normal'：只排普通；
     ④ stages 支持 @raid / @both / @normal 逐关覆盖（agent 承诺的
@@ -3976,8 +3979,12 @@ def check_raid_order(tmp):
         rows, _retry = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '',
                                           logs.append)
         seq = [(r['stage_name'], r['is_raid']) for r in rows]
-        # ① 默认只打突袭——不再先刷一遍普通
-        assert seq == [('SV-EX-1', True), ('SV-EX-2', True)], seq
+        # ① 默认只打普通：没明说难度就不许替用户升级到突袭
+        assert seq == [('SV-EX-1', False), ('SV-EX-2', False)], seq
+
+        # ①b 显式 raid='raid' 才只排突袭
+        rows_r, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='raid')
+        assert [(r['stage_name'], r['is_raid']) for r in rows_r] == [('SV-EX-1', True)]
 
         # ② both：普通 → 突袭两条，顺序不能反
         rows_b, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='both')
@@ -4123,7 +4130,7 @@ def check_agent_tool_chain(tmp):
     try:
         logs = []
         rows, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append,
-                                      fixed={'SV-EX-1': 98765})
+                                      fixed={'SV-EX-1': 98765}, raid='raid')
         assert hits['search'] == 0, '指名作业后不许再搜作业站'
         assert rows[0]['filename'].endswith('98765.json'), rows
         assert rows[0]['is_raid'] is True, rows
@@ -4204,6 +4211,9 @@ def check_battle_retry(tmp):
     old = (copilot.fetch_prepared, skills._default_maa_dir)
     copilot.fetch_prepared = fake_fetch
     skills._default_maa_dir = lambda: tmp
+    old_leave = maaplan._leave_result
+    # 这一段只关心「排了哪几份作业」；离开结算页的真实行为由 B56 ⑧ 用假 Touch 测
+    maaplan._leave_result = lambda *a, **k: True
     try:
         eng = Eng()
         # 只记了「卡在 SV-EX-2」这一条失败（没有逐关成功记录）
@@ -4223,6 +4233,8 @@ def check_battle_retry(tmp):
         logs3 = []
         swapped, mark = maaplan._retry_failed(eng, spec, state, logs3.append,
                                               tmp, time.time() + 600)
+        # 换到候选 #202 就重排一次；桩里这一轮的链是 ok，所以按「没再报失败
+        # 就收手」直接结束——不会把刚打完的关再排一遍。
         assert len(eng.appended) == 1, eng.appended
         rows = eng.appended[0][1]['copilot_list']
         assert [r['stage_name'] for r in rows] == ['SV-EX-2'], rows
@@ -4231,8 +4243,33 @@ def check_battle_retry(tmp):
         assert mark is not None, '重试过就要给收尾一个 chains 分界'
         assert any('换作业重挂：SV-EX-2' in x for x in logs3), logs3
         assert not any('SV-EX-1' in x for x in logs3), '卡住之前的关不该重挂'
+
+        # 候选用完又翻车：同一份再试一次（用户 2026-11-22：「翻车后 agent 要
+        # 帮我重新挂」，不能因为没别的作业就把后面几关一起丢下）
+        class EngBad(Eng):
+            def append(self, typ, params):
+                super().append(typ, params)
+                self.chains[-1]['ok'] = False      # 这一轮又翻车
+
+        eng2 = EngBad()
+        state2 = {'stage': 'SV-EX-2',
+                  'results': [{'stage': 'SV-EX-2', 'ok': False, 'why': '三星',
+                               'at': 0, 'cid': 102}],
+                  'tried': {'SV-EX-2@raid': 102},
+                  'by_file': {}, 'cid_of': {}, 'last_log': 0}
+        logs4 = []
+        maaplan._retry_failed(eng2, {'copilotList': spec['copilotList']},
+                              state2, logs4.append, tmp, time.time() + 600)
+        assert len(eng2.appended) == 1, eng2.appended
+        same_rows = eng2.appended[0][1]['copilot_list']
+        assert same_rows[0]['filename'].endswith('_102.json'), same_rows
+        assert any('同一份' in x for x in logs4), logs4
+        # 同一份只补试一次；再失败就跳过这关（不死循环）
+        assert state2.get('same_retry') == ['SV-EX-2@raid'], state2.get('same_retry')
+        assert any('跳过 SV-EX-2' in x for x in logs4), logs4
     finally:
         copilot.fetch_prepared, skills._default_maa_dir = old
+        maaplan._leave_result = old_leave
 
     # ④ 分段扫图：普通 → EX 普通 → EX 突袭 → S
     old_res = resources.resolve
@@ -4271,7 +4308,7 @@ def check_event_nav(tmp):
     _reset_config(tmp)
     import datetime
 
-    from core import eventnav, maaplan, skills, stagenav
+    from core import eventnav, maaplan, pages, skills, stagenav
 
     # ① 有效期
     assert eventnav.has('OS-EX-1') and not eventnav.has('SV-EX-1')
@@ -4322,6 +4359,10 @@ def check_event_nav(tmp):
     assert ok and called == ['TL-EX-1'], (ok, called)
 
     # ⑤ 重挂前点结算页 → 回到关卡列表
+    # 2026-11-22 用户补的口径：「在失败界面重新挂作业是不会成功的，需要在关卡
+    # 菜单界面重挂」。所以这里桩「结算页判据」：第一帧认得出 → 必须点一下；
+    # 点完不再是结算页且 probe 说是关卡列表 → 放行。真实的标题模板在 B56 ⑧
+    # 用合成帧验，这里只验流程。
     taps = []
 
     class Touch:
@@ -4339,6 +4380,16 @@ def check_event_nav(tmp):
             taps.append((x, y))
             return True
 
+        def tap_px(self, x, y):
+            taps.append((x, y))
+            return True
+
+        def back(self):
+            return True
+
+        def esc(self):
+            return True
+
     class FakeTime:
         @staticmethod
         def sleep(_s):
@@ -4348,7 +4399,8 @@ def check_event_nav(tmp):
         def time():
             return 0.0
 
-    old = (stagenav.Touch, stagenav.probe, stagenav._moved, maaplan.time)
+    old = (stagenav.Touch, stagenav.probe, stagenav.probe_bytes,
+           stagenav._moved, maaplan.time, pages.to_home)
     stagenav.Touch = Touch
     stagenav._moved = lambda a, b, thr=3.0: False      # 画面不动 = 点完了
     maaplan.time = FakeTime
@@ -4357,24 +4409,29 @@ def check_event_nav(tmp):
     maaplan._navigate = lambda conn, st, log, client=None: (
         naved.append(st) or (True, 'ok'))
     try:
-        stagenav.probe = lambda t: 'map'
+        stagenav.probe_bytes = lambda d: 'map'
         ok = maaplan._leave_result({'adb_path': 'adb', 'address': 'x'},
                                    {'clientType': 'Official'}, 'TL-EX-1',
                                    talk.append)
         assert ok, talk
-        assert taps and taps[0] == maaplan._RESULT_TAP, (taps, maaplan._RESULT_TAP)
-        assert any('点回到关卡列表' in x for x in talk), talk
+        # 第一帧不判（结算页底部也暗，probe 会误判成地图），必须先点一下
+        assert len(taps) == 1, taps
+        assert taps[0] == maaplan._RESULT_TAP, (taps, maaplan._RESULT_TAP)
+        assert any('已回到活动关卡界面' in x for x in talk), talk
         assert not naved, '已经在关卡列表就不该再导航'
-        # 点完不在关卡列表（例如停在主题页）：退回重新导航
+        # 点完还不在关卡界面（例如停在主题页）：点满 3 次后回主页重新导航
         taps.clear()
-        stagenav.probe = lambda t: 'theme'
+        stagenav.probe_bytes = lambda d: 'theme'
+        pages.to_home = lambda *a, **k: True
         ok2 = maaplan._leave_result({'adb_path': 'adb', 'address': 'x'},
                                     {'clientType': 'Official'}, 'TL-EX-1',
                                     talk.append)
         assert ok2 and naved == ['TL-EX-1'], (ok2, naved)
+        assert len(taps) == 3, taps
+        assert any('还不在活动关卡界面' in x for x in talk), talk
     finally:
-        (stagenav.Touch, stagenav.probe, stagenav._moved,
-         maaplan.time) = old
+        (stagenav.Touch, stagenav.probe, stagenav.probe_bytes,
+         stagenav._moved, maaplan.time, pages.to_home) = old
         maaplan._navigate = old_nav
 
     # ⑥ 名单核对：用户点名之外的关剔掉，缺的要点名
@@ -4445,7 +4502,7 @@ def check_stage_infer(tmp):
     cp.search = fake_search
     try:
         logs = []
-        picks, pool = skills._select_ops(['TL-S-3'], '', logs.append, raid='auto')
+        picks, pool = skills._select_ops(['TL-S-3'], '', logs.append, raid='raid')
         assert picks == [{'copilotId': 12, 'stageCode': 'TL-S-3',
                           'variant': 'raid'}], picks
         assert any('缺干员' in x for x in logs), logs
@@ -5744,6 +5801,756 @@ def check_task_log_isolation(tmp):
     assert '--skill-worker' in src and 'skillworker' in src
 
 
+def check_pages_skills_logs(tmp):
+    """B56：页面识别 + 基建确认框 + 多账号默认导航 + MAA 风格日志
+
+    2026-11-22 用户报的四件事：
+      ① 判断不出游戏停在哪（主页/设置页/基建确认框都分不清）
+      ② 多账号时「已经在关卡列表」以外的场景都要走导航
+      ③ 日志不像 MAA（缺「选择干员 / 当前步骤 / 每关完成」）
+      ④ skill 架构太散，加一个要改好几处
+
+    这里全用合成图 + 假 Touch，不碰真机、不连模拟器。
+    """
+    _reset_config(tmp)
+    from core import copilot, pages, skills, maaplan, stagenav
+
+    # ---- ① 主页识别：齿轮 + 邮件同时命中才算（设置页只有齿轮） ----
+    gear = os.path.join(pages._TPL_DIR, 'home_gear.png')
+    mail = os.path.join(pages._TPL_DIR, 'home_mail.png')
+    assert os.path.isfile(gear) and os.path.isfile(mail)
+
+    def compose(items, size=(1920, 1080), bg=(58, 62, 74)):
+        from PIL import Image
+        im = Image.new('RGB', size, bg)
+        for p, xy in items:
+            im.paste(Image.open(p).convert('RGB'), xy)
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    home = compose([(gear, (20, 4)), (mail, (160, 4))])
+    only_gear = compose([(gear, (20, 4))])
+    only_mail = compose([(mail, (160, 4))])
+    assert pages.is_home_bytes(home), '两个图标都在还不认主页'
+    assert not pages.is_home_bytes(only_gear), '只认到齿轮就当主页（设置页会误判）'
+    assert not pages.is_home_bytes(only_mail), only_mail
+    assert pages.has_templates()
+
+    # ---- ② 基建退出确认框：左「✕」右「✓」两个白圆钮同时定点命中 ----
+    ok_btn = os.path.join(pages._TPL_DIR, 'confirm_ok.png')
+    cancel_btn = os.path.join(pages._TPL_DIR, 'confirm_cancel.png')
+    assert os.path.isfile(ok_btn) and os.path.isfile(cancel_btn)
+
+    def compose_confirm(icons):
+        """按模板自带的相对坐标贴回去，造一张「就是这个弹窗」的帧"""
+        from PIL import Image
+        im = Image.new('RGB', (1920, 1080), (44, 20, 22))
+        for name, (fx, fy) in icons:
+            t = Image.open(os.path.join(pages._TPL_DIR, name)).convert('RGB')
+            im.paste(t, (int(1920 * fx) - t.width // 2,
+                         int(1080 * fy) - t.height // 2))
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    confirm = compose_confirm(pages._CONFIRM_ICONS)
+    pt = pages.confirm_leave_bytes(confirm)
+    assert pt, '两个圆钮都在还不认基建确认框'
+    assert abs(pt[0] - round(1920 * pages._CONFIRM_TAP[0])) <= 3, pt
+    assert abs(pt[1] - round(1080 * pages._CONFIRM_TAP[1])) <= 3, pt
+
+    assert pages.confirm_leave_bytes(
+        compose_confirm(pages._CONFIRM_ICONS[:1])) is None, '只有一个圆钮就认了'
+    assert pages.confirm_leave_bytes(home) is None, '主页被当成基建确认框'
+
+    # 老坑回归：一整块红色（关卡列表 / 主页红角标那种）绝不能当确认框。
+    # 2026-11-22 真机就是从关卡列表误判过一次，日志里冒出假弹窗。
+    from PIL import Image, ImageDraw
+    red = Image.new('RGB', (1920, 1080), (40, 44, 52))
+    ImageDraw.Draw(red).rectangle([960, 700, 1919, 770], fill=(150, 30, 35))
+    buf = io.BytesIO()
+    red.save(buf, 'PNG')
+    assert pages.confirm_leave_bytes(buf.getvalue()) is None, '整块红色被当成确认框'
+
+    # 兜底路径（打包漏模板时走色彩签名）也要能用
+    bar = Image.new('RGB', (1920, 1080), (120, 120, 120))
+    dr = ImageDraw.Draw(bar)
+    dr.rectangle([0, 682, 959, 800], fill=(30, 30, 30))
+    dr.rectangle([960, 682, 1919, 800], fill=(120, 30, 34))
+    buf = io.BytesIO()
+    bar.save(buf, 'PNG')
+    fb = pages._bar_bytes(buf.getvalue())
+    assert fb and 960 < fb[0] < 1919 and 700 < fb[1] < 790, fb
+    assert pages._bar_bytes(home) is None, '主页触发了兜底签名'
+
+    # ---- ③ to_home：认到主页就停手，先按返回；确认框要点红条不是按返回 ----
+    class FakeTouch:
+        def __init__(self, frames):
+            self.frames = frames
+            self.i = 0
+            self.backs = 0
+            self.taps = []
+
+        def shot(self):
+            return self.frames[min(self.i, len(self.frames) - 1)]
+
+        def back(self):
+            self.backs += 1
+            self.i += 1
+
+        def esc(self):
+            self.i += 1
+
+        def tap(self, *a):
+            self.taps.append(a)
+
+        def tap_px(self, *a):
+            self.taps.append(a)
+            self.i += 1
+
+        def heal(self):
+            pass
+
+    t = FakeTouch([only_gear, home])
+    assert pages.to_home(t, lambda *_: None)
+    assert t.backs == 1, ('认到主页后还在按返回', t.backs)
+
+    t2 = FakeTouch([confirm, home])
+    assert pages.to_home(t2, lambda *_: None)
+    assert t2.backs == 0 and len(t2.taps) == 1, (t2.backs, t2.taps)
+    assert abs(t2.taps[0][0] - round(1920 * pages._CONFIRM_TAP[0])) <= 3, t2.taps
+
+    # ---- ④ 多账号默认走导航（两种例外才直跑） ----
+    one = skills._nav_first([('fight', {'stages': ['1-7']})], False)[0][1]
+    assert not one.get('wakeup'), '单个号不该被强制唤醒'
+    many = skills._nav_first([('fight', {'stages': ['1-7']})], True)[0][1]
+    assert many.get('wakeup') and many.get('navigate'), many
+    for flag in ('assumeStageList', 'noSwitch'):
+        keep = skills._nav_first(
+            [('fight', {'stages': ['1-7'], flag: True})], True)[0][1]
+        assert not keep.get('wakeup'), (flag, keep)
+
+    # ---- ⑤ 注册表：装饰器登记的都在 SKILLS；别名/环境闸自动派生 ----
+    assert 'claim' in skills.SKILLS and 'claim' in skills._NEEDS_GAME
+    assert 'signin' not in skills._NEEDS_GAME, '签到不该要求开模拟器'
+    assert skills.ALIASES.get('扫图') == 'sweep'
+    assert [n for n, _ in skills._norm_steps([{'skill': '扫图', 'stage': 'OS'}])] \
+        == ['sweep']
+
+    # ---- ⑥ MAA 风格日志：编队 / 选干员 / 当前步骤 / 换关即上一关完成 ----
+    logs = []
+    state = {'stage': '', 'trail': [], 'nodes': {}, 'deployed': {},
+             'actions': {}, 'by_file': {}}
+
+    def ev(what, data):
+        maaplan._on_core_event({'kind': 'extra', 'what': what, 'data': data},
+                               logs.append, None, state)
+
+    ev('BattleFormation', {'formation': ['芬', '斑点', '黑角']})
+    assert '[芬, 斑点, 黑角]' in logs, logs
+    ev('BattleFormationSelected', {'selected': '芬'})
+    assert '选择干员: 芬' in logs, logs
+    ev('CopilotAction', {'action': 'SwitchSpeed'})
+    assert '当前步骤: 切换倍速' in logs, logs
+    ev('CopilotAction', {'action': 'Deploy', 'target': '黑角'})
+    assert '当前步骤: 部署 黑角' in logs, logs
+    ev('CopilotAction', {'action': 'SkillDaemon'})
+    assert '当前步骤: 开始挂机' in logs, logs
+
+    state['stage'] = 'OS-1'
+    ev('CopilotListLoadTaskFileSuccess', {'file_name': 'OS-2_123.json'})
+    assert '✓ OS-1 完成' in logs, logs
+    assert state['stage'] == 'OS-2', state
+
+    # ---- ⑤ 回调码：MaaCore 5.x/6.x 的子任务是 20000 段 ----
+    # 这一段是 2026-11-22 用户报「战斗日志没有 MAA 那种提示」的真凶：代码里
+    # 一直写着 4.x 的 70001/70003，于是任务链级照常显示、逐条步骤全被丢掉。
+    from core import maacore
+    assert maacore.MSG_SUBTASK_START == 20001, maacore.MSG_SUBTASK_START
+    assert maacore.MSG_SUBTASK_COMPLETED == 20002
+    assert maacore.MSG_SUBTASK_EXTRA == 20003
+    assert maacore.MSG_SUBTASK_ERROR == 20000
+    eng = maacore.Engine.__new__(maacore.Engine)    # 不加载核心，只验翻译层
+
+    node = eng._translate(maacore.MSG_SUBTASK_START,
+                          {'taskchain': 'Copilot', 'first': ['Copilot@BattleStartPre']})
+    assert node and node['kind'] == 'node' and node['sub'] == 'Copilot@BattleStartPre', node
+    assert maaplan._subtask_label(node['sub']) == '开始编队'
+    old = eng._translate(70001, {'taskchain': 'Copilot', 'first': ['BattleStartAll']})
+    assert old and old['sub'] == 'Copilot@BattleStartAll', old
+    ext = eng._translate(maacore.MSG_SUBTASK_EXTRA,
+                         {'taskchain': 'Copilot', 'what': 'CopilotAction',
+                          'details': {'action': 'Deploy', 'target': '芬'}})
+    assert ext and ext['kind'] == 'extra' and ext['what'] == 'CopilotAction', ext
+    assert eng._translate(70003, {'taskchain': 'Copilot', 'what': 'BattleFormation',
+                                  'details': {'formation': ['芬']}})
+
+    serr = eng._translate(maacore.MSG_SUBTASK_ERROR,
+                          {'taskchain': 'Copilot', 'first': ['Copilot@WaitUntilEndOfAction']})
+    assert serr and serr['kind'] == 'sub_error', serr
+    slogs = []
+    maaplan._on_core_event(serr, slogs.append, None, {})
+    assert any('不是三星' in x for x in slogs), slogs
+
+    # ---- ⑤b 编队缺干员：MaaCore 发 SubTaskError(OperatorMissing)
+    #      + **TaskChainStopped**（不是 Error）。2026-11-23 用户排 5 关普通，
+    #      实际排成突袭，第二关缺「圣聆初雪」就这么停住；旧代码把 Stopped
+    #      一律当 ok=True，run_scatter 于是报「超时 1200 秒」骗了 20 分钟。
+    eng.chains, eng.errors, eng._sub_why = [], [], ''
+    eng._chain_starts = 0
+    serr2 = eng._translate(maacore.MSG_SUBTASK_ERROR,
+                           {'taskchain': 'Copilot', 'subtask': 'BattleFormationTask',
+                            'why': 'OperatorMissing',
+                            'details': {'opers': {'圣聆初雪': [{'name': '圣聆初雪'}]}}})
+    assert serr2['why'] == 'OperatorMissing', serr2
+    assert serr2['opers'] == ['圣聆初雪'], serr2
+    slogs2 = []
+    st2 = {}
+    maaplan._on_core_event(serr2, slogs2.append, None, st2)
+    assert any('缺干员：圣聆初雪' in x for x in slogs2), slogs2
+    assert st2['last_sub_opers'] == ['圣聆初雪'], st2
+    stop = eng._translate(maacore.MSG_TASK_STOPPED, {'taskchain': 'Copilot'})
+    assert stop and stop['kind'] == 'chain_failed', stop
+    assert eng.chains[-1]['ok'] is False, eng.chains
+    assert eng.chains[-1]['why'] == 'OperatorMissing', eng.chains
+    assert maacore.why_cn('OperatorMissing') == '编队缺干员'
+    # 正常的 Stop（次数打满 / 理智不足 / 用户按停止）仍然算成功
+    stop2 = eng._translate(maacore.MSG_TASK_STOPPED, {'taskchain': 'Copilot'})
+    assert stop2['kind'] == 'chain_stop', stop2
+    assert eng.chains[-1]['ok'] is True, eng.chains
+    # 新任务链开始要清掉上一链的残留 why，别让下一关背锅
+    eng._translate(maacore.MSG_SUBTASK_ERROR,
+                   {'taskchain': 'Copilot', 'why': 'OperatorMissing'})
+    eng._translate(maacore.MSG_TASK_START, {'taskchain': 'Copilot'})
+    stop3 = eng._translate(maacore.MSG_TASK_STOPPED, {'taskchain': 'Copilot'})
+    assert stop3['kind'] == 'chain_stop', stop3
+    # 装置占位那条 ERR 要翻成人话，别让用户以为程序坏了
+    from core import maalog
+    human = maalog._humanize('asst::BattleProcessTask::to_group Group not found'
+                             ' in combat data:  雪崩触发装置')
+    assert '雪崩触发装置' in human and '不影响打' in human, human
+
+    # ---- ⑥ 练度修正是顺手补的，不再写进修正说明 ----
+    from core import copilot as cpl
+    notes = []
+    op = {'name': '维什戴尔', 'skill': 1, 'requirements': {'skill_level': 8}}
+    cpl._fix_oper(op, {'维什戴尔': (6, 'char_113_cqbw')}, notes)
+    assert op['requirements']['elite'] == 2, op
+    assert not any('精英' in n for n in notes), notes
+    notes = []
+    bare = {'name': '某某', 'skill': 2}
+    cpl._fix_oper(bare, {'某某': (4, 'char_x')}, notes)
+    assert bare['requirements'] == {'elite': 1}, bare
+    assert not notes, notes
+    # ---- ⑦ 翻车重挂：只换翻车那关，后面的关照原样（2026-11-22 用户口径）----
+    # 「更换作业集（只改那关，其他不变，帮我重新挂），然后任务继续」
+
+    class Eng2:
+        def __init__(self):
+            self.appended, self.chains = [], []
+
+        def append(self, typ, params):
+            self.appended.append((typ, params))
+            self.chains.append({'chain': typ, 'ok': True, 'stopped': False})
+
+        def start(self):
+            return True
+
+        def running(self):
+            return False
+
+        def wait(self, timeout=0, poll=0.5):
+            return True
+
+        def stop(self):
+            pass
+
+    def fake_fetch2(cid):
+        cid = int(cid)
+        code = {301: 'OS-6', 401: 'OS-6', 302: 'OS-7', 303: 'OS-8'}.get(cid, 'OS-9')
+        return ({'stage_name': code}, copilot.DIFF_NORMAL, code, [], True)
+
+    old = (copilot.fetch_prepared, skills._default_maa_dir)
+    copilot.fetch_prepared = fake_fetch2
+    skills._default_maa_dir = lambda: tmp
+    old_leave = maaplan._leave_result
+    maaplan._leave_result = lambda *a, **k: True   # 界面点击由 ⑧ 单独测
+    try:
+        eng = Eng2()
+        st = {'stage': 'OS-6',
+              'results': [{'stage': 'OS-6', 'ok': False, 'why': '三星',
+                           'at': 0, 'cid': 301}],
+              'tried': {'OS-6@normal': 301, 'OS-7@normal': 302},
+              'by_file': {}, 'cid_of': {}, 'last_log': 0}
+        spec = {'copilotList': [
+                    {'filename': 'OS-6_301.json', 'stage_name': 'OS-6'},
+                    {'filename': 'OS-7_302.json', 'stage_name': 'OS-7'},
+                    {'filename': 'OS-8_303.json', 'stage_name': 'OS-8'}],
+                'retry': {'maxRounds': 2,
+                          'pool': {'OS-6@normal': [301, 401],
+                                   'OS-7@normal': [302, 402]}}}
+        logs = []
+        maaplan._retry_failed(eng, spec, st, logs.append, tmp, time.time() + 600)
+        first = eng.appended[0][1]['copilot_list']
+        assert [r['stage_name'] for r in first] == ['OS-6', 'OS-7', 'OS-8'], first
+        assert first[0]['filename'].endswith('_401.json'), '翻车那关要换作业'
+        assert first[1]['filename'].endswith('_302.json'), '没打的关不许换作业'
+        assert first[2]['filename'].endswith('_303.json'), first
+        assert any('换作业重挂：OS-6' in x for x in logs), logs
+        assert any('回关卡界面' in x for x in logs), logs
+
+        # 没有候选也要重挂：同一份再试一次，不许翻车后什么都不做
+        eng2 = Eng2()
+        st2 = {'stage': 'OS-6',
+               'results': [{'stage': 'OS-6', 'ok': False, 'why': '',
+                            'at': 0, 'cid': 301}],
+               'tried': {'OS-6@normal': 301}, 'by_file': {}, 'cid_of': {},
+               'last_log': 0}
+        logs2 = []
+        maaplan._retry_failed(eng2, {'copilotList': spec['copilotList']},
+                              st2, logs2.append, tmp, time.time() + 600)
+        assert eng2.appended, '没有 retry 字段也必须重挂一次'
+        rows2 = eng2.appended[0][1]['copilot_list']
+        assert rows2[0]['filename'].endswith('_301.json'), rows2
+        assert any('同一份' in x for x in logs2), logs2
+        assert 'OS-6@normal' in (st2.get('same_retry') or []), st2.get('same_retry')
+
+        # 理智不够这类翻车重挂也没用，别烧时间
+        eng3 = Eng2()
+        st3 = {'results': [{'stage': 'OS-6', 'ok': False, 'why': '理智不够',
+                            'at': 0, 'cid': 301}]}
+        sw3, mk3 = maaplan._retry_failed(eng3, {'copilotList': spec['copilotList']},
+                                         st3, lambda *_: None, tmp,
+                                         time.time() + 600)
+        assert (sw3, mk3) == ([], None) and not eng3.appended
+
+        # 重挂成功（换到下一关）要在 results 里记 ok，否则下一轮还会再挂
+        st4 = {'stage': 'OS-6', 'cur_cid': 301, 'trail': [], 'nodes': {},
+               'by_file': {}, 'cid_of': {}, 'results': []}
+        maaplan._on_core_event(
+            {'kind': 'extra', 'chain': 'Copilot',
+             'what': 'CopilotListLoadTaskFileSuccess',
+             'data': {'file_name': 'OS-7_302.json', 'stage_name': 'OS-7'}},
+            lambda *_: None, None, st4)
+        assert any(r.get('ok') and r.get('stage') == 'OS-6'
+                   for r in st4['results']), st4['results']
+        assert st4['stage'] == 'OS-7', st4['stage']
+    finally:
+        copilot.fetch_prepared, skills._default_maa_dir = old
+        maaplan._leave_result = old_leave
+    # ---- ⑧ 翻车后回活动关卡界面：失败只认 MAA 回调 ----
+    # 用户 2026-11-22 两句原话：
+    #   「失败识别应该以 maa 的失败通知为准，而不是自己识别有没有失败」
+    #   「失败后点击屏幕任何位置都能立即返回关卡界面，重新运行作业集，
+    #     甚至不需要写导航」
+    # 所以结算页那套自识别（先两颗亮星、后来「行动结束」标题）整个删掉了：
+    # 失败由 TaskChainError / 子任务失败决定，界面只做「点一下 → 看是不是
+    # 活动关卡地图」。
+    assert not hasattr(pages, 'is_result_bytes'), '结算页自识别应该删掉'
+    assert not hasattr(pages, 'result_cover'), '结算页自识别应该删掉'
+    assert not os.path.isfile(os.path.join(pages._TPL_DIR, 'result_title.png'))
+
+    logs8 = []
+    st8 = {'stage': 'OS-6', 'results': [],
+           'last_sub_error': 'Copilot@WaitUntilEndOfAction'}
+    maaplan._on_core_event({'kind': 'chain_failed', 'chain': 'Copilot',
+                            'text': '任务失败：Copilot'}, logs8.append, None, st8)
+    assert st8['results'] and st8['results'][0]['ok'] is False, st8
+    assert '结算不是三星' in st8['results'][0]['why'], st8['results']
+
+    dark = compose([], bg=(30, 32, 40))
+    assert stagenav.probe_bytes(dark) == 'map', '深色帧应判成活动关卡地图'
+
+    class FakeTouch2:
+        def __init__(self, frames):
+            self.frames, self.taps = list(frames), []
+
+        def ready(self):
+            return True, 'adb 正常（测试桩）'
+
+        def shot(self):
+            return self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+
+        def tap(self, x, y):
+            self.taps.append((x, y))
+
+    fake = FakeTouch2([dark])
+    old_touch = stagenav.Touch
+
+    class _FastTime:                 # 别为了等 1.4 秒让冒烟慢几秒
+        @staticmethod
+        def sleep(_s):
+            return None
+
+        @staticmethod
+        def time():
+            return 0.0
+    old_time = maaplan.time
+    maaplan.time = _FastTime
+    stagenav.Touch = lambda *a, **k: fake
+    logs_lr = []
+    try:
+        assert maaplan._leave_result(
+            {'adb_path': 'x', 'address': 'y'}, {'clientType': 'Official'},
+            'OS-6', logs_lr.append), '点一下就该回到活动关卡界面'
+        # 第一帧不判（结算页底部也暗，probe 会误判成地图），必须先点一下
+        assert len(fake.taps) == 1, fake.taps
+        assert fake.taps[0] == maaplan._RESULT_TAP, fake.taps
+        assert any('已回到活动关卡界面' in x for x in logs_lr), logs_lr
+
+        # 点满 3 次还不在关卡界面（比如掉到主页）→ 回主页 + 重新导航兜底
+        fake3 = FakeTouch2([dark])
+        stagenav.Touch = lambda *a, **k: fake3
+        old_probe = stagenav.probe_bytes
+        stagenav.probe_bytes = lambda d: 'home'
+        old_home, old_nav = pages.to_home, maaplan._navigate
+        pages.to_home = lambda *a, **k: True
+        naved3 = []
+        maaplan._navigate = (lambda conn, st, log, client=None:
+                             (naved3.append(st) or (True, 'ok')))
+        logs_lr3 = []
+        try:
+            assert maaplan._leave_result(
+                {'adb_path': 'x', 'address': 'y'}, {'clientType': 'Official'},
+                'OS-6', logs_lr3.append), logs_lr3
+        finally:
+            pages.to_home, maaplan._navigate = old_home, old_nav
+            stagenav.probe_bytes = old_probe
+        assert len(fake3.taps) == 3, fake3.taps
+        assert naved3 == ['OS-6'], naved3
+        assert any('还不在活动关卡界面' in x for x in logs_lr3), logs_lr3
+    finally:
+        stagenav.Touch = old_touch
+        maaplan.time = old_time
+
+
+def check_cross_zone_segments(tmp):
+    """B57 跨分区分段导航（挂完 OS-10 要先去 EX 区再排 OS-EX-1）
+
+    用户 2026-11-22：「挂完 OS-10 后，没有切换我们的导航到 EX 的关卡界面，
+    就直接挂 OS-EX-1 了，导致 MAA 一直找不到 OS-EX-1」。根因是 MaaCore 的多关
+    Copilot 只在**当前这一页**上 OCR 找关卡名，它不会点活动地图的分区节点。
+    """
+    _reset_config(tmp)
+    from core import maaplan
+    import time as _t
+
+    def segs(codes):
+        rows = [{'stage_name': c, 'filename': c + '_1.json', 'is_raid': False}
+                for c in codes]
+        return maaplan.segments_of(rows)
+
+    # ---- ① 切段规则：同活动不同分区必须分开，同分区必须合并，不许重排 ----
+    s = segs(['OS-1', 'OS-2', 'OS-10', 'OS-EX-1', 'OS-EX-2'])
+    assert [x['key'] for x in s] == ['OS/base', 'OS/ex'], s
+    assert [len(x['rows']) for x in s] == [3, 2], s
+    assert (s[0]['from'], s[0]['to']) == ('OS-1', 'OS-10'), s[0]
+    assert [x['key'] for x in segs(['OS-EX-1', 'OS-S-1'])] == ['OS/ex', 'OS/s']
+    assert len(segs(['OS-1', 'OS-2', 'OS-3'])) == 1, '同分区的关要合成一段'
+    inter = segs(['OS-1', 'OS-EX-1', 'OS-2'])
+    assert [x['key'] for x in inter] == ['OS/base', 'OS/ex', 'OS/base'], inter
+    assert [r['stage_name'] for x in inter for r in x['rows']] == \
+        ['OS-1', 'OS-EX-1', 'OS-2'], '不许重排用户选的顺序'
+    assert [x['key'] for x in segs(['1-7', '2-1'])] == ['/base'], '主线不切段'
+    st = segs(['OS-ST-1', 'OS-1'])
+    assert len(st) == 1 and st[0]['key'] == 'OS/base', \
+        '剧情关归基础区，口径要和 eventnav.run 一致'
+    assert segs([]) == []
+
+    class FakeEng:
+        def __init__(self):
+            self.appended, self.chains, self.starts = [], [], 0
+
+        def append(self, t, p):
+            self.appended.append((t, p))
+
+        def start(self):
+            self.starts += 1
+            return True
+
+    rows = [{'stage_name': c, 'filename': c + '_1.json', 'is_raid': False}
+            for c in ['OS-1', 'OS-2', 'OS-10', 'OS-EX-1', 'OS-EX-2']]
+    spec = {'copilotList': rows}
+    conn = {'adb_path': 'x', 'address': 'y'}
+    old = (maaplan._navigate, maaplan._leave_result, maaplan._wait_run)
+    naved, left = [], []
+    maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+        naved.append(st) or (True, 'ok'))
+    maaplan._leave_result = lambda c, sp, st, log: (left.append(st) or True)
+    maaplan._wait_run = lambda eng, total, log, state: True
+    try:
+        # ---- ② 首段复用已做的导航，只有跨段时才点结算页 + 重新导航 ----
+        eng = FakeEng()
+        talk = []
+        ok = maaplan._run_tail(
+            eng, [('Copilot', maaplan._copilot_params(rows, spec))],
+            spec, {}, talk.append, conn, 'dir', _t.time() + 3600,
+            can_reuse_nav=True)
+        assert ok, '分段跑完不该报没跑完'
+        assert len(eng.appended) == 2, eng.appended
+        assert [len(a[1]['copilot_list']) for a in eng.appended] == [3, 2], \
+            eng.appended
+        assert naved == ['OS-EX-1'], ('首段应复用已有导航', naved)
+        assert left == ['OS-10'], ('段间要先点掉上一段末关的结算页', left)
+        assert any('跨 2 个分区' in x for x in talk), talk
+        assert any('切到新分区完成' in x for x in talk), talk
+
+        # ---- ③ 段间导航失败不许 raise（前面几关已经打完了）----
+        naved.clear()
+        left.clear()
+        maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+            naved.append(st) or (False, '模拟失败'))
+        eng2 = FakeEng()
+        talk2 = []
+        ok2 = maaplan._run_tail(
+            eng2, [('Copilot', maaplan._copilot_params(rows, spec))],
+            spec, {}, talk2.append, conn, 'dir', _t.time() + 3600,
+            can_reuse_nav=True)
+        assert ok2 and len(eng2.appended) == 2, (ok2, eng2.appended)
+        assert any('警告' in x and '找不到关卡' in x for x in talk2), talk2
+
+        # ---- ④ 抄作业前面还排了别的任务：首段也必须重新导航 ----
+        naved.clear()
+        left.clear()
+        maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+            naved.append(st) or (True, 'ok'))
+        eng3 = FakeEng()
+        talk3 = []
+        maaplan._run_tail(
+            eng3, [('Recruit', {'max_times': 1}),
+                   ('Copilot', maaplan._copilot_params(rows, spec))],
+            spec, {}, talk3.append, conn, 'dir', _t.time() + 3600,
+            can_reuse_nav=True)
+        assert naved == ['OS-1', 'OS-EX-1'], ('跑过别的任务后界面不在关卡列表', naved)
+        assert [a[0] for a in eng3.appended] == ['Recruit', 'Copilot', 'Copilot'], \
+            eng3.appended
+
+        # ---- ⑤ 单分区（普通情况）一次都不多导航 ----
+        naved.clear()
+        left.clear()
+        one = [{'stage_name': c, 'filename': c + '_1.json', 'is_raid': False}
+               for c in ['OS-1', 'OS-2']]
+        eng4 = FakeEng()
+        maaplan._run_tail(
+            eng4, [('Copilot', maaplan._copilot_params(one, {'copilotList': one}))],
+            {'copilotList': one}, {}, lambda *_: None, conn, 'dir',
+            _t.time() + 3600, can_reuse_nav=True)
+        assert len(eng4.appended) == 1 and not naved and not left, \
+            (eng4.appended, naved, left)
+    finally:
+        (maaplan._navigate, maaplan._leave_result, maaplan._wait_run) = old
+
+
+
+def check_scatter_stages(tmp):
+    """B58 散点关卡（S 关）：认格子 → 点进去 → 单作业模式一关一趟
+
+    用户 2026-11-23：OS 的 S 关不在关卡列表里，浮在雪山地图上（左上竖条写着
+    「积雪清理系统」）。MaaCore 的 ``ClickStageName`` 只在关卡列表里整屏 OCR，
+    这种界面一个都认不出，所以这条路自己点到编队页，再一关排一个 Copilot 任务
+    （单作业模式：只给 filename，不给 copilot_list，它就不做导航）。
+    """
+    _reset_config(tmp)
+    import io as _io
+    from core import scatter, maaplan, maacore, eventnav, stagenav
+
+    # ---- ① 形状解析：EX / 主线不能被当成 S 关 ----
+    assert scatter.has('OS-S-3') and not scatter.has('TL-1'), '活动入口判据不对'
+    assert scatter.cell_index('OS-S-3') == 3
+    assert scatter.cell_index('OS-EX-1') == 0, \
+        'OS-EX-1 被解析成格子 1（会点到 S-1 上）'
+    assert scatter.cell_index('1-7') == 0 and scatter.cell_index('OS-1') == 0
+
+    # ---- ② 模板齐全 ----
+    lay = scatter.layout_of('OS')
+    for idx in (1, 2, 3, 4, 5):
+        assert scatter._tpl(lay['cells'][idx]['tpl']), '缺格子模板 %d' % idx
+    for k in ('start', 'raid', 'start_raid', 'formation'):
+        assert scatter._tpl(lay[k]), '缺按钮模板 %s' % k
+
+    # ---- ③ 认格子：贴回原位命中；ROI 之外的误命中不算 ----
+    from PIL import Image
+
+    def compose(items, size=(1920, 1080), bg=(40, 44, 56)):
+        im = Image.new('RGB', size, bg)
+        for pth, xy in items:
+            im.paste(Image.open(pth).convert('RGB'), xy)
+        buf = _io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    poses = {1: (220, 295), 2: (1325, 295), 3: (220, 576),
+             4: (1325, 576), 5: (765, 771)}
+    tpls = {i: scatter._tpl(lay['cells'][i]['tpl']) for i in range(1, 6)}
+    full = compose([(tpls[i], poses[i]) for i in range(1, 6)])
+    got = scatter.cells_of(full, 'OS')
+    assert sorted(got) == [1, 2, 3, 4, 5], got
+    assert scatter.is_here(full, 'OS')
+    assert not scatter.has_detail(full, 'OS'), '没打开详情却说有详情面板'
+    assert scatter.cells_of(compose([]), 'OS') == {}, '空图也认出了格子'
+
+    # S2 的模板贴到 S5 的位置：ROI 不匹配，必须不算
+    wrong = compose([(tpls[2], poses[5])])
+    assert 2 not in scatter.cells_of(wrong, 'OS'), \
+        'S2 的模板在 S5 的位置也被认成 S2（ROI 没起作用）'
+
+    # ---- ④ 详情面板 / 编队页判据 ----
+    detail = compose([(scatter._tpl(lay['start']), (1560, 940))])
+    assert scatter.has_detail(detail, 'OS'), '「开始行动」在还说没详情面板'
+    form = compose([(scatter._tpl(lay['formation']), (1288, 16))])
+    assert scatter.in_formation(form, 'OS'), '「快捷编队」在还说不在编队页'
+    assert not scatter.in_formation(compose([]), 'OS')
+
+    # ---- ⑤ 单作业模式的参数：只给 filename，不给 copilot_list ----
+    row = {'filename': 'X:/copilot/OS-S-1_1.json',
+           'stage_name': 'OS-S-1', 'is_raid': True}
+    prm = maaplan._single_params(row, {'copilot': {'formation': True}})
+    assert 'copilot_list' not in prm, '单作业模式不能带 copilot_list（会走导航）'
+    assert prm['filename'] == row['filename']
+    assert prm['formation'] is True
+
+    # ---- ⑥ run_scatter 的循环：每个格子一趟，未被解锁/点不开就跳过 ----
+    class FakeTouch:
+        def __init__(self, *a, **k):
+            self.taps = []
+            self._shot = b'frame'
+
+        def ready(self):
+            return True, 'adb 正常（测试桩）'
+
+        def shot(self):
+            return self._shot
+
+        def tap_px(self, x, y):
+            self.taps.append((x, y))
+
+        def tap(self, x, y):
+            self.taps.append((x, y))
+
+    class FakeEng:
+        # ④ 用：模拟「用户点了停止挂机」——wait 返回 False，且引擎被标记 stopped
+        user_stop = False
+
+        def __init__(self, *a, **k):
+            self.appended, self.starts, self.chains = [], 0, []
+            self.stopped = False
+
+        def open(self):
+            return self
+
+        def connect(self, *a, **k):
+            return True
+
+        def append(self, typ, params):
+            self.appended.append((typ, params))
+            return len(self.appended)
+
+        def start(self):
+            self.starts += 1
+            return True
+
+        def wait(self, timeout=None, poll=1.0):
+            if FakeEng.user_stop:
+                self.stopped = True
+                return False
+            return True
+
+        def stop(self):
+            self.stopped = True
+
+        def close(self):
+            pass
+
+    old = (stagenav.Touch, maacore.Engine, eventnav.run,
+           scatter.is_here, scatter.cells_of, scatter.open_stage,
+           scatter.back_to_cells, maaplan._connection)
+    opened, bad = [], []
+
+    def fake_open(touch, pre, idx, raid, log=None, pos=None, timeout=12.0):
+        opened.append((idx, raid))
+        if (idx, raid) in bad:
+            return False, '没点开（测试桩）'
+        return True, ''
+
+    stagenav.Touch = FakeTouch
+    maacore.Engine = FakeEng
+    # 冒烟环境没有真的 MAA 目录，连接参数直接给一份（不然 _connection 会去读
+    # <maaDir>/config/gui.new.json 然后抛 FileNotFoundError）
+    maaplan._connection = lambda d, profile=None: {
+        'adb_path': 'adb', 'address': '127.0.0.1:5555',
+        'config': 'General', 'touch': 'MiniTouch', 'maa_dir': d}
+    eventnav.run = lambda *a, **k: (True, 'ok')
+    scatter.open_stage = fake_open
+    scatter.back_to_cells = lambda *a, **k: True
+    try:
+        # ① 三关连着跑：S1 普通 → S1 突袭 → S2 普通
+        cells = {1: (430, 385), 2: (1535, 385)}
+        scatter.is_here = lambda d, p: True
+        scatter.cells_of = lambda d, p: dict(cells)
+        spec = {'maaDir': tmp,
+                'copilot': {'formation': True},
+                'copilotList': [
+                    {'filename': 'a.json', 'stage_name': 'OS-S-1',
+                     'is_raid': False},
+                    {'filename': 'b.json', 'stage_name': 'OS-S-1',
+                     'is_raid': True},
+                    {'filename': 'c.json', 'stage_name': 'OS-S-2',
+                     'is_raid': False}]}
+        r1 = maaplan.run_scatter(spec, tid=None, timeout=600)
+        assert r1['ok'], r1
+        assert opened == [(1, False), (1, True), (2, False)], opened
+        assert r1['stage_trail'] == ['OS-S-1', 'OS-S-1(突袭)', 'OS-S-2'], \
+            r1['stage_trail']
+
+        # ② 界面上没有这个按钮（没解锁）→ 跳过，不排作业
+        opened.clear()
+        cells = {1: (430, 385)}
+        spec2 = dict(spec, copilotList=[
+            {'filename': 'd.json', 'stage_name': 'OS-S-4', 'is_raid': False},
+            {'filename': 'e.json', 'stage_name': 'OS-S-1', 'is_raid': False}])
+        r2 = maaplan.run_scatter(spec2, tid=None, timeout=600)
+        assert opened == [(1, False)], opened
+        assert r2['stage_trail'] == ['OS-S-1'], r2['stage_trail']
+
+        # ③ 点开了但没进编队（理智不够/未开放）→ 记进失败，接着跑下一关
+        opened.clear()
+        bad.clear()
+        bad.append((2, False))
+        cells = {1: (430, 385), 2: (1535, 385)}
+        spec3 = dict(spec, copilotList=[
+            {'filename': 'f.json', 'stage_name': 'OS-S-2', 'is_raid': False},
+            {'filename': 'g.json', 'stage_name': 'OS-S-1', 'is_raid': False}])
+        r3 = maaplan.run_scatter(spec3, tid=None, timeout=600)
+        assert not r3['ok'], r3
+        assert r3['stages_failed'][0]['stage'] == 'OS-S-2', r3
+        assert r3['stage_trail'] == ['OS-S-1'], r3['stage_trail']
+        assert opened == [(2, False), (1, False)], opened
+
+        # ④ 用户点「停止挂机」：绝不是超时、也不记失败。
+        #    2026-11-23 用户手动暂停，日志写「这一关超时（1200 秒）」——
+        #    他当场质疑「前后矛盾」。停就是停，剩下的关不打了。
+        opened.clear()
+        bad.clear()
+        FakeEng.user_stop = True
+        cells = {1: (430, 385), 2: (1535, 385)}
+        logs4 = []
+        spec4 = dict(spec, copilotList=[
+            {'filename': 'h.json', 'stage_name': 'OS-S-1', 'is_raid': False},
+            {'filename': 'i.json', 'stage_name': 'OS-S-2', 'is_raid': False}])
+        r4 = maaplan.run_scatter(spec4, tid=None, timeout=600)
+        FakeEng.user_stop = False
+        assert r4['ok'], r4
+        assert r4['paused'] == '手动停止', r4
+        assert r4['stages_failed'] == [], r4
+        assert not r4['timed_out'], r4
+        assert opened == [(1, False)], opened
+    finally:
+        (stagenav.Touch, maacore.Engine, eventnav.run,
+         scatter.is_here, scatter.cells_of, scatter.open_stage,
+         scatter.back_to_cells, maaplan._connection) = old
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -5819,6 +6626,12 @@ def main():
                 lambda: check_nav_from_stage_list(tmp))
         r.check('B55 右栏日志按账号分栏（序列化不带句柄/前缀补齐/owners 过滤/子进程入口）',
                 lambda: check_task_log_isolation(tmp))
+        r.check('B56 页面识别+基建确认框+多账号默认导航+MAA 风格日志',
+                lambda: check_pages_skills_logs(tmp))
+        r.check('B57 跨分区分段导航（OS-10 → 先切 EX 区再挂 OS-EX-1）',
+                lambda: check_cross_zone_segments(tmp))
+        r.check('B58 散点关卡（S 关）：认格子→点进编队→单作业模式一关一趟',
+                lambda: check_scatter_stages(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -39,9 +39,11 @@
 | `core/acctbind.py` | 「这个账号跑 StartUp 写哪个切号名」的唯一解析入口：账号绑了配置文件（`maa.profile`）且没手改过 → 读那份档案 StartUp 的 `AccountName`（`maa.profile_account_name()`，**只读**）；否则用账号存的 `maa.accountName`；都没有才返回空让调用方去问用户。手改过的值标 `accountNameFrom=manual`，不会被档案里的旧号码盖回去 |
 | `core/multiacct.py` | 多账号编排：MAA「一个配置档案 = 一个账号」，按各账号练度各挑作业，串行切换执行。档案一律新建 `PRTS-` 前缀的那份，用户自己的档案一个字段都不动。切号名统一走 `acctname.check()`；`maaProfile` 是档案名不是切号名，别混用 |
 | `core/maaplan.py` | 把「用户想怎么挂」翻成可执行的东西，两条路线：① `build_queue`/`ensure_profile` 写 GUI 的 `TaskQueue` + `RunDirectly`（能看界面，但**不能抄作业**：MAA 的 `InitializeItems` 不认 CopilotTask，会抛 NotImplementedException 让整个任务列表空白）；② `core_tasks`/`run_core` 生成 MaaCore 的任务序列直接驱动（能抄作业、能跑 Custom 小活动、自己按开始）。`run_core` 跑抄作业固定四段：**登录（StartUp）→ `AsstStop` 把 MAA 停住 → 用 `stagenav` 点到关卡地图 → 再 append Copilot + `AsstStart`**。停这一步不能省：不停的话 MaaCore 还在按自己的逻辑截屏/滑动，和我们的 adb 点击抢界面。导航失败且这一关有卡片模板（老故事集）时**直接报错**，不把作业交给 MAA——它只会横向滑主线，白跑 30 秒再失败（2026-11-17 SV 实测：停住后 24 秒内 MAA 就在地图上 OCR 到 SV-1、点开始行动、自动编队开打） |
-| `core/maacore.py` | MaaCore 直连：`AsstCreateEx` → `AsstLoadResource` → `AsstConnect` → `AsstAppendTask` → `AsstStart`，回调翻成事件流。三个坑写在文件头：`AsstCreateEx` 的 restype 必须是 `c_void_p`（否则 64 位句柄截断成 32 位，每次 append 都 access violation）、Copilot 的 `filename` 必须绝对路径、`copilot_list` 的键是 `filename` 不是 `file_name`（写错会让进程 C++ 异常崩溃） |
+| `core/maacore.py` | MaaCore 直连：`AsstCreateEx` → `AsstLoadResource` → `AsstConnect` → `AsstAppendTask` → `AsstStart`，回调翻成事件流。三个坑写在文件头：`AsstCreateEx` 的 restype 必须是 `c_void_p`（否则 64 位句柄截断成 32 位，每次 append 都 access violation）、Copilot 的 `filename` 必须绝对路径、`copilot_list` 的键是 `filename` 不是 `file_name`（写错会让进程 C++ 异常崩溃）；还有第四个**静默**坑——子任务回调码是 20000 段不是 70000 段（见下一节） |
+| `core/pages.py` | 认「现在停在哪一页」+ 回主界面。主页 = 左上角「设置齿轮 + 邮件」两个图标定点比对（实测 0.0 分；活动地图/设置页/基建都不命中）；基建「是否确认离开罗德岛基建？」= 底部按钮条上左「✕」右「✓」两个白圆钮同时定点命中，认出就点右半「确认」的中心（这个弹窗按 ESC / 返回都退不出去）。`to_home()` 每轮先看一帧再决定按返回 / ESC / 点确认。 |
 | `core/stagenav.py` | 把界面带到活动关的关卡列表。**MAA 自己做不到**：`TL-Open`/`TLChapterToTL` 那套模板图在当前活动 UI 上全匹配失败，Copilot 的 `FullStageNavigation` 又只会横向滑动切章节（这版游戏改成点底部 EPISODE 了）。这条路是真机一步步点出来的：底部「终端」tab → 主界面活动大图 → 主题页区域名 → 活动地图区域列表第 N 行。两个坑：① 主界面点大图是**记忆位置**的，所以流程按 `probe()` 判出的页面状态收敛，不是死按顺序点；② `AsstAsyncClick` 一次连接只能点中第一下，所以点击/截图都走 adb（`Touch`）。坐标 1280×720 口径，可用 `config/nav.json` 覆盖 |
 | `core/stagenav.py`（老故事集） | 当期活动之外的第二条路：**曲谱 → 乐章收录 → 网格找卡片 → 进入活动 →（EX / S / MO 关再点右下角那排分区图标里的对应格子）**。老活动 MAA 资源里压根没有导航配置（`Fight` 直接拒收），只能从「曲谱」这个统一索引里进。网格里卡片位置跟滚动位置绑定、新活动还会把顺序挤动，所以**按模板图找**（`navtpl/<代号>.png`，46 张随包发布，覆盖全部有战斗关的常驻活动；代号是 2026-11-17 真机把 48 张卡逐个导航进图、读落图关卡前缀核出来的，易错对照见 `stagenav.EVENTS` 注释）。分发双闸：模板存在**或**代号在 `EVENTS` 表里都走这条路；`EVENTS` 里的活动导航失败会**直接报错停止**，绝不交给 MAA——它只会横向滑主线，白跑 30 秒再失败。匹配是「1/4 降采样粗扫 + 全分辨率两轮精修 + 全程只记最像那一屏」，粗扫明显不像（>32 分）就跳过精修：真卡 0~7 分、无关卡 21 分起，**阈值 12**（暗色模板在相邻暗卡上能拿 14~19 分，18 挡不住）。五个坑：① 主界面有两套视图，不带底部 tab 的那套要先点中央「终端」大卡（`at_home()` 用底部功能格白像素判，主界面 0.45 / 其它 ≤0.07；带白色 EX 徽章的活动地图上白像素也会超 0.2，所以回主界面的判据是 `at_home AND not in_story_page AND not in_story_dialog AND not on_login_page` 四条件——后两个是 2026-11-17 补的：明亮沙地 CG 回放连 `at_home` 都能骗过，登录页浅灰底 + 白 logo 也能骗过）；② **扫描步长别贪快**：整张表（主线 + 各 Story Line + 未归组的新活动）11 屏，`_SWIPE_STEP` 360 配 1.4 秒等待刚好一张不漏；560 那版实测会漏屏——玛莉娅·临光（MN）正好落在两张截图之间，翻完 34 屏报「没找到」，用 360 重扫第 5 屏 1.0 分命中；③ **`in_story_page()` 必须两条同时成立**（底部左 tab 白 <0.05 且左上灰度 <90）：只看灰度会把主界面判成曲谱页（皮肤立绘压在左边，灰度 98.5 卡在旧阈值 100 下面），于是登录后一步没走就开始翻屏，报「翻了几十屏没找到」；④ **滑动起点必须在最左边缘 x=20 的空白处**，压到卡片上会被判成点击、直接跳进那个活动的详情页，之后分数一动不动（`goto_story_activity` 里躺过一次）；⑤ 退回上一层**先按返回键、再按 ESC**（有些详情页对 `keyevent 4` 完全没反应，ESC 一下就退）；⑥ **剧情页判定换了三版才站住**：白像素占比会把主界面右上角的货币数字（合成玉/342）当成「跳过▶」，于是「剧情排水」在主界面按返回键弹「退出游戏」又点中确认——**游戏被自己关掉**；灰度模板又把 TG 的亮天空烤进了模板，暗背景剧情全失配（而且模板匹配锚点一度把「中心」当「左上角」，全体错位）；最终用**字形掩码 XOR**（两边 >235 二值化后比对差异占比，剧情页 0.00~0.14 / 非剧情 ≥1.0，阈值 0.55），背景无关且天然排除登录页；⑦ **登录页判定也得用模板**：「开始唤醒」按钮（navtpl/_wakeup.png，820,726 起 280×90）匹配认页，整屏均值判据对登录页失效（底部深色横带把均值拉到 ~150，过不了 >165）；⑧ **重启流程**（`restart_app`）：先 `pidof` 查游戏进程（不在就直接拉起，别在安卓桌面上按返回键空转），`am start` 后 30 秒内要看到进程、没看到再拉（最多 3 次），轮询 600 秒、每轮先 `game_alive`（游戏半路崩了要重新拉起——实测强杀后重启会走到 START 页又崩），轮询里**先认拦截页再判主界面**（顺序反了会在登录页误报回主界面）；START 页点**黄色菱形质心**（真实中心 (0.474w,0.949h)，按亮度判会把主界面亮皮肤/公告弹窗误判成 START 页、在主界面上连点几十下）；⑨ **`run_core` 的顺序铁律**：登录（StartUp）没跑完绝不能开始导航——两者并发时导航点在启动页甚至桌面上（nav-fail 现场图是一张桌面截图），作业也永远没排队；队列头是 StartUp 就只排它、等完、`eng.stop()`、导航、再排剩下的；作业列表给了但队列没勾「抄作业」时自动补一条 Copilot；B 服账号要把 `com.hypergryph.arknights.bilibili` 包名传给 Touch，否则「游戏进程不在」的检测永远为真。每一步点完都用 `_moved()`（截图差值 >3.0）验证页面真的切了——「OK」不等于「到对了」，RS/DL/BY 三个模板都曾经匹配到相邻错误卡上还报成功。模板本身也可能过期：卡片改成 214×204 的斜切框以后，早期按「卡片+周边背景」裁的 400×258 图会失配，正确裁法是取卡片中心 200×165、避开左上进度徽章和 NEW! 角标；新活动上线后按 `docs/config.md` 的裁法补一张即可 |
+| `core/scatter.py` | 散点关卡（S 关）：活动地图上浮着的是 `OS-S-1`~`OS-S-5` 五个按钮，不在关卡列表里，MaaCore 的 `ClickStageName` 认不出。这里用定点模板认格子 → 点「开始行动」/「突袭模式→开始突袭」→ 等编队页，再交给 `maaplan.run_scatter` 用单作业模式（只给 `filename`、不给 `copilot_list`）一关一趟打。格子的 `roi` 把命中位置也锁死（模板带雪山背景会认到隔壁）；编队页判据用右上「快捷编队」而不是右下那条有滑入动画的「开始行动」 |
 | `core/agent.py` | 内置助手：10 个工具的 agent loop、OpenAI 兼容流式调用、写操作确认闸门；apiKey 走 DPAPI 单独存 `config/agent.key` |
 | `backend/cli.py` | 命令行入口（`python -m backend.cli` / `MAA-PRTS.exe --cli`），输出 `{ok, command, data, error}`，退出码 0/1/2/3 |
 
@@ -442,6 +444,27 @@ API：`POST /api/skill/run`（body：`{"skill": ..., "params": {...}}`）、`GET
 | `tool` | MAA 牛杂小工具（小游戏 / 活动商店） | `maatools` + `eventnav.run_tool` |
 | `claim` | 领活动奖励：进奖励页点「一键领取」（纯 adb，不连 MaaCore） | `eventnav.claim_reward` |
 
+**加一个新 skill 只要三步**（2026-11-22 重构，`REGISTRY` + `@skill` 装饰器）：
+
+```python
+@skill("fishing", "钓鱼：自动打完今天的鱼", aliases=("钓鱼",))
+def skill_fishing(ctx):          # 第一个参数叫 ctx → _call_skill 传 Ctx
+    t = ctx.touch()              # 这个号的 adb 连接（档案/多开地址都已生效）
+    ctx.log("开始钓鱼")
+    return {"ok": True}
+```
+
+1. 函数第一个参数写 `ctx`（`Ctx` 里有 `file` / `maa_dir` / `conn` / `client` /
+   `touch()` / `spec()` / `log` / `tid`），不用再抄「解析账号 → 查 MAA 目录 →
+   拼连接 → 建 Touch」那四行；
+2. `@skill(名字, 一句话描述, needs_game=?, aliases=?)` 会把它登记进 `REGISTRY`，
+   `SKILLS` / `_NEEDS_GAME` / `ALIASES` / `/api/skill/list` 全部自动派生，
+   **不用改第二张表**；
+3. 老写法 `(params, log, tid=None)` 继续支持（`_call_skill` 看第一个参数名决定
+   怎么调），现有 skill 可以一个一个慢慢迁。
+
+页面状态判断和「回主界面」不在这个文件，见 `pages.py`（下一节）。
+
 排序规则（`_cycle_sort_key`）：`ST-N → 主线 1..N → EX`，正好是 MN 这类周目的
 推图顺序；关卡清单来自 `resources._stages(True)`（含 story=True 的 208 条剧情关，
 resolve 的默认视图查不到它们）。
@@ -528,10 +551,18 @@ MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与�
 
 现在的口径（`skills._prepare_ops`）：
 
-- 默认 `raid='auto'`：**有突袭作业就只排突袭**一条（`IsRaid=true`）；没有突袭
-  作业的关照旧排普通。
+- 默认 `raid='auto'`：**只排普通**（2026-11-23 改）。原先 auto = 「有突袭作业
+  就只排突袭」，出事经过：用户说「帮我挂 OS-S 关 1 到 5 普通」，助手没传 `raid`，
+  5 关全排成突袭，第二关还因为突袭作业要「圣聆初雪」编队失败卡了 20 分钟。
+  而且突袭本来要先通关普通才解锁，首次打某关排突袭大概率点不进去。
+  **要突袭必须明说**：`raid='raid'` 或逐关 `@raid`。
+- `raid='raid'`：只打突袭（用户明说要突袭时）。
 - `raid='both'`：普通 → 突袭两条（普通还没通关、要一次打通时用）。
 - `raid=False` / `'normal'`：只排普通（刷材料）。
+
+> **难度只照用户原话**：用户说「普通」→ 必须 `raid='normal'`；助手不许以
+> 「复刻活动」「应该打突袭」为由替他升级。`skill_fight` 排完单会单独打一行
+> 「难度：普通 OS-S-1、OS-S-2 …」，是给用户对照的锚点。
 - **逐关指定**：`stages` 支持 `SV-EX-1@raid` / `SV-EX-1@both` / `SV-EX-1@normal`，
   也支持 `{'stage': 'SV-EX-1', 'raid': 'both'}`（见 `_parse_stages`）。这是为了
   让助手能按计划执行（「EX-1~5 只打突袭、EX-6/7 普通+突袭」），以前只有全局
@@ -574,31 +605,116 @@ MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与�
 
 **② 换作业重挂（`_retry_failed`）**
 
+> **2026-11-22 二次修订：改成「只换翻车那一关」。** 用户报「我刚刚确实是 2 星，
+> 但是 agent 并没有帮我换作业重新挂」，要求「回到对应的关卡界面，更换作业集
+> （只改那关，其他不变，帮我重新挂），然后任务继续」。查下来有**两个**独立原因：
+>
+> 1. **翻车根本没被识别**：`_mark_fail` 要 `state['stage']` 才知道哪一关翻车，
+>    而这个值只由 `CopilotListLoadTaskFileSuccess` 设置——那个回调码当时写成
+>    70003（MaaCore 4.x），6.x 是 20003，事件被丢，`stage` 永远空，于是
+>    `_mark_fail` 直接 return、`results` 为空、重挂条件不成立。同一次的总根因，
+>    见「回放真实回调流查『日志还是没有』」那一节。
+> 2. **重挂的触发条件太窄**：`if state.get('results') and spec.get('retry')`。
+>    `_prepare_ops` 只在「某关有 >1 份候选」时才给 `retry`，所以每关只有一份作业
+>    的批次，翻车后什么都不做。
+
+现在的行为：
+
+- **触发**：只要 `state['results']` 里有 `ok=False` 且这批有 `copilotList`，
+  就进 `_retry_failed`——不再要求 `spec['retry']` 存在。
+- **只动翻车那一关**：候选池取该关「下一份没试过」的；**翻车关之后还没打的关
+  沿用原来那份**（旧实现会顺手把它们也换成下一份，白冒风险）。已打完的关
+  （`start_idx` 之前）一关都不重打。
+- **没别的作业就同一份再试一次**：漏怪是偶发的，2 星重打一次经常就三星。
+  以前「候选都试过」直接收工、把后面几关一起丢下。同一份只补试一次
+  （`state['same_retry']`），试过还不行就把这关记进 `state['skip_retry']`
+  跳过、继续打后面的关。
+- **不值得重挂的原因直接跳过**：理智不够 / 关卡没解锁 / 作业与关卡对不上，
+  重挂也是同样结果，别烧时间。`state['pause']`（材料不足）直接不重挂。
+- **每轮按最新结果继续**：每轮结束重看 `_tally(state['results'])[1]`，哪关还失败
+  才继续；都过了立刻收手。旧实现每轮都从同一个起点重排，第二轮会把打过的关
+  再打一遍（白烧理智）。
+- **「上一关过了」要有记录**：MaaCore 在 Copilot 里不发 `StageDrops`，唯一可靠
+  的成功信号是「换到下一个作业」。所以 `CopilotListLoadTaskFileSuccess` 里看到
+  `prev != code` 时，除了打 `✓ X 完成`，还往 `results` 写一条 `ok=True`——
+  不写的话 `_tally` 只看到失败，重挂成功一轮后还会再挂一次。
+- **翻车原因不再说「MAA 没给原因」**：MaaCore 的 `TaskChainError` 只有
+  `taskchain`/`taskid`，`details` 是空的。拿最近一条 `SubTaskError` 推：
+  `Copilot@WaitUntilEndOfAction` → 「结算不是三星（漏怪 / 作业没打过这关）」。
+  用户看到这句才知道「为什么要换作业」，而不是以为程序坏了。
+
+其余机制不变：
+
 - `skills._select_ops` 每关挑 `depth=3` 份候选（按「可直接抄 → 借一人 →
   练度不足」排），`_prepare_ops` 返回 `(copilotList, retry)`，
-  `retry = {'pool': {'SV-EX-1@raid': [41623, 41624, 46114]}, 'maxRounds': 3}`，
-  由 `spec['retry']` 交给 `run_core`。
-- 一轮跑完从**失败的那一关**开始往后重排（`start_idx` 由 `state['stage']` 定位：
-  跑到 X 才翻车，说明 X 之前都过去了）。以前靠 `cleared` 排除已成功的关，但
-  那个集合永远为空（`StageDrops` 不来），会把前面打完的关全重打一遍白烧理智——
-  2026-11-22 改的。`start_idx` **必须在进循环前算好**：每轮重排后
-  `state['stage']` 会被清空，第二轮再算就回到第 0 关了。
-- 每关换候选池里**还没试过**的下一份，同一个
-  Engine 直接 `append` 新的 Copilot 任务再 `start`——不重新 open / connect /
-  导航，省掉每轮十几秒。`attempted` 记着试过哪些，#102→#202→#102 这种
+  `retry = {'pool': {'SV-EX-1@raid': [41623, 41624, 46114]}, 'maxRounds': 3}`。
+- 同一个 Engine 直接 `append` 新的 Copilot 任务再 `start`——不重新 open /
+  connect / 导航，省掉每轮十几秒。`tried` 记着试过哪些，#102→#202→#102 这种
   来回打转不会发生。
-- **重挂前必须先点掉结算页**（`_leave_result`，2026-11-19 用户实测补的）：
-  战斗失败后游戏停在「作战失败 / 行动结束」那一层，这时把新作业集排下去，
-  MAA 的 `ClickStageName` 在这一层 OCR 不到关卡名，整轮重挂白跑。用户的口径
-  是「随便点一下回到关卡界面，在那个界面重新运行作业集就能换作业，不需要
-  重新唤醒登录」。
-  点哪儿不随便：用 MAA 自己 `ClickCorner` 的 `[1000,20,270,50]`（1280 口径，
-  中心 `_RESULT_TAP = (1135,45)`），任务定义写明「点屏幕右边不会点到掉落物，
-  也不会关掉关卡选择」，所以结算页能推进、在关卡列表上点了也无害，连点几次
-  都安全。点完 `stagenav.probe == 'map'` 就算回到关卡列表；不是就按正常流程
-  重新导航一次（`_navigate`）。
+- **翻车判定只认 MaaCore 回调**（2026-11-22 用户明确要求：「失败识别应该以
+  maa 的失败通知为准，而不是自己识别有没有失败」）：`chain_failed`
+  （`TaskChainError`）或子任务失败（`Copilot@WaitUntilEndOfAction` = 结算不是
+  三星）→ `_mark_fail` 记一条 `results[ok=False]` → `_retry_failed` 才动手。
+  截图只用来**看界面在哪**，绝不用来猜「是不是失败了」。
+- **重挂前先把界面弄回活动关卡界面**（`_leave_result`，是 `_retry_failed` 里的
+  **硬前置**——返回 False 就这一轮不排，绝不把作业丢在结算页上白跑）：
+  用户 2026-11-22 实测「**失败后点屏幕任何位置都会立刻回到关卡界面**，在那个
+  界面重新运行作业集就能换作业，不需要重新唤醒登录，也不需要写导航」。
+  所以流程只有「点一下 → 看现在是不是活动关卡地图」：
+  1. 点 MAA 自己的 `ClickCorner`（`_RESULT_TAP = (1135, 45)`，1280 口径）。
+     任务定义写明「点屏幕右边不会点到掉落物品，也不会关掉关卡选择」，所以
+     结算页上能推进，已经在地图上点了也不误触（真机验过：在地图上点完界面
+     不动）。
+  2. `stagenav.probe_bytes() == 'map'`（底部 tab 暗）就算回到了活动关卡界面。
+     **第一帧不判**：结算页底部也是暗的，probe 会把它当成地图，于是「还没点
+     就放行」，作业排在结算页上白跑一整轮。点过一次之后结算页必然消失，probe
+     才有意义。
+  3. 点三次还不是地图（掉到主页 / 基建 / 主题页）→ `pages.to_home()` + 完整
+     导航（`_navigate`）兜底。
+- **不再有「结算页识别」**：先按两颗亮星裁模板（`result_star1/2.png`）被用户
+  否掉——三星 / 一星 / 直接失败都停在同一个结算页，只有星亮几颗不同；后来
+  改成「行动结束」标题 mask 也被否掉（仍是自识别）。现在 `pages.py` 只认
+  主页和基建确认框，翻车界面靠「先点后判」。
 - 收尾判失败只从 `eng.chains[mark:]` 看，否则第一轮的失败会把重试成功盖掉。
   `mark is None` 表示压根没重试（**0 是合法分界**，别拿它当「没重试」）。
+
+**②a 跨分区必须分段导航（2026-11-22 晚）**
+
+用户实测：「挂完 OS-10 后，没有切换我们的导航到 EX 的关卡界面，就直接挂
+OS-EX-1 了，导致 MAA 一直找不到 OS-EX-1」。
+
+根因：`run_core` 原来只在开工前导航**第一关**，然后把整个 `copilotList`
+当成一条 Copilot 任务一次性交给 MaaCore。MaaCore 在多关之间只会
+`ClickStageName` 在**当前这一页**上 OCR 找关卡名——它不会点活动地图上的分区
+节点（圣巡之旅 / 变革之路 / 喀兰之心）。所以基础区最后一关打完后，界面还停在
+基础区列表，EX 关根本不在这一页上，它会一直找，整轮卡死在那儿。
+
+现在 `_run_tail` 把作业按「活动前缀 + 分区」切段（`segments_of`），段与段
+之间：
+
+1. `_leave_result` 点掉上一段末关的结算页（顺序不能反，见上一条）；
+2. `_navigate` 到下一段首关所在的分区（多花 10~15 秒，用户 2026-11-22 明确
+   接受这个代价）；
+3. 再把这一段 `append` + `start`。
+
+几条硬规矩：
+
+- **只合并连续的同类，绝不重排**：顺序排成 OS-1 → OS-EX-1 → OS-2 就老实切
+  三段来回跑。重排等于替用户改打关顺序，出了问题全是没法解释的疑问。
+- **分区口径和 `eventnav.run` 完全一致**：`st`（剧情关）/`f`（额外关）都归
+  基础区（`_zone_of` 里的白名单），否则会切出「没标定过分区节点」的段，
+  导航必然失败。
+- **段间导航失败不许 raise**：前面几关已经打完了，raise 会把整轮记成失败。
+  打一行「警告：没导航到 X，这一段的作业可能全找不到关卡」照样排下去。
+- **首段能不能复用已有导航**看 `can_reuse_nav`：只有「刚导航完、中间没跑
+  别的任务」才复用；抄作业前面排了收菜/招募，界面早就不在关卡列表上了，
+  必须重新导航。
+- **直跑模式（`noNav`）同样分段**：`skill_fight` 默认 `wakeup=false` 就是这
+  条路，`run_core` 原来在 `noNav` 下把整个队列一次性 `append + start`，根本
+  走不到分段。现在 `noNav` 也交给 `_run_tail`，只是首段 `can_reuse_nav=True`
+  ——「别重复唤醒/导航」的意思是别从头再走一遍，不是「打不到也不许点分区」。
+- `_retry_failed` 的重挂同样分段——翻车在 OS-10、重挂往后接 OS-EX-1，
+  是同一个坑。
 
 **②b 关卡名单核对（`skills._tidy_stage_list`，2026-11-19）**
 
@@ -617,6 +733,8 @@ EX-1 之后又往后补了一关凑数，白烧一整轮理智。预检会把前
   没有 S 关就只有三段；`tiers` 可以只挑一段，`raid` 控制 EX（both/raid/normal）。
 - 每段开始前用 `skill_navigate` **重新导航**：EX 和 S 是活动地图里不同的
   分区，MAA 的 Copilot 只认当前分区上的关卡名（见 `_run_fight_batch` 的注释）。
+  2026-11-22 起 `run_core` 自己也会按分区切段（见 ②a），这条只剩「sweep 想
+  按 tiers 分组算作业」的意义。
 - 段内 `_select_ops(strict=True)`：普通段不拿突袭作业顶，反之亦然。
 - 每段一次 `run_core`（带 retry 池），段与段之间靠导航衔接。
 
@@ -784,6 +902,32 @@ skill_claim({'account': ..., 'stage': 'OS', 'wakeup': False})
 纯 adb 操作（不连 MaaCore），所以它不在 `_WRITE_HANDLERS` 里——和 `wakeup` /
 `navigate` 一样免确认。奖励页的「一键领取」按钮已领完也还在，点了没反应不算失败。
 
+## 页面识别与回主界面（`pages.py`，2026-11-22）
+
+用户报「判断不出游戏停在哪一页」：以前只有 `stagenav.at_home()` 一套整屏
+统计特征（底部白占比），认得主页，认不出设置页 / 基建 / 退出确认框，
+「回主界面」只能盲按返回键，撞上基建的「是否确认离开罗德岛基建？」就卡死。
+
+- **主页判据换成图标定点比对**：左上角「设置齿轮 + 邮件」两个模板
+  （`backend/core/navtpl/pages/home_gear.png` / `home_mail.png`，1920 口径从
+  真机原地裁 56×56，中心 (48,32) / (188,32)）。两个**同时**命中才算主页：
+  设置页左上角也有齿轮（只是更靠右），只要一个会误判。实测主页 0.0 分、
+  活动地图齿轮 27.6（阈值 14）。`at_home()` 优先走它，模板缺失才退回老特征。
+- **基建确认框**：底部横贯整屏的按钮条，左黑「✕」（取消）/ 右暗红「✓」
+  （确认）。判据同样是**定点比对**：`backend/core/navtpl/pages/confirm_cancel.png`
+  / `confirm_ok.png`（1920 口径从真机原地裁 72×72，中心相对坐标 0.346/0.687
+  与 0.658/0.688），两个圆钮**同时**命中才算，返回右半「确认」的中心
+  （1920×1080 实测 (1264,743)，可以直接 tap）。
+  为什么不用「按行数红色像素」（2026-11-22 曾这么写）：这条暗红按钮带一层
+  斜纹贴图，红像素是散点——同一行红占比只有 35%~60%、最长连续红段仅 30px，
+  于是关卡列表 / 主页的红色角标也能凑够数，真机日志里冒出过一次假弹窗。
+  换模板后主页 0.0、其余页面 85 分以上。打包漏了模板才退回
+  `_bar_bytes()`：按「左半很暗 + 右半偏红」的色彩签名找按钮条（`_BAR_*`）。
+- **`to_home(touch, log)`**：每轮先看一帧 → 主页就停；认到确认框就点「✓」
+  （返回键对这个弹窗无效）；剧情页跳幕；否则前 3 轮返回键、再 3 轮 ESC、最后点左上
+  「<」。`eventnav._to_home` 已改成直接调它。
+
+
 ## 当期活动导航（`eventnav.py`，2026-11-19 / 2026-11-22 改）
 
 新活动的入口 UI 和老的「曲谱 / 主界面活动大图」都不一样了，用户逐屏标注了
@@ -935,6 +1079,87 @@ ex 16 分、s 12.5 分、reward 17.5 分、claim 21~23 分，全都压着阈值 
 2026-11-22 起这层包成了 skill：`skills.skill_claim` / 助手工具 `skill_claim`
 （见上面「④ 领奖 skill」）。
 
+## 散点关卡（S 关，`scatter.py`，2026-11-23）
+
+当期活动（雪山降临1101 / OS）的 S 关**不在关卡列表里**：活动地图右下角点
+「喀兰之心」进去是一张满屏雪山图，五个 `OS-S-x` 按钮浮在上面，左上竖条写着
+「积雪清理系统」。MaaCore 的 Copilot 只在**关卡列表**里整屏 OCR 找关卡名
+（`Copilot@ClickStageName`），这种界面它一个都认不出——用户 2026-11-23 的原话
+是「MAA 无法识别 S 关卡」。
+
+所以这条路完全绕开 Copilot 的导航：
+
+| 步 | 谁做 | 判据 / 动作 |
+|---|---|---|
+| 1 | `eventnav.run` | 主页 → 终端 → 活动地图 → 点「喀兰之心」，到 S 关界面 |
+| 2 | `scatter.cells_of` | 五个定点模板各认一次，**认到才算解锁**（没解锁的格子游戏不画） |
+| 3 | `scatter.open_stage` | 点格子 → 等详情面板 → 点「开始行动」（普通）或「突袭模式 → 开始突袭」（突袭）→ 等编队页 |
+| 4 | `maaplan.run_scatter` | 一关排**一个** Copilot 任务（单作业模式），等 TaskChainCompleted |
+| 5 | `scatter.back_to_cells` | 点屏幕回 S 关界面（认到格子且没有详情面板就停手） |
+
+**单作业模式怎么写**（`maaplan._single_params`）：Copilot 参数只给
+`filename`、**不给** `copilot_list`。MaaCore 里那句话是
+`CopilotTask set_params failed, stage_name or filename not found`——filename
+单独就成立。给了 `copilot_list` 它会走 MultiCopilot，每关都要 ClickStageName
+导航，而散点关卡在它的 OCR 里根本不存在。只给 filename 它就不导航，界面在哪
+从哪开始——正好我们从编队页交给它。
+
+**单作业模式不判三星**：asst.log 实证，`BattleProcessTask` 完成 →
+`TaskChainCompleted`，中间没有 `StageDrops` / `EndOfAction` / `WaitUntilEndOfAction`。
+也就是说它打完就结束，界面停在结算页，**成败它不报**。所以：
+- 「点一下回关卡界面」归 `back_to_cells`（三星和失败都要点，失败页还多一层
+  「任务失败」，实测要点两下）；
+- 日志里如实写「打完了（单作业模式不判三星）」，**不要**编造逐关成功数；
+- 别再用「截图看几颗星」补这一课——用户 2026-11-22 明确否了自识别结算页。
+
+**模板与 ROI**（`navtpl/scatter/`，1920 口径）：
+
+| 名字 | 内容 | 备注 |
+|---|---|---|
+| `OSs_1.png` ~ `OSs_5.png` | 五个格子（含编号） | 每个带 `roi`（1920 口径 `[x,y,w,h]`）：模板里带雪山背景，整屏搜会认到隔壁格子上（实测 S2 的模板在 S5 位置 6.9 分，比阈值 12 还低） |
+| `OSs_start.png` | 详情页「开始行动」（蓝） | 本体 0 分，其他页 ≥19.5 分 |
+| `OSs_raid.png` | 「突袭模式」红条 | 切到突袭后这一格就变成「普通难度」了，所以它同时是「当前是普通难度」的判据 |
+| `OSs_start_raid.png` | 「开始突袭」红钮 | 和「开始行动」同位置换字，靠灰度就能分开 |
+| `OSs_quickform.png` | 编队页右上「快捷编队」 | **别用右下那条竖的「开始行动」当判据**：它有滑入动画、亮度跟主题变，同一位置重截一帧能从 0 分掉到 999 |
+
+**格子只认一次**：详情面板一展开，整屏蒙一层暗色，所有模板分数从 0 涨到
+11 分左右，这时重新识别会把「有」看成「没有」（实测 S4 被判成没解锁）。所以
+`run_scatter` 开头认一次、把坐标存下来，之后 `open_stage(..., pos=坐标)`。
+
+**加一期新的散点活动**：
+1. 真机 1920×1080 截图，按上面列表裁模板进 `navtpl/scatter/`；
+2. `LAYOUTS` 里加一条（`zone` 填 eventnav 的分区键，`cells` 填编号→模板+ROI）；
+3. 每张模板先自检（同帧 `find_card_bytes` 应 0~2 分、别的页面 >18 分）；
+4. 冒烟 B58 会自动带上（模板缺失会直接报）。
+
+### 一关怎么算结束（2026-11-23 补齐，三个坑一起踩过）
+
+单作业模式下 MaaCore 的收尾回调**不是只有 Completed/Error 两种**，这三种都要认：
+
+| 回调 | 真实含义 | 处理 |
+|---|---|---|
+| `TaskChainCompleted` | 打完了 | 记成功、`back_to_cells`、下一关 |
+| `TaskChainError` | 任务链报错（结算不是三星等） | 记失败，接着打下一关 |
+| `SubTaskError(why=OperatorMissing)` + `TaskChainStopped` | **编队缺干员**（作业要的干员账号里没有） | 记失败并说出缺谁，接着打下一关 |
+| `TaskChainStopped`（无前置错误） | 次数打满 / 理智不足 / 用户按停止 | 正常收尾 |
+| `wait()` 返回 False 且 `eng.stopped` | **用户点了「停止挂机」** | 记「已停止」，不记失败，直接收尾 |
+
+- **`TaskChainStopped` 不能一律当成功**：编队缺干员时 MaaCore 只发
+  `SubTaskError` + `Stopped`，不发 `Error`。旧代码把 Stopped 记成 `ok=True`，
+  于是 `run_scatter` 既不报失败、`wait()` 又返回 False，最后打成一句
+  「这一关超时（1200 秒）」——用户 2026-11-23 就被这句骗了（实际是缺「圣聆初雪」，
+  而且他中途还手动按了停止）。现在 `maacore` 把 `SubTaskError` 的 `why` 记在
+  引擎上，下一条 `TaskChainStopped` 带 `why` 就走 `chain_failed`。
+- **`wait()` 返回 False ≠ 超时**：它有三种来源（真跑满 / 任务被停 / 根本没跑起来）。
+  现在日志报**实际等了多久**，别再说「超时 1200 秒」这个上限值。
+- **用户按停止要单独说**：`Engine.stop()` 置 `self.stopped`，`run_scatter` /
+  `run_core` 因此在 `wait()` 返回 False 时能分清「你按了停止」和「MAA 卡死」。
+  手动停止：不记 `stages_failed`、`timed_out=False`、`paused='手动停止'`，
+  日志说「已停止（你按了停止），剩下的关不打了」。
+
+**已知限制**：理智不足时「开始行动」点不动（弹理智不足框），`open_stage` 会
+返回「点开始后没进到编队界面」并按关跳过；用户要自己补理智或勾吃药。
+
 ## MAA 小工具（牛杂，`maatools.py`，2026-11-19）
 
 MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列里**，但 MaaCore
@@ -1083,6 +1308,62 @@ B40 用「train-plan.json + account 为字符串/数组/缺 game 的文件」钉
 3. **心跳**（`_wait_run`）：90 秒没有任何新日志就补一句「…还在跑：MN-EX-6
    （已 3 分 20 秒）」。以前直接 `eng.wait(timeout=…)`，卡住和正常跑在面板上
    长得一模一样。
+
+### 回放真实回调流查「日志还是没有」（2026-11-22 晚）
+
+用户第二次报「战斗日志还是有问题，没有 MAA 那种提示」。这次日志里连**一行**
+逐条步骤都没有，只有「开始任务 / 任务失败」。查法（这套值得记住）：
+
+1. 先看落盘的任务日志 `debug/tasks/<tid>.log`，确认不是前端没渲染——它确实
+   一个阶段行都没写。
+2. 再看 MAA 自己的 `debug/asst.log`：同一时间段 `append_callback | SubTaskStart`
+   和 `SubTaskExtraInfo` 一大把，说明 MaaCore **发了**，是我们没接。
+3. 写探针跑一趟最便宜的 `Depot`（仓库识别），在 `Engine._translate` 上打补丁
+   打印**原始 msg 码**：拿到的是 `10001,10002,20001,20002,20003`。
+
+**根因**：`MSG_SUBTASK_*` 一直按 MaaCore 4.x 抄成 70000~70004，而 5.x/6.x
+的 `AsstMsg` 早就挪到 **20000~20004**。任务链级（10001~10004）两边一样，所以
+「开始任务 / 任务失败」一直正常、唯独逐条步骤被 `_translate` 全部挡掉——
+表现就是「一场仗打完日志一个字都没有」，而且没有任何报错。
+
+- 常量改成 20000 段；另留 `_SUBTASK_OLD` 映射，`_translate` 开头先归一化，
+  老核心（4.x）的 70000 段也认，换核心不会又哑一次。
+- `_fn` 里 `_translate` 原来是裸调：翻译层一抛异常，整条事件连日志都不留痕。
+  现在包 try/except，出错落一条 `日志翻译出错（msg=…）` 的 error 事件——
+  这次的坑就是「静默」放大的。
+- 补 `MSG_SUBTASK_ERROR`（20000）：MaaCore 只给 pipeline 名不给原因，
+  `Copilot@WaitUntilEndOfAction` 翻成「作战结束了，但结算不是三星（漏怪 /
+  作业没打过这关）」。以前这种情况只有一句空白的「任务失败：自动战斗」。
+- 验证不用真打：`debug/replay_log.py` 把历史 asst.log 里的 `append_callback`
+  行按时间窗回放给 `_translate` + `_on_core_event`，看面板会打出什么。
+  拿 20:51 那次真机翻车（OS-6 打 2 星）回放，输出和 MAA 自己 gui.log 的形状
+  一致：`换作业：OS-6` → `开始编队` → `[芬, 斑点, …]` → `选择干员: 芬` →
+  `已开始行动` → `当前步骤: 切换倍速 / 部署 芬 …` → `作战结束了，但结算不是三星`。
+
+顺带两条降噪（同一轮用户要求）：
+
+- **练度修正不再显示**：`copilot._fix_oper` 补精英下限照样补，但不再往 notes
+  里塞「芬 精英要求 None → 1」（一套作业集 5~10 行，纯噪音）。技能/星级
+  不合法、丢弃动作这些真问题仍会写。
+- `to_group Group not found in combat data: 雪崩触发装置` 这条 ERR 是无害的
+  （作业把装置写成干员组），`maalog` 翻成「装置/召唤物占位，MAA 认不出会跳过，
+  不影响打」，免得用户以为程序坏了。
+
+
+4. **按 MAA 面板的样式补全（2026-11-22）**：对照 MAA 自己的日志面板，之前缺
+   三类——`BattleFormationSelected`（`details.selected`）没接，所以没有
+   `选择干员: 芬`；`CopilotAction` 的 `SwitchSpeed` / `SkillDaemon` /
+   `UseSkill` / `Retreat` 只报了个词，没有 MAA 那种 `当前步骤: …` 前缀；
+   `BattleFormation` 打成一整句「编队：…」，MAA 是单独一行 `[芬, 斑点, 黑角]`。
+   现在全部对齐，`StartAction` 单独一行 `已开始行动`。
+
+   **每关成功**：MaaCore 6.20.1 在 Copilot 任务里不发 `StageDrops`，但
+   MultiCopilot 是**顺序执行**的——收到下一个 `CopilotListLoadTaskFileSuccess`
+   就说明上一关已经打完（翻车会走 `TaskChainError`，不会换关）。所以换作业时
+   先 `✓ <上一关> 完成`，再把 `state['stage']` 换成新关，并**清掉
+   `state['nodes']`**：阶段去重是按 label + 8 秒窗口做的，不清的话新一关的
+   「已开始行动」会被上一关的那条吞掉。单关作业没有换关信号，以最终的
+   `完成任务：自动战斗` 为准。
 
 
 ## 依赖
