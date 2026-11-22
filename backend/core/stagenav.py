@@ -335,10 +335,16 @@ def game_package(client=None):
 
     ``pidof`` / ``am start`` 都要包名；B 服用户给官服包名会「进程永远不在」，
     启动检测全部落空。
+
+    渠道串来自账号文件的 ``account.channelName``，实际取值是 **``bilibili服``**
+    （不是 ``bilibili``）——2026-11-22 实测：老写法只认 ``('bilibili','b','b服')``，
+    「bilibili服」两边都不等，被判成官服，b 服那台模拟器上找官服包找不到，
+    表现正是「另一个模拟器一点动静都没有」。所以这里按「含 bili / b服」判。
     """
-    return ('com.hypergryph.arknights.bilibili'
-            if str(client or '').lower() in ('bilibili', 'b', 'b服')
-            else 'com.hypergryph.arknights')
+    c = str(client or '').strip().lower()
+    if 'bili' in c or c in ('b', 'b服') or 'b服' in c:
+        return 'com.hypergryph.arknights.bilibili'
+    return 'com.hypergryph.arknights'
 
 
 # ---------------------------------------------------------------- 触屏通道
@@ -350,12 +356,16 @@ class Touch:
     adb 每一下都是独立进程，稳。
     """
 
-    def __init__(self, adb_path, address, log=None, package=None):
+    def __init__(self, adb_path, address, log=None, package=None, strict=False):
         self.adb = adb_path or 'adb'
         self.address = address or '127.0.0.1:5555'
         self.log = log or (lambda *_: None)
         self.package = package or 'com.hypergryph.arknights'
         self._size = None
+        # strict=True：地址是这个号**指定**的那一台（多开），连不上就报错，
+        # 绝不悄悄换成第一台在线设备——换了就等于两个组同时戳同一台，
+        # 表现是「另一台模拟器一动不动」（2026-11-22 用户实测）
+        self.strict = bool(strict)
 
     def game_alive(self):
         """游戏进程在不在运行
@@ -595,17 +605,26 @@ class Touch:
 
         out = self._run(['devices'], timeout=15)
         text = (out or b'').decode('utf-8', 'ignore')
+        online = []
         for line in text.splitlines():
             parts = line.split('\t')
             if len(parts) >= 2 and parts[1].strip().startswith('device'):
                 cand = parts[0].strip()
-                if not cand or cand == self.address:
-                    continue
-                self.address = cand
-                self._size = None
-                out = self._run(['get-state'], timeout=15)
-                if (out or b'').decode('utf-8', 'ignore').strip() == 'device':
-                    return True, 'adb 正常（地址换成 %s）' % cand
+                if cand:
+                    online.append(cand)
+        if self.strict:
+            # 多开时不允许「自动挑一台」：把在线设备列出来，让日志说清连的是谁
+            return False, ('adb 连不上设备「%s」（在线：%s）——多开时不会自动'
+                           '换成别的模拟器，先确认它开着了'
+                           % (self.address, '、'.join(online) or '无'))
+        for cand in online:
+            if cand == self.address:
+                continue
+            self.address = cand
+            self._size = None
+            out = self._run(['get-state'], timeout=15)
+            if (out or b'').decode('utf-8', 'ignore').strip() == 'device':
+                return True, 'adb 正常（地址换成 %s）' % cand
         return False, ('adb 连不上设备「%s」（adb: %s）'
                        % (self.address, self.adb))
 
@@ -632,13 +651,21 @@ def probe(touch):
     几乎没有；主题页再靠中部亮度（亮）和主界面（暗）分开。
     """
     try:
+        data = touch.shot()
+    except Exception:
+        return ''
+    return probe_bytes(data)
+
+
+def probe_bytes(data):
+    """同 :func:`probe`，但吃一张截图 bytes（调用方手里已经有帧时省一次截图）"""
+    if not data:
+        return ''
+    try:
         from PIL import Image
     except Exception:
         return ''
     try:
-        data = touch.shot()
-        if not data:
-            return ''
         im = Image.open(io.BytesIO(data)).convert('RGB')
         w, h = im.size
 
@@ -936,53 +963,72 @@ def find_card_bytes(data, tpl_file, max_score=_CARD_MAX_SCORE):
         if TW >= SW or TH >= SH:
             continue
 
-        # --- 1) 粗扫
-        coarse = (999.0, 0, 0)
+        # --- 1) 粗扫：**留前几名**，别只留冠军
+        # 只留冠军会整块锁错位置：细长低对比的模板（活动提示条那种 400×44 的
+        # 一行字）缩到 1/4 以后笔画几乎没了，背景渐变的谷底可能比字所在的
+        # 位置还低，后面「精修」只在冠军附近几十像素里找，再也回不来。
+        # 2026-11-22 实测（雪山降临导航偶发失败）：同一帧直接按标定位置比是
+        # 10 分，函数却报 22 分、坐标跑到下面别的行上——就是踩了这个。
         step = 4
+        cand = []
         for y in range(0, SH - TH, step):
             for x in range(0, SW - TW, step):
                 s = ImageStat.Stat(ImageChops.difference(
                     small.crop((x, y, x + TW, y + TH)), t)).mean[0]
-                if s < coarse[0]:
-                    coarse = (s, x, y)
+                cand.append((s, x, y))
+        if not cand:
+            continue
+        cand.sort()
 
         # 粗扫都明显不像就别做全分辨率精修了（那一步最贵，两轮上千次全图
         # 比对）。翻屏时 90% 的屏都是无关卡片，跳过能省一半时间。
-        if coarse[0] > _COARSE_SKIP:
+        if cand[0][0] > _COARSE_SKIP:
             continue
 
-        # --- 2) 精修
-        _, cx, cy = coarse
-        for y in range(max(0, cy - step), min(SH - TH, cy + step) + 1):
-            for x in range(max(0, cx - step), min(SW - TW, cx + step) + 1):
-                s = ImageStat.Stat(ImageChops.difference(
-                    small.crop((x, y, x + TW, y + TH)), t)).mean[0]
-                if s < coarse[0]:
-                    coarse = (s, x, y)
+        # 相距不到「半个模板」的算同一个位置；取前 3 个候选各自精修
+        picks = []
+        for s, x, y in cand:
+            if s > _COARSE_SKIP or len(picks) >= 3:
+                break
+            if all(abs(x - px) > TW // 2 or abs(y - py) > TH // 2
+                   for _, px, py in picks):
+                picks.append((s, x, y))
 
-        # --- 3) 全分辨率复核
-        # 1/4 尺度上「玛莉娅·临光」和隔壁「长夜临光」能同时拿到 10 分，
-        # 1/4 分不出来（实测：拿 MN 模板去认，跑到长夜临光那张卡上）。全分辨
-        # 率再比一次就拉开了：同一张卡 0~3 分，相邻卡 15 甚至 30 分。
-        fx = coarse[1] * S
-        fy = coarse[2] * S
-        fw, fh = tw, th
-        fine = (coarse[0], fx, fy)
-        # 两轮：先 ±16 走 4 步（补上 1/4 尺度 16 像素的粒度），再 ±4 走 1 步
-        for rng, st in ((16, 4), (4, 1)):
-            bx, by = fine[1], fine[2]
-            for dy in range(-rng, rng + 1, st):
-                for dx in range(-rng, rng + 1, st):
-                    px, py = bx + dx, by + dy
-                    if px < 0 or py < 0 or px + fw > screen.width or py + fh > screen.height:
-                        continue
-                    d = ImageStat.Stat(ImageChops.difference(
-                        screen.crop((px, py, px + fw, py + fh)), tpl0)).mean[0]
-                    if d < fine[0]:
-                        fine = (d, px, py)
+        zone_best = (999.0, 0, 0)
+        for cs, cx, cy in picks:
+            # --- 2) 精修
+            for y in range(max(0, cy - step), min(SH - TH, cy + step) + 1):
+                for x in range(max(0, cx - step), min(SW - TW, cx + step) + 1):
+                    s = ImageStat.Stat(ImageChops.difference(
+                        small.crop((x, y, x + TW, y + TH)), t)).mean[0]
+                    if s < cs:
+                        cs, cx, cy = s, x, y
 
-        if fine[0] < best[0]:
-            best = (fine[0], fine[1], fine[2], fw, fh)
+            # --- 3) 全分辨率复核
+            # 1/4 尺度上「玛莉娅·临光」和隔壁「长夜临光」能同时拿到 10 分，
+            # 1/4 分不出来（实测：拿 MN 模板去认，跑到长夜临光那张卡上）。全分辨
+            # 率再比一次就拉开了：同一张卡 0~3 分，相邻卡 15 甚至 30 分。
+            fw, fh = tw, th
+            fine = (cs, cx * S, cy * S)
+            # 两轮：先 ±16 走 4 步（补上 1/4 尺度 16 像素的粒度），再 ±4 走 1 步
+            for rng, st in ((16, 4), (4, 1)):
+                bx, by = fine[1], fine[2]
+                for dy in range(-rng, rng + 1, st):
+                    for dx in range(-rng, rng + 1, st):
+                        px, py = bx + dx, by + dy
+                        if px < 0 or py < 0 or px + fw > screen.width or py + fh > screen.height:
+                            continue
+                        d = ImageStat.Stat(ImageChops.difference(
+                            screen.crop((px, py, px + fw, py + fh)), tpl0)).mean[0]
+                        if d < fine[0]:
+                            fine = (d, px, py)
+            if fine[0] < zone_best[0]:
+                zone_best = fine
+            if zone_best[0] <= _EARLY_STOP:   # 已经板上钉钉，别再精修剩下两个
+                break
+
+        if zone_best[0] < best[0]:
+            best = (zone_best[0], zone_best[1], zone_best[2], tw, th)
         if best[0] <= _EARLY_STOP:
             break
 
@@ -1982,17 +2028,20 @@ def goto_stage_list(touch, stage_code, log=None):
                            '先换成真实关卡代号再导航' % stage_code)
 
     # 当期活动：用户 2026-11-19 逐屏标注的那套入口（终端页活动提示条 → 活动
-    # 地图 → 右下区域按钮）。**排在老路径前面**：新活动的 UI 上「主界面大图 →
-    # 主题页 → 区域列表」已经点不到了（区域是散点，分区靠关卡列表右下角切）。
+    # 地图 → 直接点分区节点）。**排在老路径前面**，而且这里**不再退回老路径**
+    # （2026-11-22 用户报「雪山降临用的还是老导航」）：新活动的 UI 上「主界面
+    # 大图 → 主题页 → 区域列表」已经点不到，退化过去只会白点几下再报一个更
+    # 难懂的错，还会让人以为程序在用旧逻辑。失败就把原因说清楚。
     try:
         from . import eventnav
         if eventnav.has(stage_code):
             ok, why = eventnav.run(touch, stage_code, log)
             if ok:
                 return True, why
-            log('当期活动导航没成功（%s），退回老路径再试一次' % why)
+            return False, ('当期活动导航没到位：%s。这条活动的入口模板要重新标定'
+                           '（日志里有现场截图），别用老路径硬试' % why)
     except Exception as e:                       # noqa: BLE001 别把人卡在这
-        log('当期活动导航出错（%s: %s），退回老路径' % (type(e).__name__, e))
+        return False, ('当期活动导航出错（%s: %s）' % (type(e).__name__, e))
 
     # 有卡片模板、或者代号在活动总表（EVENTS）里，就先走「曲谱」：这是显式
     # 配置过的意图。**两道闸都要在**——打包环境里模板目录偶尔解析不到

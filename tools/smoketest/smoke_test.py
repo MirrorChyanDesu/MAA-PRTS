@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import io
 import json
 import os
 import py_compile
@@ -3328,14 +3329,14 @@ def check_envcheck(_tmp):
              'name': '', 'source': ''}
 
     # 1) 读不到 MAA 配置（还没引导过）：放行，别把任务堵死
-    with mock.patch.object(envcheck, 'read_config', lambda: empty):
+    with mock.patch.object(envcheck, 'read_config', lambda *a, **k: empty):
         logs = []
         ok, why = envcheck.ensure(log=logs.append)
         assert ok and not logs, ('没配置时应静默放行', logs)
 
     # 2) 已经连上：零日志（「不显示出来」就是这条）
     with mock.patch.multiple(
-            envcheck, read_config=lambda: cfg,
+            envcheck, read_config=lambda *a, **k: cfg,
             adb_now=lambda cfg=None: (True, 'emulator-5554', 'adb 正常')):
         logs = []
         ok, why = envcheck.ensure(log=logs.append)
@@ -3345,7 +3346,7 @@ def check_envcheck(_tmp):
     # 3) 用户关了自动启动：只提示，绝不发启动命令
     started = []
     with mock.patch.multiple(
-            envcheck, read_config=lambda: cfg,
+            envcheck, read_config=lambda *a, **k: cfg,
             adb_now=lambda cfg=None: (False, '', '没有在线设备'),
             instance_up=lambda cfg: False,
             launch=lambda c: started.append(c) or (True, 'x')):
@@ -3363,7 +3364,7 @@ def check_envcheck(_tmp):
         return (len(seq) > 1, 'emulator-5554', 'adb 正常（emulator-5554）')
     logs = []
     with mock.patch.multiple(
-            envcheck, read_config=lambda: cfg, adb_now=fake_adb,
+            envcheck, read_config=lambda *a, **k: cfg, adb_now=fake_adb,
             instance_up=lambda cfg: False,
             launch=lambda c: (True, 'ldconsole.exe launch --index 0')):
         with mock.patch.object(envcheck, 'settings',
@@ -3375,7 +3376,7 @@ def check_envcheck(_tmp):
 
     # 5) 启动器找不到 / 类型不认识：说清原因，别静默往下走
     with mock.patch.multiple(
-            envcheck, read_config=lambda: dict(cfg, emu_dir='D:\\nope\\'),
+            envcheck, read_config=lambda *a, **k: dict(cfg, emu_dir='D:\\nope\\'),
             adb_now=lambda cfg=None: (False, '', '没有在线设备'),
             instance_up=lambda cfg: False):
         with mock.patch.object(envcheck, 'settings',
@@ -3383,7 +3384,7 @@ def check_envcheck(_tmp):
             ok, why = envcheck.ensure(log=lambda *_: None)
         assert not ok and '目录不存在' in why, why
     with mock.patch.multiple(
-            envcheck, read_config=lambda: dict(cfg, kind='Weird'),
+            envcheck, read_config=lambda *a, **k: dict(cfg, kind='Weird'),
             adb_now=lambda cfg=None: (False, '', '没有在线设备'),
             instance_up=lambda cfg: False):
         with mock.patch.object(envcheck, 'settings',
@@ -3393,7 +3394,7 @@ def check_envcheck(_tmp):
 
     # 6) 进程在、adb 连不上（模拟器还在开机 / adb 端口被占）：等一小会再给话术
     with mock.patch.multiple(
-            envcheck, read_config=lambda: cfg,
+            envcheck, read_config=lambda *a, **k: cfg,
             adb_now=lambda cfg=None: (False, 'emulator-5554', '设备 offline'),
             instance_up=lambda cfg: True):
         ok, why = envcheck.ensure(log=lambda *_: None, wait=1)
@@ -3412,7 +3413,7 @@ def check_envcheck(_tmp):
     skills.SKILLS['wakeup'] = (entry[0], lambda *a, **k: boom.append(1))
     try:
         with mock.patch.object(skills.envcheck, 'ensure',
-                               lambda log=None: (False, '模拟器没起来')):
+                               lambda *a, **k: (False, '模拟器没起来')):
             tid = skills.run_skill('wakeup', {})
             t = None
             for _ in range(300):
@@ -4132,28 +4133,31 @@ def check_agent_tool_chain(tmp):
 
 
 def check_battle_retry(tmp):
-    """B43：逐关战报 + 换作业重挂 + 分段扫图（用户 2026-11-19 的四条需求）
+    """B43：换作业重挂 + 分段扫图 + 「不猜逐关成败」（2026-11-22 改口径）
 
-    ① 一关打完日志有「✔ X 战斗成功」，刷材料重复结算不刷屏
+    ① 不再把 StageDrops 当「这关成功」：MaaCore 在 Copilot 里根本不发这个
+      回调，算出来的「成功 0 关」是假消息，`_mark_clear` 现在什么也不记
     ② 作业翻车时日志明确「✘ X 翻车：原因」，能看出是哪一关
-    ③ 失败后换下一份作业重挂这一关，**已成功的关不重排**
+    ③ 失败后换下一份作业，**从卡住的那关往后重挂**（前面的关不重打）
     ④ skill_sweep 的分段顺序：普通关 → EX 普通 → EX 突袭 → S 关
     """
     _reset_config(tmp)
     from core import copilot, maaplan, resources, skills
 
-    # ① 逐关成功
+    # ① 逐关成败不统计：掉落回调进来也不要写「战斗成功」、不记 results
     st = {'stage': 'SV-EX-1', 'cleared': {}, 'results': [], 'cur_cid': 41623}
     logs = []
     maaplan._mark_clear({'stats': [{'itemName': '固源岩', 'addQuantity': 2}]},
                         logs.append, st)
-    assert len(st['results']) == 1, st
-    r0 = st['results'][0]
-    assert r0['stage'] == 'SV-EX-1' and r0['ok'] is True and r0['cid'] == 41623, r0
-    assert any('✔ SV-EX-1 战斗成功' in x and '固源岩' in x for x in logs), logs
-    # 同一关再结算一次（刷材料）：只喊一次「战斗成功」
-    maaplan._mark_clear({'stats': []}, logs.append, st)
-    assert sum(1 for x in logs if '战斗成功' in x) == 1, logs
+    assert st['results'] == [], st
+    assert not any('成功' in x for x in logs), logs
+    maaplan._on_core_event({'kind': 'extra', 'what': 'StageDrops',
+                            'data': {'stats': [{'itemName': '固源岩',
+                                                'addQuantity': 2}]}},
+                           logs.append, None, st)
+    assert any('掉落' in x for x in logs), logs
+    assert not any('战斗成功' in x for x in logs), logs
+    assert st['results'] == [], st
 
     # ② 翻车要说清是哪一关
     st2 = {'stage': 'SV-EX-2', 'cleared': {}, 'results': []}
@@ -4202,10 +4206,9 @@ def check_battle_retry(tmp):
     skills._default_maa_dir = lambda: tmp
     try:
         eng = Eng()
-        state = {'stage': 'SV-EX-2', 'cleared': {'SV-EX-1': True},
-                 'results': [{'stage': 'SV-EX-1', 'ok': True, 'why': '',
-                              'at': 0, 'cid': 101},
-                             {'stage': 'SV-EX-2', 'ok': False, 'why': 'x',
+        # 只记了「卡在 SV-EX-2」这一条失败（没有逐关成功记录）
+        state = {'stage': 'SV-EX-2', 'cleared': {},
+                 'results': [{'stage': 'SV-EX-2', 'ok': False, 'why': 'x',
                               'at': 0, 'cid': 102}],
                  'tried': {'SV-EX-1@raid': 101, 'SV-EX-2@raid': 102},
                  'by_file': {}, 'cid_of': {}, 'last_log': 0}
@@ -4227,7 +4230,7 @@ def check_battle_retry(tmp):
         assert swapped and swapped[0]['to'] == 202, swapped
         assert mark is not None, '重试过就要给收尾一个 chains 分界'
         assert any('换作业重挂：SV-EX-2' in x for x in logs3), logs3
-        assert not any('SV-EX-1' in x for x in logs3), '已成功的关不该重挂'
+        assert not any('SV-EX-1' in x for x in logs3), '卡住之前的关不该重挂'
     finally:
         copilot.fetch_prepared, skills._default_maa_dir = old
 
@@ -4258,8 +4261,8 @@ def check_battle_retry(tmp):
 def check_event_nav(tmp):
     """B44：当期活动导航 + 翻车重挂前点结算页 + 关卡名单核对
 
-    ① 当期活动表带有效期（TL 到 2026-11-25），过期只提示不失效
-    ② 用户说「最新活动 / 活动名」能落到真实代号（TL-1）
+    ① 当期活动表带有效期（OS 到 2026-12-02，TL 只剩商店到 11-28），过期只提示不失效
+    ② 用户说「最新活动 / 活动名」能落到真实代号（OS-1；已结束的 TL 排后面）
     ③ 导航模板都在包里（缺了就只能靠兜底坐标）
     ④ goto_stage_list 对当期活动先走 eventnav，不再点老的活动大图
     ⑤ 翻车重挂前点一下结算页（MAA 自己的 ClickCorner 位置）回关卡列表
@@ -4271,35 +4274,41 @@ def check_event_nav(tmp):
     from core import eventnav, maaplan, skills, stagenav
 
     # ① 有效期
-    assert eventnav.has('TL-EX-1') and not eventnav.has('SV-EX-1')
-    assert not eventnav.is_expired('TL', datetime.date(2026, 11, 19))
-    assert eventnav.is_expired('TL', datetime.date(2026, 11, 26))
-    act = eventnav.active(datetime.date(2026, 11, 19))
-    assert any(r['prefix'] == 'TL' and r['until'] == '2026-11-25' for r in act), act
+    assert eventnav.has('OS-EX-1') and not eventnav.has('SV-EX-1')
+    assert not eventnav.is_expired('OS', datetime.date(2026, 11, 22))
+    assert eventnav.is_expired('OS', datetime.date(2026, 12, 3))
+    assert not eventnav.is_expired('TL', datetime.date(2026, 11, 27))
+    assert eventnav.is_expired('TL', datetime.date(2026, 11, 29))
+    act = eventnav.active(datetime.date(2026, 11, 22))
+    assert any(r['prefix'] == 'OS' and r['until'] == '2026-12-02' for r in act), act
+    assert act[0]['prefix'] == 'OS', '已结束的 TL 要排在正在开的 OS 后面'
     assert not any(r['prefix'] == 'TL'
                    for r in eventnav.active(datetime.date(2026, 12, 1)))
 
     # ② 指代 → 真实代号
-    assert eventnav.match_name('最新活动') == 'TL-1'
-    assert eventnav.match_name('当期活动') == 'TL-1'
+    assert eventnav.match_name('最新活动') == 'OS-1'
+    assert eventnav.match_name('当期活动') == 'OS-1'
+    assert eventnav.match_name('雪山降临') == 'OS-1'
     assert eventnav.match_name('时间啊，向前！') == 'TL-1'
     assert eventnav.match_name('时间啊向前') == 'TL-1'
     assert eventnav.match_name('覆潮之下') == ''
-    assert skills.norm_stage('最新活动')[0] == 'TL-1'
+    assert skills.norm_stage('最新活动')[0] == 'OS-1'
     assert skills.norm_stage('SV-EX-1')[0] == 'SV-EX-1'
 
-    # ③ 模板齐全 + 分区结构（基础 / EX / S 都要有兜底坐标和识别区域）
-    ent = eventnav.ENTRIES['TL']
-    specs = [ent['entry']] + list(ent['zones'].values())
+    # ③ 模板齐全 + 分区结构（OS 是当期复刻活动：三个分区 + 三个工具入口 + 领奖按钮）
+    ent = eventnav.ENTRIES['OS']
+    specs = ([ent['entry'], ent['claim']] + list(ent['zones'].values())
+             + list(ent['tools'].values()))
     for s in specs:
         p = eventnav._tpl_path(s['tpl'])
         assert p and os.path.isfile(p), s
     assert set(ent['zones']) == {'base', 'ex', 's'}, ent['zones']
     for k, v in ent['zones'].items():
         assert len(v['tap']) == 2 and len(v['roi']) == 4, (k, v)
-    # ROI 只框住目标按钮：EX 和 S 的识别区域不能重叠到互相抢
-    assert ent['zones']['ex']['roi'][1] + ent['zones']['ex']['roi'][3] \
-        <= ent['zones']['s']['roi'][1], ent['zones']
+    # 活动结束后 TL 只留商店：分区关掉，别让导航到地图上才发现没按钮
+    tl = eventnav.ENTRIES['TL']
+    assert tl.get('closed') and not tl['zones'], tl
+    assert set(tl['tools']) == {'shop'}, tl['tools']
 
     # ④ 当期活动先走 eventnav
     called = []
@@ -4517,16 +4526,17 @@ def check_maa_tool(tmp):
 
     from core import eventnav, maaplan, maatools, skills
 
-    # ① 模板 + 结构
-    ent = eventnav.ENTRIES['TL']
-    assert set(ent['tools']) == {'minigame', 'shop'}, ent['tools']
+    # ① 模板 + 结构（OS 的三个入口：小游戏 / 商店 / 活动奖励）
+    ent = eventnav.ENTRIES['OS']
+    assert set(ent['tools']) == {'minigame', 'shop', 'reward'}, ent['tools']
     for k, v in ent['tools'].items():
         p = eventnav._tpl_path(v['tpl'])
         assert p and os.path.isfile(p), (k, v['tpl'])
         assert len(v['tap']) == 2 and len(v['roi']) == 4, (k, v)
-    # 小游戏在左上、商店在右上，识别区域不能互相盖住
+    # 小游戏在右上、商店在左侧，识别区域不能互相盖住（任一方向分开即可）
     a, b = ent['tools']['minigame']['roi'], ent['tools']['shop']['roi']
-    assert a[0] + a[2] <= b[0], (a, b)
+    assert (a[0] + a[2] <= b[0] or b[0] + b[2] <= a[0]
+            or a[1] + a[3] <= b[1] or b[1] + b[3] <= a[1]), (a, b)
 
     # ② run_tool：先到活动地图，再点入口
     calls = []
@@ -4549,8 +4559,8 @@ def check_maa_tool(tmp):
     try:
         ok, why = eventnav.run_tool(Shot(), 'minigame', log=lambda *_: None)
         assert ok and why, (ok, why)
-        assert calls[0] == ('map', 'TL'), calls
-        assert calls[1][0] == 'tap' and '战时新闻委员会' in calls[1][1], calls
+        assert calls[0] == ('map', 'OS'), calls
+        assert calls[1][0] == 'tap' and '喀兰贸易' in calls[1][1], calls
         ok2, _ = eventnav.run_tool(Shot(), 'shop', log=lambda *_: None)
         assert ok2
         # 没配入口要说清楚，而不是默默点到别的地方
@@ -4560,11 +4570,25 @@ def check_maa_tool(tmp):
         eventnav._to_map, eventnav._tap = orig_map, orig_tap
         eventnav.time.sleep = orig_sleep
 
-    # ③ 名字 → 键
+    # ③ 名字 → 键（2026-11-22：两个活动的小游戏是两条不同任务，泛称要配 prefix）
     assert maatools.resolve('战时新闻委员会')[0] == 'wartime_press'
-    assert maatools.resolve('小游戏')[0] == 'wartime_press'
+    assert maatools.resolve('喀兰贸易技术研发部')[0] == 'os_rd'
+    assert maatools.resolve('小游戏', prefix='OS')[0] == 'os_rd'
+    assert maatools.resolve('小游戏', prefix='TL')[0] == 'wartime_press'
     assert maatools.resolve('活动商店')[0] == 'event_shop'
     assert maatools.resolve('shop')[0] == 'event_shop'
+    # 「小游戏」不带活动 → 说不清是哪一个，必须让用户/助手补 prefix
+    try:
+        maatools.resolve('小游戏')
+    except ValueError as e:
+        assert '小游戏' in str(e) or '哪一个' in str(e), e
+    else:
+        raise AssertionError('泛称不带 prefix 该报错')
+    # 两条 Custom 任务名不能写混（写错了 MAA 会当成不存在）
+    assert maatools.TOOLS['os_rd']['task']['task_names'] == ['MiniGame@OS@Begin']
+    assert maatools.TOOLS['wartime_press']['task']['task_names'] == \
+        ['MiniGame@WartimePressCommittee@Begin']
+    assert maatools.TOOLS['os_rd']['prefix'] == 'OS'
     try:
         maatools.resolve('抽卡')
     except ValueError:
@@ -5164,6 +5188,562 @@ def check_account_bind(tmp):
                                              'accountNameFrom': ''})
 
 
+def check_event_os(tmp):
+    """B51 复刻活动 OS + TL 收尾
+
+    用户 2026-11-22 的口径：TL 只剩商店（关卡和小游戏入口都关了），OS 是当期
+    复刻活动，导航要能从「终端页横幅」进地图并点齐六个入口。这里只查数据与
+    模板是否齐、指代是否落到 OS——真实点击要模拟器，冒烟不碰。
+    """
+    from core import eventnav, resources
+
+    os_ent = eventnav.ENTRIES.get('OS') or {}
+    assert os_ent.get('reprint') is True, 'OS 要标成复刻（前端挂「复刻」、助手问突袭都靠它）'
+    assert set(os_ent.get('zones') or {}) == {'base', 'ex', 's'}, os_ent.get('zones')
+    assert set(os_ent.get('tools') or {}) == {'minigame', 'shop', 'reward'}, \
+        os_ent.get('tools')
+    assert (os_ent.get('claim') or {}).get('tpl'), '活动奖励页少了「一键领取」的按钮模板'
+
+    # 模板文件得都在（打包漏文件时这里当场暴露）
+    specs = [os_ent.get('entry'), os_ent.get('claim')]
+    specs += list((os_ent.get('zones') or {}).values())
+    specs += list((os_ent.get('tools') or {}).values())
+    for spec in specs:
+        tpl = (spec or {}).get('tpl') or ''
+        p = eventnav._tpl_path(tpl)
+        assert p and os.path.isfile(p), '缺活动导航模板：%s' % tpl
+
+    tl = eventnav.ENTRIES['TL']
+    assert tl.get('closed') is True, 'TL 已结束，要标 closed'
+    assert not (tl.get('zones') or {}), 'TL 的关卡分区要关掉（点了也进不去）'
+    assert set(tl.get('tools') or {}) == {'shop'}, 'TL 只留商店入口'
+    ok, why = eventnav.run(None, 'TL-5')
+    assert not ok and '结束' in why, why
+
+    assert eventnav.match_name('雪山降临') == 'OS-1', '活动名要能对到 OS'
+    assert eventnav.match_name('最新活动') == 'OS-1', '「最新活动」要给正在开的 OS，不是已结束的 TL'
+    assert eventnav.active()[0]['prefix'] == 'OS', 'active() 里已结束的活动要排后面'
+
+    rows = {r['id']: r for r in resources.activity_list(40)}
+    assert rows.get('act46side', {}).get('reprint') is True, '资源库活动列表没标复刻'
+    assert rows.get('act55side', {}).get('reprint') is False, 'TL 不该被标成复刻'
+
+
+def check_multi_emu_batch(tmp):
+    """B52：多 MAA / 多模拟器编排 + 领奖 skill + 「默认用当前选中的号」
+
+    用户 2026-11-22 的口径：
+    ① 每个账号用自己绑的 MAA 目录（没绑才退回全局默认）；
+    ② 同一台模拟器上的号排队切号，不同模拟器并行多开；
+    ③ 用户没点名账号时，默认用他在左侧点开的那个（settings.lastAccount）；
+    ④ 「领活动奖励」是个独立 skill（claim），不经过 MaaCore。
+    """
+    _reset_config(tmp)
+    from unittest import mock  # noqa: F401
+    from core import acctbind, accounts, maaplan, settings, skills, tasks
+
+    def mk(name, nick, maa_dir='', profile=''):
+        accounts.save_account(name + '.json', {
+            'account': {'uid': name, 'nickName': nick,
+                        'channelName': '官服', 'game': 'arknights'},
+            'maa': {'dir': maa_dir, 'profile': profile}})
+        return name + '.json'
+
+    a = mk('emu1a', '号一', r'D://MAA-A')
+    b = mk('emu1b', '号二', r'D://MAA-A')
+    c = mk('emu2', '号三', r'D://MAA-B')
+    plain = mk('plain', '号四')
+
+    # ① 账号绑的 MAA 优先，没绑退回全局默认（落盘时路径会归一成 /，比 normpath）
+    def same(x, y):
+        return os.path.normpath(x or '').lower() == os.path.normpath(y or '').lower()
+
+    settings.save({'maaDir': r'D://DEFAULT'})
+    assert same(acctbind.dir_of(a), r'D://MAA-A'), acctbind.dir_of(a)
+    assert same(acctbind.dir_of(plain), r'D://DEFAULT'), acctbind.dir_of(plain)
+    # 切号名解析跟着这个账号自己的档案走（档案不存在 → 空串，不抛）
+    assert acctbind.profile_of(c) == ''
+
+    # ③ 默认账号 = 用户在左侧点开的那个
+    settings.save({'lastAccount': b})
+    assert skills._account_file('') == b, skills._account_file('')
+    settings.save({'lastAccount': '不存在.json'})
+    assert skills._account_file('') in {a, b, c, plain}
+    settings.save({'maaDir': r'D://DEFAULT', 'lastAccount': ''})
+
+    # ② 分组：同 (MAA 目录 + adb 地址) 合并，不同拆开
+    addr = {os.path.normpath(r'D://MAA-A').lower(): '127.0.0.1:5555',
+            os.path.normpath(r'D://MAA-B').lower(): '127.0.0.1:5557'}
+    old_conn = maaplan._connection
+
+    def fake_conn(d, p=None):
+        return {'adb_path': 'adb',
+                'address': addr.get(os.path.normpath(d or '').lower(),
+                                    '127.0.0.1:5555'),
+                'config': 'General', 'touch': 'MiniTouch', 'maa_dir': d}
+
+    maaplan._connection = fake_conn
+    try:
+        rows = [{'file': a, 'name': '号一', 'maaDir': r'D://MAA-A'},
+                {'file': b, 'name': '号二', 'maaDir': r'D://MAA-A'},
+                {'file': c, 'name': '号三', 'maaDir': r'D://MAA-B'}]
+        groups = maaplan.plan_groups(rows, {'maaDir': r'D://MAA-A'})
+        assert len(groups) == 2, groups
+        assert sorted(len(g['rows']) for _, g in groups) == [1, 2], groups
+
+        # ② run_batch：同组串行（号一 → 号二），两组都跑到
+        seq = []
+
+        def fake(tag):
+            def fn(params, log, tid=None):
+                seq.append((params.get('account'), tag))
+                return {'ok': True}
+            return fn
+
+        old_skills = dict(skills.SKILLS)
+        old_ensure = skills.envcheck.ensure
+        skills.SKILLS['wakeup'] = ('唤醒', fake('wakeup'))
+        skills.SKILLS['claim'] = ('领奖', fake('claim'))
+        skills.envcheck.ensure = lambda *x, **k: (True, 'ok')
+        # 多开默认每组一个**独立子进程**（同进程两个 MaaCore 抢管道，见
+        # multiproc 注释）。测试里换成「就地跑」——否则子进程拿不到上面
+        # 这几个假 skill，会真的去连模拟器
+        from core import multiproc
+        old_proc = multiproc.run_group
+        proc_calls = []
+
+        def local_proc(kind, tid_, idx, payload, log, who=''):
+            proc_calls.append((kind, idx, payload.get('group', {}).get('files')))
+            res = {}
+            lk = threading.Lock()
+            steps = [(s[0], s[1] if len(s) > 1 else {})
+                     for s in payload.get('steps') or []]
+            skills._run_group(payload['group'], steps, payload.get('names') or {},
+                              log, res, lk, tid=None)
+            return res, []
+
+        multiproc.run_group = local_proc
+        t = None
+        try:
+            tid = skills.run_batch([a, b, c], [{'skill': 'wakeup'},
+                                               {'skill': 'claim'}])
+            for _ in range(500):
+                t = tasks.get(tid)
+                if t and t['status'] != 'running':
+                    break
+                time.sleep(0.02)
+        finally:
+            skills.SKILLS.clear()
+            skills.SKILLS.update(old_skills)
+            skills.envcheck.ensure = old_ensure
+            multiproc.run_group = old_proc
+        assert t and t['status'] == 'done', (t or {}).get('error')
+        # 两台模拟器 = 两个子进程，每组只带自己那台的号
+        assert len(proc_calls) == 2, proc_calls
+        assert sorted(len(v) for _k, _i, v in proc_calls) == [1, 2], proc_calls
+        for f in (a, b, c):
+            got = [tag for (who, tag) in seq if who == f]
+            assert got == ['wakeup', 'claim'], (f, got)
+        # 同一台模拟器上必须串行：号二的唤醒在号一领完奖之后
+        assert seq.index((a, 'claim')) < seq.index((b, 'wakeup')), seq
+        res = t.get('result') or {}
+        assert res.get('groups') == 2 and res.get('accounts') == 3, res
+        # 日志里要带账号前缀，多开时能分清是谁
+        assert any(x.startswith('[号一]') for x in t.get('logs') or []), \
+            t.get('logs')[:5]
+
+        # 步骤清洗：中文别名认，乱七八糟的当场报错
+        assert [n for n, _ in skills._norm_steps([{'skill': '扫图'},
+                                                  {'skill': 'claim'}])] == \
+            ['sweep', 'claim']
+        try:
+            skills._norm_steps([{'skill': '飞'}])
+        except ValueError as e:
+            assert '飞' in str(e), e
+        else:
+            raise AssertionError('不认识的 skill 该报错')
+    finally:
+        maaplan._connection = old_conn
+
+    # ④ 领奖 skill 注册了，并且归到「需要模拟器」那一组
+    assert 'claim' in skills.SKILLS and callable(skills.SKILLS['claim'][1])
+    assert 'claim' in skills._NEEDS_GAME
+    # 助手侧：工具 + 处理器都挂上了
+    from core import agent
+    names = [x['function']['name'] for x in agent.TOOLS]
+    assert 'skill_claim' in names and 'run_steps' in names, names
+    assert 'skill_claim' in agent._HANDLERS and 'run_steps' in agent._WRITE_HANDLERS
+
+
+def check_multi_emu_address(tmp):
+    """B53：多开的三处硬伤——导航只点目标分区、地址必须真的传下去、
+    点名设备时不许自动换成别台
+
+    2026-11-22 用户实测两条：
+    ① 雪山降临走了老导航；
+    ② 说好两台并行，第二台（5556）一动不动。
+    这里把背后的判定全钉住（不动真模拟器）。
+    """
+    _reset_config(tmp)
+    from core import eventnav, maaplan, settings, skills, stagenav, tasks
+
+    # ---- ① 导航：直接点目标分区，不再「先基础区再切 EX」----
+    taps = []
+    ok_steps = []
+
+    class FakeTouch:
+        def __init__(self):
+            self.n = 0
+        def shot(self):
+            self.n += 1
+            return b'shot%d' % self.n
+
+    old_map, old_tap = eventnav._to_map, eventnav._tap
+    old_moved = stagenav._moved
+    eventnav._to_map = lambda *a, **k: (True, b'map', '活动地图')
+    eventnav._tap = lambda touch, data, spec, log, what: taps.append(
+        spec.get('label')) or True
+    stagenav._moved = lambda a, b: True
+    try:
+        for code, want in [('OS-1', ['圣巡之旅']),
+                           ('OS-EX-1', ['变革之路']),
+                           ('OS-S-1', ['喀兰之心'])]:
+            del taps[:]
+            ok, why = eventnav.run(FakeTouch(), code, lambda *_: None)
+            ok_steps.append((code, ok, list(taps), why))
+            assert ok, (code, why)
+            # 只点目标那一个节点：绕一遍基础区会让 EX/S 的模板落到关卡列表上
+            assert taps == want, (code, taps)
+    finally:
+        eventnav._to_map, eventnav._tap = old_map, old_tap
+        stagenav._moved = old_moved
+
+    # 新活动导航失败时不再悄悄退回老路径（老 UI 早就点不到了）
+    old_run, old_story = eventnav.run, stagenav.goto_story_activity
+    eventnav.run = lambda *a, **k: (False, '测试：认不到活动横幅')
+    stagenav.goto_story_activity = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('不该退回老路径'))
+    try:
+        ok, why = stagenav.goto_stage_list(FakeTouch(), 'OS-EX-2', lambda *_: None)
+        assert not ok and '老路径' in why, (ok, why)
+    finally:
+        eventnav.run, stagenav.goto_story_activity = old_run, old_story
+
+    # ---- ② 地址真的传进 MaaCore：run_core / run_custom 都认 adbAddress ----
+    old_conn = maaplan._connection
+    seen = []
+    maaplan._connection = lambda d, p=None: dict(
+        seen.append((d, p)) or {'adb_path': 'adb', 'address': 'emulator-5554',
+                                'config': 'General', 'touch': 'MiniTouch',
+                                'maa_dir': d})
+    try:
+        # 只看「取连接」这一段：把 Engine 换成假的，一进去就抛，验证 spec 的
+        # profile / adbAddress 有没有被用上
+        import core.maacore as maacore
+        old_eng = maacore.Engine
+
+        class Boom(Exception):
+            pass
+
+        class FakeEng:
+            def __init__(self, d, on_event=None):
+                raise Boom(d)
+
+        maacore.Engine = FakeEng
+        try:
+            try:
+                maaplan.run_core({'maaDir': r'D://MAA-B', 'profile': 'b服',
+                                  'adbAddress': 'emulator-5556',
+                                  'tasks': ['startup']}, tid=None, timeout=5)
+            except Boom:
+                pass
+            except Exception:
+                pass
+        finally:
+            maacore.Engine = old_eng
+        assert seen and seen[0][1] == 'b服', seen
+    finally:
+        maaplan._connection = old_conn
+
+    # skills 侧：每个 spec 都带 profile / adbAddress
+    assert skills._profile_kw('nope.json') == {}, skills._profile_kw('nope.json')
+    assert skills._addr_kw('nope.json') == {}
+    skills._ADDR.map = {'x.json': 'emulator-5556'}
+    try:
+        assert skills._addr_kw('x.json') == {'adbAddress': 'emulator-5556'}
+        assert skills._strict_addr('x.json') is True
+        assert skills._strict_addr('nope.json') is False
+    finally:
+        skills._ADDR.map = {}
+
+    # ---- ③ 点名了设备就不许 adb 自检偷偷换一台 ----
+    def fake_adb(touch):
+        def run(args, timeout=20):
+            if args[0] == 'get-state':
+                # 只有 5554 那台真的通：5556 连不上时，严格模式必须停手
+                return b'device' if touch.address == 'emulator-5554' else b''
+            return b'List of devices\nemulator-5554\tdevice\n'
+        return run
+
+    t = stagenav.Touch('adb', 'emulator-5556', strict=True)
+    t._run = fake_adb(t)
+    ok, why = t.ready()
+    assert not ok and t.address == 'emulator-5556', (ok, why, t.address)
+    assert 'emulator-5554' in why, why          # 把在线设备列出来，便于排查
+    t2 = stagenav.Touch('adb', 'emulator-5556')
+    t2._run = fake_adb(t2)
+    ok2, why2 = t2.ready()
+    assert ok2 and t2.address == 'emulator-5554', (ok2, why2, t2.address)
+
+    # ---- ④ 点名地址参与分组：plan_groups 认 r['address'] ----
+    rows = [{'file': 'a.json', 'name': 'A', 'maaDir': r'D://MAA-A',
+             'address': 'emulator-5556'},
+            {'file': 'b.json', 'name': 'B', 'maaDir': r'D://MAA-A'}]
+    old_conn2 = maaplan._connection
+    maaplan._connection = lambda d, p=None: {'adb_path': 'adb',
+                                            'address': 'emulator-5554',
+                                            'config': 'General', 'touch': 'MiniTouch',
+                                            'maa_dir': d}
+    try:
+        groups = maaplan.plan_groups(rows, {'maaDir': r'D://MAA-A'})
+        assert len(groups) == 2, groups
+        assert sorted(g['address'] for _k, g in groups) == ['emulator-5554',
+                                                            'emulator-5556'], groups
+    finally:
+        maaplan._connection = old_conn2
+
+    # ---- ⑤ 任务日志落盘：窗口关了也能查「第二组到底跑没跑」----
+    tid = tasks.create('B53 落盘测试', lambda: tasks.log(
+        threading.current_thread().name.replace('task-', '', 1), 'hello-5556'))
+    for _ in range(200):
+        s = tasks.get(tid)
+        if s and s['status'] != 'running':
+            break
+        time.sleep(0.02)
+    path = os.path.join(settings.DEBUG_DIR, 'tasks', '%s.log' % tid)
+    assert os.path.isfile(path), path
+    text = io.open(path, encoding='utf-8').read()
+    assert 'hello-5556' in text and 'B53 落盘测试' in text, text
+
+    # ---- ⑥ 组线程崩了要留痕（daemon 线程静默死掉＝用户看到的「没动静」）----
+    from core import accounts
+    accounts.save_account('b53.json', {
+        'account': {'uid': 'b53', 'nickName': '落盘号',
+                    'channelName': '官服', 'game': 'arknights'},
+        'maa': {'dir': r'D://MAA-B', 'profile': ''}})
+    old_skills = dict(skills.SKILLS)
+    old_ensure = skills.envcheck.ensure
+    skills.SKILLS['wakeup'] = ('唤醒', lambda p, log, tid=None: {'ok': True})
+    skills.envcheck.ensure = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('B53 故意让这一组炸'))
+    try:
+        tid2 = skills.run_batch(['b53.json'], [{'skill': 'wakeup'}],
+                                emulators={'b53.json': 'emulator-5556'})
+        for _ in range(300):
+            s = tasks.get(tid2)
+            if s and s['status'] != 'running':
+                break
+            time.sleep(0.02)
+        logs = (s or {}).get('logs') or []
+        assert any('出错' in x for x in logs), logs
+    finally:
+        skills.SKILLS.clear()
+        skills.SKILLS.update(old_skills)
+        skills.envcheck.ensure = old_ensure
+
+
+def _fake_screen(tmp, items):
+    """拼一张 1920×1080 的灰底假截图，把模板按 (x, y, 模板名) 贴上去
+
+    ``items`` 里的坐标是 **1920 口径左上角**。返回 PNG bytes。
+    """
+    from PIL import Image
+    im = Image.new('RGB', (1920, 1080), (58, 62, 74))
+    for x, y, name in items:
+        tpl = Image.open(eventnav_tpl(name)).convert('RGB')
+        im.paste(tpl, (int(x), int(y)))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+def eventnav_tpl(name):
+    from core import eventnav
+    p = eventnav._tpl_path(name)
+    assert p and os.path.isfile(p), '模板丢了：%s' % name
+    return p
+
+
+def check_nav_from_stage_list(tmp):
+    """B54：导航的起点可能是任意一页——不盲点终端大卡、提示条走定点比对
+
+    2026-11-22 实测链：连跑多关 → 起点是上一关的关卡列表 → 盲点终端大卡戳到
+    关卡卡片上；同时活动提示条用整屏搜索会锁错位置，日志报「点了六次终端大卡
+    都看不到提示条」。这里全用合成图钉住，不碰真机。
+    """
+    _reset_config(tmp)
+    from core import eventnav, stagenav
+
+    # ---- ① 活动提示条：定点比对准，整块挪走就不认 ----
+    ok, sc, ex, ey = eventnav._entry_here(
+        _fake_screen(tmp, [(150, 805, 'OS_entry.png')]),
+        eventnav.ENTRIES['OS']['entry'])
+    assert ok and sc < 3, (ok, sc)
+    assert abs(ex - 350) <= 3 and abs(ey - 827) <= 3, (ex, ey)
+
+    ok, sc, _, _ = eventnav._entry_here(
+        _fake_screen(tmp, [(700, 300, 'OS_entry.png')]),
+        eventnav.ENTRIES['OS']['entry'])
+    assert not ok, '提示条挪到别处就不该认'
+
+    # 别的页面（关卡列表）拿同一片区域去比，分数要高得多
+    ok2, sc2, _, _ = eventnav._entry_here(
+        _fake_screen(tmp, [(150, 805, 'OS_z1.png')]),
+        eventnav.ENTRIES['OS']['entry'])
+    assert not ok2 and sc2 > eventnav._ENTRY_MAX, (ok2, sc2, sc)
+
+    # ---- ② 不在主界面系时不许点「终端」大卡，先退 ----
+    taps, backs = [], []
+
+    class FakeTouch:
+        def __init__(self, data):
+            self.data = data
+        def shot(self):
+            return self.data
+        def tap(self, x, y):
+            taps.append((x, y))
+            return True
+        def tap_px(self, px, py):
+            taps.append((px, py))
+            return True
+        def back(self):
+            backs.append(1)
+            return True
+        def esc(self):
+            backs.append('esc')
+            return True
+        def heal(self):
+            return True
+
+    on_map = _fake_screen(tmp, [(1303, 769, 'OS_z1.png')])   # 有分区节点 = 活动地图
+    old_at_home, old_to_home = stagenav.at_home, eventnav._to_home
+    stagenav.at_home = lambda t: False
+    logs = []
+    eventnav._to_home = lambda touch, log, rounds=5: (
+        backs.append('home') or log('B54：退主界面') or False)
+    try:
+        data, x, y, sc = eventnav._to_terminal(
+            FakeTouch(on_map), eventnav.ENTRIES['OS']['entry'], logs.append)
+        assert not data, '一直退不回主界面就该老实返回空'
+        assert not taps, ('不在主界面还点了坐标（会戳到关卡卡片）：%s' % taps)
+        assert backs.count('home') >= 1, backs
+        assert any('退回主界面' in x for x in logs), logs
+    finally:
+        stagenav.at_home, eventnav._to_home = old_at_home, old_to_home
+
+    # 在主界面系上：点一次终端大卡就到位（提示条一开始就可见时一次都不点）
+    home = _fake_screen(tmp, [(150, 805, 'OS_entry.png')])
+    del taps[:]
+    stagenav.at_home = lambda t: True
+    try:
+        data, x, y, sc = eventnav._to_terminal(
+            FakeTouch(home), eventnav.ENTRIES['OS']['entry'], lambda *_: None)
+        assert data and not taps, (len(data or b''), taps)
+    finally:
+        stagenav.at_home = old_at_home
+
+    # ---- ③ 已经在活动地图上 → 不要再回主界面 ----
+    del taps[:], backs[:]
+    stagenav.at_home = lambda t: False
+    try:
+        got = eventnav._near_map(FakeTouch(on_map),
+                                 eventnav.ENTRIES['OS'], lambda *_: None)
+        assert got, '基础区节点认得到，就该判定「已经在活动地图上」'
+        assert not backs, ('在地图上还按了返回键：%s' % backs)
+    finally:
+        stagenav.at_home = old_at_home
+
+    # 关卡列表（probe 也判 map，但认不到分区节点）→ 只允许按一下返回，不许点坐标
+    plain = _fake_screen(tmp, [])
+    del taps[:], backs[:]
+    got = eventnav._near_map(FakeTouch(plain), eventnav.ENTRIES['OS'],
+                             lambda *_: None)
+    assert not got, '认不到分区节点就不该当自己在活动地图上'
+    assert backs == [1], backs
+    assert not taps, taps
+
+    # ---- ④ probe_bytes 和 probe 同一套判定（调用方手上有帧时省一次截图）----
+    def fake_probe(data):
+        return stagenav.probe(FakeTouch(data))
+
+    for data in (on_map, home, plain):
+        assert stagenav.probe_bytes(data) == fake_probe(data)
+
+    # ---- ⑤ 整屏匹配仍认得出（粗扫留前 3 名以后别把单峰场景搞歪）----
+    x, y, sc = stagenav.find_card_bytes(
+        _fake_screen(tmp, [(1303, 769, 'OS_z1.png')]),
+        eventnav_tpl('OS_z1.png'))
+    assert sc < 3, sc
+    # 合成图的底色是纯灰、模板外沿也偏灰，允许几个像素的位置松弛
+    assert abs(x - 1388) <= 8 and abs(y - 894) <= 8, (x, y)
+
+
+def check_task_log_isolation(tmp):
+    """右栏日志按账号分栏 + 多开子进程日志前缀（2026-11-22）
+
+    两件用户报的问题都钉在这里，全用合成数据、不碰真机：
+
+      - 「右边日志都消失了」：``tasks.get()`` 把文件句柄带出去，``/api/task``
+        序列化直接 500，前端每 700ms 收到一次失败，右栏只剩一行任务名；
+      - 「日志只在自己的 tab 里」：多开两组的日志 tail 到同一个任务，没有
+        ``[昵称]`` 前缀的行前端只能当公共行，官服 tab 混进 B 服那台进度。
+    """
+    _reset_config(tmp)
+    from core import accounts, multiproc, tasks
+
+    p = '[灰bao#0384]'
+    dec = tasks._decorate
+    assert dec('MaaCore v6.23.0 已加载', p) == p + ' MaaCore v6.23.0 已加载'
+    assert dec('[组 emulator-5556] 开始：MAA -1', p) == p + ' 开始：MAA -1'
+    assert dec('[小卡拉帕鲁灰#6408] 排队（官服）', p) == '[小卡拉帕鲁灰#6408] 排队（官服）'
+    assert dec('[MAA] 事件', p) == '[MAA] 事件'
+    assert dec('裸行', '') == '裸行'
+
+    tid = tasks.create('前缀任务', owners=['a.json'], prefix=p)
+    tasks.log(tid, '模拟器已连接')
+    tasks.log(tid, '[组 emulator-5556] 开始')
+    t = tasks.get(tid)
+    assert t['logs'] == [p + ' 模拟器已连接', p + ' 开始'], t['logs']
+    # /api/task 直接 json.dumps(get()) 的结果：内部字段一律不能出去
+    assert all(not k.startswith('_') for k in t), sorted(t)
+    json.dumps({'ok': True, 'data': t}, ensure_ascii=False)
+    assert t['owners'] == ['a.json']
+    tasks.finish(tid)
+
+    tid2 = tasks.create('全局任务')       # owners 为空 = 所有 tab 可见
+    tasks.finish(tid2)
+    ids_a = [x['id'] for x in tasks.for_owner('a.json')]
+    ids_z = [x['id'] for x in tasks.for_owner('zzz.json')]
+    assert tid in ids_a and tid2 in ids_a, (ids_a, tid, tid2)
+    assert tid2 in ids_z and tid not in ids_z, (ids_z, tid, tid2)
+
+    # 一组一个号 → tag 用昵称；多号组不硬塞（每行本来就有各自前缀）
+    old = accounts.get_account
+    accounts.get_account = lambda f: {'account': {'nickName': '灰bao#0384'}}
+    try:
+        assert multiproc.group_tag({'files': ['x.json']}) == '灰bao#0384'
+    finally:
+        accounts.get_account = old
+    assert multiproc.group_tag({'files': ['a.json', 'b.json']}) == ''
+
+    # 子进程命令 + main.py 入口分支都得在，否则多开会静默退回单进程
+    cmd = multiproc.worker_cmd('x.payload')
+    assert '--skill-worker' in cmd and cmd[-1] == 'x.payload', cmd
+    assert 'python' in cmd[0].lower(), cmd
+    src = open(os.path.join(REPO, 'backend', 'main.py'), encoding='utf-8').read()
+    assert '--skill-worker' in src and 'skillworker' in src
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -5230,6 +5810,15 @@ def main():
         r.check('B48 干员替换（塞1←黍1：匹配/写入/干员组/不触发边界）', check_copilot_substitution)
         r.check('B49 定时任务（清洗/下次运行/链式串接/参数解析）', lambda: check_scheduler(tmp))
         r.check('B50 切号名绑定（配置文件优先/手填优先/助手存尾号）', lambda: check_account_bind(tmp))
+        r.check('B51 复刻活动 OS + TL 收尾（只留商店/复刻标记/最新活动指向 OS）', lambda: check_event_os(tmp))
+        r.check('B52 多 MAA 多模拟器编排 + 领奖 skill + 默认用当前账号',
+                lambda: check_multi_emu_batch(tmp))
+        r.check('B53 多开三处硬伤（分区直点/地址传到 MaaCore/严格不换设备/日志落盘）',
+                lambda: check_multi_emu_address(tmp))
+        r.check('B54 导航从任意页起步（不盲点终端大卡/提示条定点比对/已在地图不绕路）',
+                lambda: check_nav_from_stage_list(tmp))
+        r.check('B55 右栏日志按账号分栏（序列化不带句柄/前缀补齐/owners 过滤/子进程入口）',
+                lambda: check_task_log_isolation(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

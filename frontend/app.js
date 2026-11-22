@@ -925,17 +925,14 @@ function renderQuick() {
   // 顺序由后端给：进行中的活动在最前，其次按开始时间倒序。
   // 这里不再按编号重排，否则一堆 NEW 会把当前活动挤到滚动区外面去。
   const acts = (S.activities || []);
+  // 复刻活动钉在「悖论模拟」后面：资源库里它按原版的开始时间排序，早就被挤到
+  // 十几条之外了，但它才是当期要刷的（用户 2026-11-22 要求 OS 排第二位）。
+  const rerun = acts.filter(a => a.reprint);
+  const rest = acts.filter(a => !a.reprint);
 
   let html = '<span class="quick-label">快捷</span>' + paradoxChip();
-  acts.slice(0, 12).forEach(a => {
-    const isNew = news.indexOf(a.id) >= 0;
-    html += `<button class="chip${isNew ? ' is-new' : ''}" data-q="${esc(a.id)}"
-      title="${esc(a.name)}${a.prefix ? ' · ' + esc(a.prefix) : ''}（${a.count} 关）">
-      <span class="chip-name">${esc(a.name || a.id)}</span>
-      ${a.prefix ? `<em class="chip-code">${esc(a.prefix)}</em>` : ''}
-      ${isNew ? '<i class="chip-new">NEW</i>' : ''}
-    </button>`;
-  });
+  rerun.forEach(a => { html += actChip(a, news); });
+  rest.slice(0, 12).forEach(a => { html += actChip(a, news); });
   row.innerHTML = html;
   $$('#quick-row .chip[data-q]').forEach(c => c.addEventListener('click', () => {
     $('#search-input').value = c.dataset.q;
@@ -943,6 +940,18 @@ function renderQuick() {
   }));
   const px = $('#chip-paradox');
   if (px) px.addEventListener('click', openParadox);
+}
+
+/* 一个活动 chip：名字 + 代号字母（+ 复刻标记 / NEW） */
+function actChip(a, news) {
+  const isNew = news.indexOf(a.id) >= 0;
+  return `<button class="chip${isNew ? ' is-new' : ''}" data-q="${esc(a.id)}"
+    title="${esc(a.name)}${a.prefix ? ' · ' + esc(a.prefix) : ''}（${a.count} 关）">
+    <span class="chip-name">${esc(a.name || a.id)}</span>
+    ${a.prefix ? `<em class="chip-code">${esc(a.prefix)}</em>` : ''}
+    ${a.reprint ? '<i class="chip-rerun" title="复刻活动：去年打过的话，今年突袭没有首通奖励"><b>复</b><b>刻</b></i>' : ''}
+    ${isNew ? '<i class="chip-new">NEW</i>' : ''}
+  </button>`;
 }
 
 /* ------------------------------------------------------------ 悖论模拟
@@ -1390,19 +1399,8 @@ function bindOpCards(root, ops, variant) {
   });
 }
 
-// 结果区顶部的剧情关提示：这一段里还有几个剧情关，挂到那里会停。
-// MAA 的关卡导航是「关卡列表内右滑找关卡名」的局部搜索，一旦停在剧情界面
-// 就不认识任何按钮，只能等重试耗尽然后整队终止——提前说比让用户猜有用
-function storyTipHtml(d) {
-  const list = d.stories || [];
-  if (!list.length) return '';
-  const codes = list.map(s => s.code).filter(Boolean);
-  return `<div class="story-tip">
-    <span class="badge story">剧情</span>
-    <span>本段还有 ${list.length} 个剧情关${codes.length ? '：' + codes.map(esc).join('、') : ''}</span>
-    <em>挂机会停在这里，需要手动继续</em>
-  </div>`;
-}
+// 结果区顶部的剧情关提示已经去掉（用户 2026-11-22：这一条看着碍事）。
+// 后端 ``d.stories`` 还留着，助手那边的 note 和「剧情关」卡片仍然用它。
 
 function renderResult(d) {
   // 顺手学作者 id → 昵称：作者黑名单弹窗显示名字靠这个缓存
@@ -1427,8 +1425,6 @@ function renderResult(d) {
     box.innerHTML = '<div class="empty-state"><h3>没有结果</h3><p>换个关卡代号试试，例如 TL-10 或 act55side</p></div>';
     return;
   }
-  const tip = storyTipHtml(d);
-
   if (d.stages.length === 1) {
     const s = d.stages[0];
     const ops = s.ops || [];
@@ -1447,10 +1443,10 @@ function renderResult(d) {
         </div>
       </div>`;
     if (!ops.length) {
-      box.innerHTML = tip + head + '<div class="empty-state"><h3>这个关卡还没有作业</h3><p>作业站上暂时没人上传，换个关卡吧</p></div>';
+      box.innerHTML = head + '<div class="empty-state"><h3>这个关卡还没有作业</h3><p>作业站上暂时没人上传，换个关卡吧</p></div>';
       return;
     }
-    box.innerHTML = tip + head + '<div class="ops-grid">' +
+    box.innerHTML = head + '<div class="ops-grid">' +
       ops.map((op, i) => opCard(op, {
         best: i === 0 && op.mode !== 'blocked' && op.mode !== 'train',
         inBasket: inBasket(op.id, s.stage.variant),
@@ -1538,7 +1534,7 @@ function renderResult(d) {
       </div>`;
   }).join('');
 
-  box.innerHTML = tip + head + '<div class="stage-list">' + rows + '</div>';
+  box.innerHTML = head + '<div class="stage-list">' + rows + '</div>';
 
   const allOps = [];
   d.stages.forEach(s => (s.ops || []).forEach(o => allOps.push(o)));
@@ -2013,12 +2009,27 @@ async function applyToMaa() {
 }
 
 /* root 里放日志的容器：默认 #task-log；签到面板两块日志各有各的 id，
-   所以允许传 sel 指定（否则只能给两块日志复制一套轮询逻辑） */
-function pollTask(tid, root, sel) {
+   所以允许传 sel 指定（否则只能给两块日志复制一套轮询逻辑）。
+
+   ``onNew`` 可选：``(lines, kind)`` —— kind 为 'line' / 'ok' / 'err'。
+   右栏按账号分栏时用它把行收进内存（而不是直接写 DOM），弹窗用法不传就行。 */
+function pollTask(tid, root, sel, onNew) {
   return new Promise((resolve, reject) => {
     let since = 0;
     let done = false;
     const box = root ? $(sel || '#task-log', root) : null;
+    const push = (lines, kind, owners) => {
+      if (onNew) onNew(lines, kind, owners || []);
+      if (!box) return;
+      lines.forEach(line => {
+        const div = document.createElement('div');
+        const bad = kind === 'err' || /失败|错误|error|Traceback|✗|退出码/.test(line);
+        div.className = bad ? 'err' : (kind === 'ok' ? 'ok' : '');
+        div.textContent = line;
+        box.appendChild(div);
+      });
+      box.scrollTop = box.scrollHeight;
+    };
     const tick = async () => {
       if (done) return;
       // 承载日志的弹窗被关掉了就别再空转（任务本身在后台跑，不用我们管）
@@ -2026,41 +2037,23 @@ function pollTask(tid, root, sel) {
       try {
         const t = await api('/api/task?id=' + tid + '&since=' + since);
         since = t.logCount || since;
-        if (box && t.logs && t.logs.length) {
-          t.logs.forEach(line => {
-            const div = document.createElement('div');
-            const bad = /失败|错误|error|Traceback|✗|退出码/.test(line);
-            div.className = bad ? 'err' : '';
-            div.textContent = line;
-            box.appendChild(div);
-          });
-          box.scrollTop = box.scrollHeight;
-        }
+        if (t.logs && t.logs.length) push(t.logs, 'line', t.owners);
         if (t.status === 'done') {
           done = true;
-          if (box) {
-            const ok = document.createElement('div');
-            ok.className = 'ok';
-            ok.textContent = '✓ 完成';
-            box.appendChild(ok);
-          }
+          push(['✓ 完成'], 'ok', t.owners);
           resolve(t.result);
           return;
         }
         if (t.status === 'error') {
           done = true;
-          if (box) {
-            const er = document.createElement('div');
-            er.className = 'err';
-            er.textContent = '✗ ' + (t.error || '失败');
-            box.appendChild(er);
-          }
+          push(['✗ ' + (t.error || '失败')], 'err', t.owners);
           reject(new Error(t.error || '任务失败'));
           return;
         }
         setTimeout(tick, 700);
       } catch (e) {
         done = true;
+        push(['✗ ' + e.message], 'err');
         reject(e);
       }
     };
@@ -4494,6 +4487,7 @@ function applyModuleAvailability() {
     renderGarrison();
   } else if (S.module === 'chat') {
     chatInit();                        // 换号后助手面板里的上下文提示要跟着变
+    chatSideSwitch(S.current);         // 右栏进度日志也跟着换账号
   }
 }
 
@@ -5385,6 +5379,11 @@ const CHAT = {
   nodes: new Map(),      // 事件序号 → DOM，流式文本要靠它原地更新
   sideTasks: new Set(),  // 已在右栏跟踪的任务 taskId，重渲染别重复跟
   cfg: null,
+  /* 右栏「任务进度」按账号分栏（2026-11-22 用户要求：日志跟着账号 tab 走）：
+     side.tasks 里存每个任务的全部行，每行带「属于哪个账号」的标记，
+     渲染时只挑当前账号的行 —— 切号就是重画一遍，日志不会丢、也不会串。
+     以前是直接往 DOM 里 append，切号后不同账号的日志混在一起，清一次就全没了。 */
+  side: { cur: '', loaded: {}, tasks: new Map() },
 };
 
 /* 助手引导卡片：示例问句必须和「现在真能做的事」对得上——早先那几条
@@ -5643,25 +5642,177 @@ function chatTaskModal(tid, name) {
   return m;
 }
 
-/* 右栏跟踪一个后台任务的进度日志：skill / build_run 一启动，日志就流进来，
+/* ---------------- 右栏任务日志：按账号分栏 ----------------
+
+   用户 2026-11-22 的要求：「每个账号的日志只显示在自己 tab 里，左侧切换
+   账号，右边日志跟着变」。以前是直接往 #chat-side-log 里 append，所有账号
+   的日志混在一锅里（多开时两台的行交替出现，根本看不出哪台在动），切号再
+   chatInit 一次就整块清空 → 用户看到「右边日志都消失了」。
+
+   现在改成数据驱动：任务的全部行都存在内存里，每行标一个「属于哪个账号」，
+   渲染时只挑当前账号的（公共行两边都留）。切号 = 重画，切回来还在。
+
+   行归属规则：
+     [昵称] xxx      → 昵称对上的那个账号（run_batch 每组每号都加了这个前缀）
+     [组 xxx] xxx    → 公共行，所有账号都显示
+     其它（[MAA]/[错误]/[补]…）→ 跟着「发起这个任务的那个号」走
+*/
+function sideOwnerOf(line, fallback) {
+  const m = String(line || '').match(/^\[([^\]]{1,60})\]/);
+  if (!m) return null;                    // 没有前缀：公共行
+  if (/^组[\s　]/.test(m[1])) return null; // [组 emulator-5554]：公共行
+  const tag = m[1];
+  const a = (S.accounts || []).find(x =>
+    (x.nickName || '') === tag || x.alias === tag || x.file === tag);
+  return a ? a.file : (fallback || null);
+}
+
+function sideTaskOf(tid, name) {
+  let t = CHAT.side.tasks.get(tid);
+  if (!t) {
+    t = {
+      tid,
+      name: TOOL_NAMES[name] || name || '任务',
+      file: S.current || '',
+      owners: [],                 // 后端 /api/task 会带上来，见 sideAddLines
+      lines: [],
+      startedAt: Date.now(),
+    };
+    CHAT.side.tasks.set(tid, t);
+  }
+  return t;
+}
+
+/* 把一批行收进内存；只有「当前账号看得见」的行才触发重绘（省得后台账号
+   每 700ms 把 DOM 重建一次）
+
+   注意：**只存原文，不存归属**。归属在每次渲染时现算——首次回填（切号那一
+   下）时 S.accounts 可能还没到，那一刻算出来的归属会把所有行都记到发起账号
+   头上（表现就是「A 的 tab 里混进了 B 的日志」）。 */
+function sideAddLines(tid, lines, kind, owners) {
+  const t = CHAT.side.tasks.get(tid);
+  if (!t) return;
+  // 后端知道这个任务属于哪些账号；拿到后就别再靠文本猜整块的归属了
+  if (owners && owners.length) t.owners = owners;
+  const cur = CHAT.side.cur || '';
+  let visible = false;
+  (lines || []).forEach(line => {
+    const row = {
+      text: line,
+      cls: kind === 'err' ? 'err' : (kind === 'ok' ? 'ok' : ''),
+    };
+    // 「✓ 完成」「✗ 失败」是前端合成的行，没有 [昵称] 前缀可解析；不显式
+    // 记归属就会被当成公共行，串到别的账号 tab 里（只剩一个孤零零的 ✓）
+    if (kind === 'ok' || kind === 'err') row.owner = t.file;
+    t.lines.push(row);
+    const owner = ('owner' in row) ? row.owner : sideOwnerOf(line, t.file);
+    if (owner == null || owner === cur) visible = true;
+  });
+  if (visible) paintSideLog();
+}
+
+function paintSideLog() {
+  const box = $('#chat-side-log');
+  if (!box) return;
+  const cur = CHAT.side.cur || '';
+  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  box.innerHTML = '';
+  let shown = 0;
+  CHAT.side.tasks.forEach(t => {
+    // 单账号任务整块只属于那个号：连没有前缀的行、前端合成的「✓ 完成」
+    // 都不该在别的 tab 里留下一个孤零零的任务标题
+    const own = (t.owners || []).filter(Boolean);
+    if (own.length && cur && !own.includes(cur)) return;
+    const rows = t.lines.filter(l => {
+      const owner = ('owner' in l) ? l.owner : sideOwnerOf(l.text, t.file);
+      return owner == null || owner === cur;
+    });
+    if (!rows.length) return;
+    shown += 1;
+    const head = document.createElement('div');
+    head.className = 'side-task-head';
+    head.textContent = '▶ ' + t.name + ' · ' + String(t.tid).slice(0, 8);
+    box.appendChild(head);
+    rows.forEach(l => {
+      const d = document.createElement('div');
+      if (l.cls) d.className = l.cls;
+      d.textContent = l.text;
+      box.appendChild(d);
+    });
+  });
+  if (!shown) {
+    const d = document.createElement('div');
+    d.className = 'chat-side-empty';
+    d.id = 'chat-side-empty';
+    d.textContent = cur
+      ? '这个账号还没有任务日志。skill / 后台任务跑起来会显示在这里。'
+      : 'skill / 后台任务的进度日志会显示在这里。';
+    box.appendChild(d);
+  }
+  if (near) box.scrollTop = box.scrollHeight;
+}
+
+/* 切账号：先按新账号重画，再把这个号以前跑过的任务补进来（后端内存里
+   还留着最近 40 条，包括切号前就已经跑完的） */
+function chatSideSwitch(file) {
+  CHAT.side.cur = file || '';
+  paintSideLog();
+  const f = file || '';
+  if (!f || CHAT.side.loaded[f]) return;
+  CHAT.side.loaded[f] = true;
+  api('/api/tasks?file=' + encodeURIComponent(f) + '&limit=6').then(d => {
+    // 后端给的是「新的在前」，渲染顺序要按时间正序，所以倒着塞
+    (d.list || []).slice().reverse().forEach(t => {
+      if (CHAT.sideTasks.has(t.id) || CHAT.side.tasks.has(t.id)) return;
+      const item = {
+        tid: t.id,
+        name: t.title || '任务',
+        file: (t.owners || [])[0] || f,
+        owners: t.owners || [],
+        lines: [],
+        startedAt: (t.startedAt || 0) * 1000,
+      };
+      (t.logs || []).forEach(line => {
+        item.lines.push({
+          text: line,
+          cls: /失败|错误|✗|Traceback/.test(line) ? 'err' : '',
+        });
+      });
+      if (t.status === 'done') item.lines.push({ text: '✓ 完成', cls: 'ok' });
+      if (t.status === 'error') {
+        item.lines.push({ text: '✗ ' + (t.error || '失败'), cls: 'err' });
+      }
+      CHAT.side.tasks.set(t.id, item);
+    });
+    if (CHAT.side.cur === f) paintSideLog();
+  }).catch(() => { });
+}
+
+/* 清空只清「当前账号」的日志，别的号的不动 */
+function clearSideLog() {
+  const cur = CHAT.side.cur || '';
+  CHAT.side.tasks.forEach(t => {
+    const own = (t.owners || []).filter(Boolean);
+    if (own.length && cur && !own.includes(cur)) return;  // 别动别的账号的任务
+    t.lines = t.lines.filter(l => {
+      const owner = ('owner' in l) ? l.owner : sideOwnerOf(l.text, t.file);
+      return owner != null && owner !== cur;   // 留住别的账号的行
+    });
+  });
+  paintSideLog();
+}
+
+/* 右栏跟踪一个后台任务的进度日志：skill / build_run 一启动，日志就流进内存，
    不用再点「看进度」开弹窗（弹窗还在，想单独看大图可以用）。
-   一个任务只跟一遍（Set 挡重渲染重复跟踪）；多个任务并发时日志按到达顺序
-   混排，每段开头有任务名一行做分隔。 */
+   一个任务只跟一遍（Set 挡重渲染重复跟踪）。 */
 function sideTaskWatch(tid, name) {
   if (!tid || CHAT.sideTasks.has(tid)) return;
   CHAT.sideTasks.add(tid);
-  const box = $('#chat-side-log');
-  if (!box) return;
-  const empty = $('#chat-side-empty');
-  if (empty) empty.remove();
-  const head = document.createElement('div');
-  head.className = 'side-task-head';
-  head.textContent = '▶ ' + (TOOL_NAMES[name] || name || '任务')
-    + ' · ' + tid.slice(0, 8);
-  box.appendChild(head);
-  chatSideScroll();
-  // root 给 body（永远 isConnected），让 pollTask 把日志写进右栏盒子
-  pollTask(tid, document.body, '#chat-side-log').catch(() => { });
+  sideTaskOf(tid, name);
+  paintSideLog();
+  pollTask(tid, null, null,
+    (lines, kind, owners) => sideAddLines(tid, lines, kind, owners))
+    .catch(() => { });
 }
 
 function chatRender(events) {
@@ -5776,6 +5927,7 @@ function enterChat() {
   CHAT.open = true;
   chatInit().then(() => {
     chatScroll(true);
+    chatSideSwitch(S.current);         // 进来就把当前账号那份进度摆出来
     chatPoll();
     setTimeout(() => {
       const i = $('#chat-input');
@@ -5830,9 +5982,8 @@ async function resetChat() {
     body.innerHTML = '<div class="chat-empty" id="chat-empty"></div>';
     paintChatEmpty();
   }
-  // 右栏执行日志一起清掉
-  const side = $('#chat-side-log');
-  if (side) side.innerHTML = '<div class="chat-side-empty" id="chat-side-empty">skill / 后台任务的进度日志会显示在这里。</div>';
+  // 右栏执行日志一起清掉（只清当前账号这份，别的号留着）
+  clearSideLog();
   chatInit();
 }
 
@@ -5851,10 +6002,7 @@ function bindChat() {
   const st = $('#chat-skilltest');
   if (st) st.addEventListener('click', chatSkillTest);
   const logClear = $('#chat-log-clear');
-  if (logClear) logClear.addEventListener('click', () => {
-    const side = $('#chat-side-log');
-    if (side) side.innerHTML = '<div class="chat-side-empty" id="chat-side-empty">skill / 后台任务的进度日志会显示在这里。</div>';
-  });
+  if (logClear) logClear.addEventListener('click', clearSideLog);
   $('#chat-send').addEventListener('click', () => sendChat(input.value));
   input.addEventListener('input', () => {
     input.style.height = 'auto';

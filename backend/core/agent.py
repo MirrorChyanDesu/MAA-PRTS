@@ -422,8 +422,10 @@ TOOLS = [
           '打通就写 stages=["SV-EX-1@both"]；只刷材料写 @normal 或 raid="normal"。'
           '**用户点名某份作业（「用 41624」「换成令的单核」）时必须用 ops 传 '
           'copilotId**，光说"已经换了"没用——不传 ops 就会重新搜索挑回同一份。'
-          '每关会自动准备 2~3 份备选作业：某一关打不过就换下一份重挂这一关，'
-          '已经成功的关不会重打，日志逐关写「✔ 成功 / ✘ 翻车」。'
+          '每关会自动准备 2~3 份备选作业：某一关打不过就换下一份重挂这一关'
+          '（从卡住的那关往后重排，前面的关不再重打）。'
+          '**日志只报「跑到哪一关」和任务链成败**——MAA 不提供逐关结果，'
+          '别对用户说「成功几关」。'
           '返回 taskId。',
           {'stages': {'type': 'array', 'items': {'type': 'string'},
                       'description': '关卡代号，可加 @ 后缀逐关指定难度：'
@@ -441,7 +443,8 @@ TOOLS = [
            'raid': {'type': 'string', 'enum': ['auto', 'both', 'normal'],
                     'description': '没写 @ 后缀的关怎么打：auto（默认）=有突袭'
                                    '作业就只打突袭；both=普通+突袭都打（普通还没'
-                                   '通关时用）；normal=只打普通（刷材料）。主线'
+                                   '通关时用）；normal=只打普通（刷材料）。复刻活动'
+                                   '用户说去年打过、不要突袭时传 normal。主线'
                                    '磨难/险地不是突袭，不受这个参数影响'},
            'ops': {'type': 'array',
                    'description': '指定用哪一份作业（用户点名「用 41624 那份」'
@@ -515,8 +518,8 @@ TOOLS = [
     _tool('skill_sweep',
           '**一键扫图**：把一个活动按「普通关 → EX 普通 → EX 突袭 → S 关」'
           '逐段挂完。段与段之间会自己重新导航（EX / S 是活动地图里不同的分区，'
-          '不导航 MAA 认不出关卡名）。每关打不过会自动换一份作业重挂这一关，'
-          '已经成功的关不会重打，日志里逐关播报「✔ 战斗成功 / ✘ 翻车」。'
+          '不导航 MAA 认不出关卡名）。每关打不过会自动换一份作业重挂这一关'
+          '（从卡住的那关往后重排），日志报「跑到哪几关 + 卡在哪 + 为什么」。'
           '用户说「把这个活动从头打到尾」「EX 和 S 都帮我清了」时用它。'
           '**调用前先跟用户确认：哪个活动、哪个号、要不要打突袭**。返回 taskId。',
           {'stage': _STAGE,
@@ -535,23 +538,70 @@ TOOLS = [
           ['stage']),
     _tool('skill_tool',
           '**MAA 小工具（牛杂）**：跑 MAA「小工具 → 牛杂」里的功能。会自动导航到'
-          '当期活动地图 → 点对应入口 → 交给 MAA 跑。现在接了两项：\n'
-          '- `name="wartime_press"` 战时新闻委员会（活动小游戏，第一次要手动过教程）\n'
+          '当期活动地图 → 点对应入口 → 交给 MAA 跑。现在接了三项：\n'
+          '- `name="wartime_press"` 战时新闻委员会（TL 的小游戏，第一次要手动过教程）\n'
+          '- `name="os_rd"` 喀兰贸易技术研发部（OS 的小游戏，第一次要手动过引导）\n'
           '- `name="event_shop"` 活动商店（按黑名单买，不碰无限池）\n'
-          '用户说「挂一下牛杂里的战时新闻委员会」「把活动商店买掉」时用它。'
+          '用户说「挂一下牛杂里的战时新闻委员会 / 喀兰贸易」时就它。只给「小游戏」'
+          '这种泛称时要带 prefix（OS / TL）——两个活动的小游戏是两条不同的任务。'
           '**活动商店要给黑名单**（不给就用默认四个：数据增补条 / 数据增补 / '
           '龙门币 / 家具零件）。返回 taskId。',
-          {'name': {'type': 'string', 'enum': ['wartime_press', 'event_shop'],
-                    'description': 'wartime_press=战时新闻委员会小游戏；'
-                                   'event_shop=活动商店'},
+          {'name': {'type': 'string',
+                    'enum': ['wartime_press', 'os_rd', 'event_shop'],
+                    'description': 'wartime_press=战时新闻委员会；'
+                                   'os_rd=喀兰贸易技术研发部；event_shop=活动商店'},
            'account': _ACC,
            'blacklist': {'type': 'array', 'items': {'type': 'string'},
                          'description': '活动商店黑名单（商品名，子串匹配）。'
                                         '不传就用默认四个；**别传空数组**，'
                                         '空着 MAA 会把无限池也买掉'},
            'prefix': {'type': 'string',
-                      'description': '活动代号（TL / SV…），默认当期活动'}},
+                      'description': '活动代号（OS / TL…），默认按工具自己登记的那个'}},
           ['name']),
+    _tool('skill_claim',
+          '**领取活动奖励**：导航到活动奖励页（OS 是「神谕谜题」），点一次'
+          '「一键领取」，把已完成的任务奖励收掉。纯 adb 操作，不走 MAA 任务。'
+          '用户说「把活动奖励领了 / 领一下神谕谜题」时用它。'
+          '**领完要顺手搬商店的话**，用 run_steps 把 claim + tool(event_shop) '
+          '串起来，别让用户自己再喊一次。返回 taskId。',
+          {'account': _ACC,
+           'prefix': {'type': 'string',
+                      'description': '活动代号（OS…），默认当期活动'},
+           'wakeup': {'type': 'boolean',
+                      'description': 'true=先唤醒再领（游戏没开/停在登录页时用）'}}),
+    _tool('run_steps',
+          '**按账号批量跑一组 skill（推荐用来做「活动一条龙」）**。把一个账号'
+          '要做的几步按顺序排好，程序自己决定怎么分配模拟器：\n'
+          '- 几个号绑的是**同一台模拟器** → 排队：一个号做完所有步骤，切下一个号\n'
+          '- 几个号绑的是**不同模拟器** → 多开并行，各跑各的\n'
+          '用户说「把这 5 个号的 OS 活动挂一下（普通/突袭/S/领奖/商店）」时用它。\n'
+          '每步形如 {"skill":"sweep","stage":"OS","tiers":["base","ex","s"],'
+          '"raid":"normal"}、{"skill":"claim","prefix":"OS"}、'
+          '{"skill":"tool","name":"event_shop","prefix":"OS"}。'
+          '可用 skill：wakeup navigate fight skip_story sweep tool claim '
+          'weekly train signin。**steps 里不用写 account**（程序按账号循环）。'
+          '**调用前先跟用户确认：哪些号、按什么顺序做哪几步**。',
+          {'accounts': {'type': 'array', 'items': {'type': 'string'},
+                        'description': '账号文件名列表；空数组 = 当前选中的账号'},
+           'steps': {'type': 'array',
+                     'description': '按顺序执行的 skill 步骤，每步至少要有 skill',
+                     'items': {'type': 'object',
+                               'properties': {
+                                   'skill': {'type': 'string',
+                                             'description': 'wakeup / navigate / '
+                                                            'fight / skip_story / '
+                                                            'sweep / tool / claim / '
+                                                            'weekly / train / signin'},
+                               },
+                               'required': ['skill']}},
+           'names': {'type': 'object',
+                     'description': '{账号文件名: 切号名}（缺的才要问用户）'},
+           'emulators': {'type': 'object',
+                         'description': '{账号文件名或昵称: adb 地址}，'
+                                        '如 {"灰bao#0384 bilibili服": '
+                                        '"emulator-5556"}。用户说「这个号用'
+                                        '第二台」时传；不传按账号绑的 MAA 档案连'}},
+          ['steps']),
 ]
 
 
@@ -602,6 +652,10 @@ def _default_account():
 
 def _tool_list_accounts(args):
     out = []
+    try:
+        last = settings.load().get('lastAccount') or ''
+    except Exception:
+        last = ''
     for c in accounts.list_accounts():
         if (c.get('game') or 'arknights') != 'arknights':
             continue
@@ -613,6 +667,18 @@ def _tool_list_accounts(args):
                 acc_name, _src = acctbind.resolve(c['file'])
             except Exception:
                 pass
+        d = ''
+        try:
+            d = acctbind.dir_of(c['file'])
+        except Exception:
+            d = ''
+        addr = ''
+        try:
+            from . import maaplan
+            addr = maaplan._connection(d, acctbind.profile_of(c['file'])
+                                       or None).get('address') or ''
+        except Exception:
+            addr = ''
         p = c.get('progress') or {}
         out.append({
             # 账号列表给的是 nickName / alias / channelName，没有 name / channel
@@ -627,6 +693,13 @@ def _tool_list_accounts(args):
             # 「设置里配过尾号，助手每次还问」——列表里带出来，模型就不用
             # 再开口问；只有这里是空的才轮到问用户。
             'accountName': acc_name,
+            # 用户此刻在左侧点开的账号（settings.lastAccount）。用户没点名
+            # 账号时，**默认就问这个号**，别再反问「你说的是哪个账号」
+            'current': bool(last) and c['file'] == last,
+            # 多开要看：各自的 MAA 目录和模拟器地址。同一个 emulator 的号会
+            # 排队切号，不同的会同时跑（见 skills.run_batch / maaplan.run_plan）
+            'maaDir': d,
+            'emulator': addr,
             # 字段名对齐 progress.summary()：mainRemaining / activityLeft /
             # activityStages 才是真名（曾经写成 mainLeft / activityZones，
             # 结果每个账号都返回 null，模型只能挨个再问一遍 account_progress）
@@ -637,11 +710,30 @@ def _tool_list_accounts(args):
             'activityLeft': p.get('activityLeft'),
             'activityStages': p.get('activityStages'),
         })
+    cur = next((c['file'] for c in out if c['current']), '')
+    emus = sorted({c['emulator'] for c in out if c['emulator']})
+    # 实际在线的设备（adb devices）：它才是「现在有几台模拟器能同时跑」的真相。
+    # 账号绑的档案可能全指向同一台，而用户其实开着两三台——这时助手要能问
+    # 「哪个号用哪台」，再通过 run_steps 的 emulators 传进来。
+    devs = []
+    try:
+        devs = skills.online_devices()
+    except Exception:
+        devs = []
     return {'accounts': out, 'count': len(out),
+            'current': cur,
+            'emulators': emus,
+            'devices': devs,
             'hint': 'accountName 就是已绑定的切号名（手机号后 4 位 / 前 3 位 + 后 4 位）'
                     '：**非空的直接按它跑，不要再问用户**；只有为空的账号才问'
                     '「手机号后 4 位」（B 服问游戏内用户名）。用户报了尾号就顺手用'
-                    ' set_account_name 存下来，下次不用再问'}
+                    ' set_account_name 存下来，下次不用再问。'
+                    '**用户没点名账号时用 current 那个**（他刚在左侧点开的）；'
+                    'current 为空才用第一个。emulator 相同 = 同一台模拟器，'
+                    '那几个号只能排队切号；不同 = 可以多开同时跑。'
+                    'devices 是现在 adb 上真在线的设备：emulator 值和它对不上、'
+                    '又说要「两台一起跑」时，问用户哪个号用哪台，再在 run_steps 的'
+                    ' emulators 里指定（MAA 里八份档案常常全指向同一台）'}
 
 
 def _tool_set_account_name(args):
@@ -694,7 +786,8 @@ def _tool_list_activities(args):
     n = max(1, min(40, int(args.get('limit') or 12)))
     rows = resources.activity_list(n) or []
     out = {'activities': [{'name': r.get('name'), 'prefix': r.get('prefix'),
-                           'stages': r.get('count') or r.get('stages')}
+                           'stages': r.get('count') or r.get('stages'),
+                           'reprint': bool(r.get('reprint'))}
                           for r in rows]}
     # 当期活动（我们写过导航的那几个，带有效期）：用户说「最新活动」时用
     # 这里的 prefix，别自己猜代号（2026-11-19 用户要求）
@@ -705,8 +798,11 @@ def _tool_list_activities(args):
             out['current'] = cur
             out['currentHint'] = ('current 是**当期还在有效期**的活动（我们写过'
                                   '导航），用户说「最新活动 / 当期活动」就用它的 '
-                                  'stage（如 TL-1），EX / S 关分别是 TL-EX-1 / '
-                                  'TL-S-1')
+                                  'stage（如 OS-1），EX / S 关分别是 OS-EX-1 / '
+                                  'OS-S-1。reprint=true 的是**复刻活动**：用户要刷'
+                                  '它的 EX / S 时，先问「要不要连突袭一起打」和'
+                                  '「去年打过吗」——去年打过的话突袭没有首通奖励，'
+                                  '默认只排普通（@normal）')
     except Exception:
         pass
     return out
@@ -891,7 +987,8 @@ def _tool_apply_plan(args, session=None):
     if blocked:
         return blocked
     tid = tasks.create('多账号挂机（%d 个账号）' % len(
-        [a for a in plan['accounts'] if a.get('ops')]))
+        [a for a in plan['accounts'] if a.get('ops')]),
+        owners=[a.get('file') for a in plan['accounts'] if a.get('file')])
     def go():
         try:
             res = multiacct.apply(plan, tid)
@@ -1080,6 +1177,10 @@ def _roster(want_files, names, maa_dir):
         rows.append({'file': c['file'], 'name': c['name'],
                      'channel': c.get('channel') or '',
                      'accountName': nm, 'nameSource': source,
+                     # 每个号用哪份 MAA / 哪台模拟器：多开时靠这两个字段分组
+                     # （见 maaplan.plan_groups）。空串=用全局默认。
+                     'maaDir': acctbind.dir_of(c['file']) or maa_dir or '',
+                     'profile': acctbind.profile_of(c['file']),
                      'ops': [], 'stages': []})
     return rows, missing, ''
 
@@ -1245,7 +1346,8 @@ def _start_build(payload):
             out['failed'] = failed
         return out
 
-    tid = tasks.create('挂机（%d 个账号）' % len(rows))
+    tid = tasks.create('挂机（%d 个账号）' % len(rows),
+                       owners=[r.get('file') for r in rows if r.get('file')])
 
     def go():
         try:
@@ -1456,6 +1558,91 @@ def _tool_skill_tool(args, session=None):
     return _skill_via_guard('tool', args, session)
 
 
+def _tool_skill_claim(args, session=None):
+    # 领奖是纯点击，不改任何配置、也不消耗理智，和唤醒一样免确认
+    return {'started': True, 'taskId': skills.run_skill('claim', args),
+            'note': '领奖在后台跑，日志里会写进了哪个奖励页、点没点中「一键领取」。'}
+
+
+def _tool_run_steps(args, session=None):
+    """按账号批量跑一组 skill（同一模拟器排队、不同模拟器并行）"""
+    from . import maaplan
+
+    steps = args.get('steps') or []
+    if not steps:
+        return {'error': 'steps 是空的',
+                'hint': '每步写 {skill: "sweep", stage: "OS"} 这样；'
+                        '可用：' + ' '.join(sorted(skills.SKILLS))}
+    try:
+        skills._norm_steps(steps)
+    except ValueError as e:
+        return {'error': str(e), 'valid': sorted(skills.SKILLS)}
+
+    accounts = [str(x) for x in (args.get('accounts') or []) if str(x).strip()]
+    names = {str(k): v for k, v in (args.get('names') or {}).items()}
+    emus_raw = {str(k): str(v or '').strip()
+                for k, v in (args.get('emulators') or {}).items() if str(v or '').strip()}
+    d = multiacct._maa_dir({}) or (settings.load().get('maaDir') or '')
+    rows, missing, err = _roster(accounts, names, d)
+    if err:
+        return {'error': err}
+    if missing:
+        return {'need_info': 'accountName', 'missing': missing, 'ready': len(rows),
+                'note': '一次性把所有缺的账号问用户，补齐后带 names 再调一次'}
+    if not rows:
+        return {'error': '没有能跑的账号'}
+
+    # 用户点名的模拟器：键可以是账号文件名，也可以是昵称（模型两种都爱写）
+    by_name = {r['name']: r['file'] for r in rows}
+    emus = {}
+    for k, v in emus_raw.items():
+        f = by_name.get(k) or next((r['file'] for r in rows
+                                    if r['file'] == k or r['file'].startswith(k)), '')
+        if f:
+            emus[f] = v
+    if emus:
+        for r in rows:
+            if emus.get(r['file']):
+                r['address'] = emus[r['file']]
+
+    groups = maaplan.plan_groups(rows, {'maaDir': d})
+    desc = ' → '.join(skills.SKILLS[n][0].split('：')[0]
+                      for n, _ in skills._norm_steps(steps))
+    lines = ['%d 个账号 / %d 台模拟器' % (len(rows), len(groups)),
+             '每步：' + desc]
+    for key, g in groups:
+        who = '、'.join(r['name'] for r in g['rows'])
+        lines.append('· %s ← %s（%s）'
+                     % (g['address'] or '默认模拟器', who,
+                        '排队切号' if len(g['rows']) > 1 else '单独跑'))
+    same = [g for _k, g in groups if len(g['rows']) > 1]
+    devs = [x for x in skills.online_devices(d) if x]
+    hint = ''
+    if same and len(devs) > len(groups):
+        hint = ('\n注：%d 个号被算成同一台模拟器，但这台机器上还有别的设备在线'
+                '（%s）。要并行的话告诉我「哪个号用哪台」，我用 emulators 传进去。'
+                % (sum(len(g['rows']) for g in same), '、'.join(devs)))
+    summary = '\n'.join(lines) + hint
+
+    payload = {'accounts': [r['file'] for r in rows], 'steps': steps,
+               'names': {r['file']: r['accountName'] for r in rows},
+               'emulators': emus}
+    blocked = _guard(session, 'run_steps', dict(payload, _confirmed=True), summary)
+    if blocked:
+        return blocked
+    tid = skills.run_batch(payload['accounts'], steps, names=payload['names'],
+                           emulators=emus)
+    out = {'started': True, 'taskId': tid, 'accounts': len(rows),
+           'emulators': len(groups),
+           'note': '已在后台跑：同一台模拟器的号排队切号，不同模拟器同时开跑。'
+                   '每行日志带 [账号名]，整份日志还会落到 debug/tasks/<任务号>.log。'}
+    if hint:
+        out['hint'] = hint.strip()
+    if devs:
+        out['devices'] = devs
+    return out
+
+
 _HANDLERS = {
     'list_accounts': _tool_list_accounts,
     'set_account_name': _tool_set_account_name,
@@ -1472,6 +1659,7 @@ _HANDLERS = {
     'skill_wakeup': _tool_skill_wakeup,
     'skill_navigate': _tool_skill_navigate,
     'skill_signin': _tool_skill_signin,
+    'skill_claim': _tool_skill_claim,
 }
 
 _WRITE_HANDLERS = {
@@ -1486,6 +1674,7 @@ _WRITE_HANDLERS = {
     'skill_train': _tool_skill_train,
     'skill_sweep': _tool_skill_sweep,
     'skill_tool': _tool_skill_tool,
+    'run_steps': _tool_run_steps,
 }
 
 
@@ -1624,6 +1813,27 @@ build_run（mode=fight、keyword=1-7）。纯理智作战，不抄作业。
 **「这周活动帮我打一下」**
 list_activities 确认哪个 → build_run（mode=copy 或 daily_copy，keyword=活动前缀）
 
+**「把这 5 个号的 OS 活动挂一下（普通、突袭、S、领奖、搬商店）」**
+1. list_accounts —— 看 `current`（用户在左侧点开的那个号）和各自的 `emulator`
+2. 按「复刻突袭」那两条先问：要突袭吗？去年打过吗？（OS 是复刻活动）
+3. run_steps，一次说清哪些号、做哪几步：
+   ```
+   steps = [
+     {"skill":"sweep","stage":"OS","tiers":["base","ex","s"],"raid":"normal"},
+     {"skill":"claim","prefix":"OS"},
+     {"skill":"tool","name":"event_shop","prefix":"OS"}]
+   ```
+   同一台模拟器上的号会自动排队切号，不同模拟器自动多开并行。
+4. 中间某一步失败不会拖垮别的号，但**哪个号哪一步失败要在回话里说清楚**
+
+**「把活动奖励领了」** → skill_claim（带 prefix；游戏没开就传 wakeup=true）。
+领完通常接着要搬商店：**主动问一句**「要顺手把活动商店也搬了吗」，
+不用等他再说一遍。
+
+**「帮我把这个号的奖励领了，再搬商店」**
+→ run_steps(accounts=[这个号], steps=[{"skill":"claim","prefix":"OS"},
+  {"skill":"tool","name":"event_shop","prefix":"OS"}])
+
 **「现在跑到哪了 / 为什么失败」**
 run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 想看跑到第几个作业，用返回里的 stage / index / total。
@@ -1634,11 +1844,15 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 八个 skill，各自独立跑后台、失败单独停：
 - skill_wakeup：唤醒游戏到主界面（可按尾号切号）
 - skill_navigate：导航到活动（老活动 / 当期 / EX 都行）。stage 优先传**中文
-  活动名**（「孤星」），代号/活动 id 也行——内部统一换，别自己换算
+  活动名**（「孤星」），代号/活动 id 也行——内部统一换，别自己换算。
+  当期活动（ENTRIES 里有的，如 OS / TL）走的是「终端页 → 活动横幅 → 地图上
+  直接点分区节点」，**失败时不会退回老路径**（老 UI 早就点不到了）：报的是
+  「当期活动导航没到位：…」。照实告诉用户是入口认不出、要重新标定导航，
+  别建议他「用老办法再点一次」
 - skill_skip_story：过剧情关（ST 关自动点开 + 跳剧情）
 - skill_fight：自动战斗（编队 / 借助战 / 吃理智药）。**默认不唤醒不导航**，
   界面在哪就从哪直接开打；要全套（唤醒+导航）得用户明说或传 wakeup=true。
-  **打不过会自动换一份作业重挂这一关**（已成功的关不重打），日志逐关播报
+  **打不过会自动换一份作业，从卡住的那关往后重挂**，日志报「跑到哪几关 / 卡在哪」
 - skill_signin：森空岛签到
 - skill_weekly：**周目编排**——ST 剧情自动过、主线按序批量打、EX 收尾
 - skill_train：**培养干员**——升精英化 / 技能等级 / 专精，可一次排多个
@@ -1646,12 +1860,51 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   导航 + 挂机。用户说「这个活动从头打到尾」「EX 和 S 都清了」就用它，
   比 skill_weekly 更适合「只要战斗、不要剧情编排」的场景
 - skill_tool：**MAA 小工具（牛杂）**——`name="wartime_press"` 战时新闻委员会
-  小游戏、`name="event_shop"` 活动商店。两项都自己导航到当期活动地图再点入口。
+  （TL）、`name="os_rd"` 喀兰贸易技术研发部（OS）、`name="event_shop"` 活动商店。
+  三项都自己导航到活动地图再点入口。只给「小游戏」这种泛称时**必须带 prefix**
+  （OS / TL）——两个活动的小游戏是 MAA 里两条不同的任务，选错进去也是白跑。
   活动商店必须给黑名单（默认四个：数据增补条 / 数据增补 / 龙门币 / 家具零件），
   **空黑名单会把无限池也买掉**，别传空数组。
-  小游戏第一次进要过教程，MAA 不会点教程对话：任务里 `stuck` / 超时的时候，
+  小游戏第一次进要过教程/引导，MAA 不会点教程对话：任务里 `stuck` / 超时的时候，
   明确告诉用户「先在模拟器里手动把教程过一遍，过完再让我挂一次」，不要说
   「任务失败请重试」这种空话
+- skill_claim：**领取活动奖励**（OS 的「神谕谜题」页 → 一键领取）。纯点击，
+  不用 MAA 任务；游戏没开就先 skill_wakeup 或传 wakeup=true
+
+**多账号怎么跑（2026-11-22）**：
+- 一个号一段连续操作 → 单独调 skill
+- **多个号做同一套事** → 用 `run_steps`，把步骤写成列表交给我，程序自己
+  按模拟器分组：同一台模拟器排队切号，不同模拟器多开并行
+- 用户说「5 个号都挂一下 OS 活动，普通/突袭/S/领奖/商店」就这么写：
+  ```
+  run_steps(accounts=[...], steps=[
+    {"skill":"sweep","stage":"OS","tiers":["base","ex","s"],"raid":"normal"},
+    {"skill":"claim","prefix":"OS"},
+    {"skill":"tool","name":"event_shop","prefix":"OS"}])
+  ```
+  （raid 按「复刻突袭」那段先问用户；**别一个号一个号地调 skill**——
+  那样前一个还在跑，后一个就抢同一台模拟器）
+- list_accounts 的 `current` 是用户**此刻在左侧点开的那个号**：用户没点名
+  是谁时就用它，别反问「你说哪个账号」；`emulator` 相同的号只能排队，
+  不同的可以并行
+- 每个号用的是**它自己绑的 MAA 目录和配置文件**（设置 → MAA 路径），
+  不需要你传 maaDir
+- **但要并行两台，光靠档案常常不够**：MAA 里好几份档案可能全写着
+  `emulator-5554`，而用户其实开着两台。`list_accounts` 的 `devices` 才是
+  现在真在线的设备列表：
+  - 用户说「两台一起跑」而 `devices` 比分组多 → **问一句**「哪个号用哪台」，
+    然后 `run_steps(..., emulators={"灰bao#0384 bilibili服": "emulator-5556"})`
+  - 不问也能跑，但会串行排队，用户看到的还是「只有一台在动」
+  - 传了 emulators，程序会**严格**连那台：连不上就报错，不会偷偷换回 5554
+- 每组跑在**自己的进程**里（不是线程）：同一个进程里两个 MaaCore 会抢
+  命名管道，第二台永远连不上（asst.log 里 `CreateOverlappablePipe failed,
+  err 231`）——以前「说好并行，另一台一动不动」就是这个。现在多组=多进程，
+  两台会真的同时动
+- **官服 / b 服是两个不同的包**：账号的渠道自动判定（b 服走
+  `com.hypergryph.arknights.bilibili` + MaaCore 的 `Bilibili`），你**不用**
+  也别自己切客户端；同一个模拟器上装了两个包时，按账号自己的渠道来
+- 日志每行带 `[账号名]`，右栏按账号分栏（切到哪个号只看那个号的日志）；
+  完整日志另存在 `debug/tasks/<任务号>.log`，出问题让用户把这个文件发你
 
 **什么时候用 skill 而不是 build_run**：
 - 用户要「从唤醒开始，剧情关也帮我过，一口气打完」→ skill_weekly。
@@ -1736,15 +1989,24 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
   同一次计划里可以逐关分开写：``["SV-EX-1@raid", "SV-EX-6@both"]``。
   只刷材料写 ``@normal`` 或 raid=normal。磨难/险地是主线独立难度，不用后缀。
   **不要**跟用户说「突袭打不了」——作业站有突袭作业就能排。
+- **复刻活动的 EX / S：先把突袭问清楚**（用户 2026-11-22 要求）：list_activities
+  里 `reprint: true`（现在 OS = 雪山降临1101）或活动导航标了复刻的，用户说要刷
+  它的 EX / S 时，**先问两句**：「要不要连突袭一起打」「去年这个活动打过吗」。
+  去年打过 → 突袭的首通奖励已经领过，今年再打只多花理智，**默认不加**；用户说
+  不用突袭，就逐关写 `@normal`（或 raid=normal），排进作业集的别出现突袭行。
+  用户明确要打，再按 `@raid` / `@both` 排。「去年打过」只影响奖励，不影响能不能打。
 - **换作业要真的换**：用户说「用 41624 那份」「换成令的单核」时，先 find_ops
   拿到 copilotId，再调 skill_fight 时用 ops=[{stage, copilotId}] 钉住。只把
   文案改成"已换"是没用的——不传 ops 就会重新搜索，排序又挑回原来那份。
 - **翻车会自动重挂，不用你重排**：skill_fight / skill_sweep 每关都备了
-  2~3 份作业，某关打不过会换下一份自动重挂这一关，**已经成功的关不会重打**。
+  2~3 份作业，某关打不过会换下一份，**从卡住的那关往后重挂**（前面的关不再打）。
   重挂前程序会自己点一下结算页把界面带回关卡列表（用户 2026-11-19 实测：
   失败后必须点一下才回得到关卡界面，**不需要重新唤醒/登录**）。
-  日志里会出现「✘ X 翻车：原因」「换作业重挂：X #a → #b」「✔ X 战斗成功」，
-  照实转述换了哪几关、最后成没成；不要自己说"我再重跑一遍"。
+  日志里会出现「换作业重挂：X #a → #b」「翻车：X —— 原因」。
+- **逐关成败不要报数**（2026-11-22 用户口径）：MAA 在抄作业时**不回报每关
+  成功/失败**（asst.log 里没有任何 StageDrops 回调），程序也就不知道「成了
+  几关」。只能说「跑到了哪几关 + 任务链正常结束还是卡在哪关 + 原因」，
+  **绝不能说「一关都没挂」「成功 0 关」**——那是假消息。
 - **关卡名单只能用用户点名的那些**（2026-11-19 用户实测吃亏）：用户说
   「SV-EX-1 到 SV-EX-6」就排这 6 关，**不许改编号、不许跳掉一关再往后补
   一关凑数**（那次实际排成 SV-EX-2 ~ SV-EX-7，白烧一轮理智）。跳过要说明

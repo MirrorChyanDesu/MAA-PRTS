@@ -3,23 +3,28 @@
 
 为什么单独写一段（2026-11-19 用户逐屏标注的步骤）：当期活动的入口已经不是
 ``stagenav.goto_stage_list`` 里那条「主界面活动大图 → 主题页 → 右下区域列表」
-了。新活动的入口在**终端页的活动提示条**上，进去是散点式活动地图，分区靠
-关卡列表右下角那排「区域名」按钮切换：
+了。新活动的入口在**终端页的活动提示条 / 活动卡片**上，进去是散点式活动地图，
+分区靠地图上的节点图标切换：
 
     任意界面 --底部第1个tab「终端」--> 主界面
-    主界面   --固定位置点「终端」大卡---> 终端页（有活动提示条 + 黄钻石进度）
-    终端页   --活动提示条（区域+图像识别）-> 活动地图（约 5 秒过场动画）
-    活动地图 --区域节点（残照终尽）------> 普通关卡界面（基础区）
-    关卡列表 --右下区域按钮（长冬初青）--> EX 关卡界面
-    关卡界面 --右下区域按钮（世纪之春）--> S 关卡界面
+    主界面   --固定位置点「终端」大卡---> 终端页
+    终端页   --左下横幅（当期活动）-----> 活动主页（约 5 秒过场动画）
+    终端页   --ATTENTION 区活动卡片-----> 活动地图（已结束的旧活动走这条）
+    活动主页 --节点（圣巡之旅）--------> 普通关卡界面（基础区）
+    活动主页 --节点（变革之路）--------> EX 关卡界面
+    活动主页 --节点（喀兰之心）--------> S 关卡界面
 
-到关卡列表就不用管了：Copilot 的 ``ClickStageName`` 会 OCR 认出 ``TL-EX-1``
+到关卡列表就不用管了：Copilot 的 ``ClickStageName`` 会 OCR 认出 ``OS-EX-1``
 点进去开打（``stagenav`` 顶部注释里写过这条）。
 
-**为什么模板识别 + 坐标兜底**：这排区域按钮在不同界面里的高度不一样（用户
-2026-11-19 的截图里 长冬初青 在 1280 口径 y≈573，世纪之春 在 y≈662，差 90px），
-活动换版整排还会挪，所以坐标只当兜底，主判据是模板匹配（用户给的红框就是
-「区域 + 图像识别」）。识别不到就按标定坐标点，并在日志里说清楚是兜底。
+**两种入口并存**（2026-11-22 用户实测）：当期活动在终端页左下角的横幅上
+（``<雪山降临1101>活动已开放``）；活动结束之后横幅会被下一个活动占走，旧活动
+退到 ATTENTION 区第二格卡片、状态显示「作战已结束」，点卡片照样能进地图——
+但地图上关卡分区已经关了，只剩商店。所以``closed`` 的活动只保留 ``tools``。
+
+**为什么模板识别 + 坐标兜底**：这排节点在不同界面里的高度不一样，活动换版整排
+还会挪，所以坐标只当兜底，主判据是模板匹配（用户给的红框就是「区域 + 图像
+识别」）。识别不到就按标定坐标点，并在日志里说清楚是兜底。
 
 **数据在 ``ENTRIES`` 里，一条活动一项，老的别删**：活动会复刻，复刻活动 UI
 不变、模板还能用（只是分区可能重排，所以日志里会提示过期）。``until`` 是
@@ -29,8 +34,8 @@
 ``config/navtpl/events/`` 同名文件优先，升级不覆盖）。加一条新活动：
 
 1. 用户给几张带红框的截图 + 步骤；
-2. 从截图里把按钮抠出来存成 ``<前缀>_z1/z2/z3.png``（1920 口径原样抠，红框
-   往里缩 6~8px，别把红线抠进去）；
+2. 从截图里把按钮抠出来存成 ``<前缀>_z1/z2/z3.png``（1920 口径，红框往里缩
+   6~12px，别把红线抠进去）；
 3. 在 ``ENTRIES`` 里加一项：``until`` 写活动结束日，``zones`` 按基础 / EX / S
    写 ``tpl`` + 兜底 ``tap`` + 识别区域 ``roi``；
 4. 跑 ``python tools/zone_calib.py`` 之外不需要任何标定——模板就是标定。
@@ -38,6 +43,7 @@
 from __future__ import annotations
 
 import datetime
+import io
 import json
 import os
 import re
@@ -50,37 +56,73 @@ from . import stagenav
 ENTRIES = {
     'TL': {
         'name': '时间啊，向前！',
-        'until': '2026-11-25',          # 用户 2026-11-19 给的结束日
-        'wrote': '2026-11-19',
-        'entry': {                      # 终端页上的活动提示条（黄钻石进度行）
-            'tpl': '_entry_track.png',
-            'roi': [80, 500, 300, 130],
-            'tap': [218, 551],
-            # 认出来的是提示条下半截的黄钻石行，真正要点的是上面那行文字
-            # （用户红框画在文字上），所以往上挪 51 再点
-            'offset': [0, -51],
-            'wait': 5.0,                # 点完有过场动画，用户实测 5 秒
+        'until': '2026-11-28',          # 关卡已结束，商店还开着（用户 2026-11-22 截图）
+        'wrote': '2026-11-22',
+        # 活动已结束（2026-11-22 用户口径）：关卡分区和小游戏入口都不可用了，
+        # 只留商店。入口也不再是左下角的横幅——那个横幅现在归当期活动，TL 的
+        # 卡片退到终端页 ATTENTION 区第二格，点它才进活动地图。
+        'closed': True,
+        'entry': {
+            'tpl': 'TL_card.png',
+            'roi': [620, 300, 260, 150],
+            'tap': [753, 371],
+            'wait': 5.0,
         },
-        'zones': {
-            'base': {'tpl': 'TL_z1.png', 'label': '残照终尽',
-                     'roi': [380, 540, 320, 180], 'tap': [532, 628]},
-            'ex': {'tpl': 'TL_z2.png', 'label': '长冬初青',
-                   'roi': [960, 495, 320, 135], 'tap': [1110, 547]},
-            's': {'tpl': 'TL_z3.png', 'label': '世纪之春',
-                  'roi': [960, 630, 320, 90], 'tap': [1141, 662]},
-        },
-        # 活动地图上除了关卡分区，还有两个「入口节点」，和分区在同一屏，
-        # 但点进去不是关卡列表：小游戏（战时新闻委员会）和活动商店。
-        # 这两项由 MAA 的 Custom 任务接手，所以导航只负责把界面点到门口
-        # （见 maatools.py 顶部注释）。
+        'zones': {},                    # 关卡导航关闭（活动已结束）
+        # 活动地图上除了关卡分区，还有「入口节点」，点进去不是关卡列表：
+        # 小游戏和活动商店。这两项由 MAA 的 Custom 任务接手，所以导航只负责
+        # 把界面点到门口（见 maatools.py 顶部注释）。
         'tools': {
-            'minigame': {'tpl': 'TL_mini.png', 'label': '战时新闻委员会',
-                         'roi': [40, 165, 200, 130], 'tap': [127, 227],
-                         'wait': 3.0},
-            'shop': {'tpl': 'TL_shop.png', 'label': '炮火所掩埋的',
+            # 名字是用户 2026-11-22 截图里的写法（之前标成「炮火所掩埋的」）
+            'shop': {'tpl': 'TL_shop.png', 'label': '熄火所掩埋的',
                      'roi': [880, 120, 200, 130], 'tap': [975, 185],
                      'wait': 3.0},
         },
+    },
+    'OS': {
+        'name': '雪山降临1101',
+        'until': '2026-12-02',          # 截图「作战结束时间 2026/12/02 03:59」
+        'wrote': '2026-11-22',
+        # 复刻活动：去年打过的号今年没有首通奖励，突袭那档要问用户打不打
+        # （见 agent 提示词里的「复刻活动突袭」）。前端快捷栏也靠这个标「复刻」。
+        'reprint': True,
+        'entry': {                      # 终端页左下角的活动横幅（<雪山降临1101>活动已开放）
+            # 2026-11-22 晚重抠：模板直接从**真机 1920×1080 截图**上裁，
+            # roi/tap 换算回 1280 口径。之前那份是从用户窗口截图（1176×700
+            # 含标题栏）放大来的，真机上一律认不出（22 分 > 阈值 12），
+            # 于是 _to_map 第一步就失败、整个导航退回老路径。
+            'tpl': 'OS_entry.png',
+            'roi': [100, 536, 267, 31], 'tap': [233, 551],
+            'wait': 5.0,
+        },
+        # 点横幅进的是散点式活动主页：六个入口绕成一圈，分区和工具入口长一个样，
+        # 所以每个都要单独的模板 + ROI（单看模板容易认错到隔壁去）。
+        # 2026-11-22 晚：模板全部改用**真机 1920×1080 截图**重裁，roi 是那块的
+        # 1280 口径包围盒（以前从窗口截图放大，真机上一律 16~20 分认不出）。
+        'zones': {
+            'base': {'tpl': 'OS_z1.png', 'label': '圣巡之旅',
+                     'roi': [869, 513, 113, 167], 'tap': [925, 596]},
+            'ex': {'tpl': 'OS_z2.png', 'label': '变革之路',
+                   'roi': [992, 481, 134, 167], 'tap': [1059, 565]},
+            's': {'tpl': 'OS_z3.png', 'label': '喀兰之心',
+                  'roi': [1120, 410, 130, 157], 'tap': [1185, 488]},
+        },
+        'tools': {
+            'minigame': {'tpl': 'OS_mini.png', 'label': '喀兰贸易技术研发部',
+                         'roi': [1102, 122, 136, 179], 'tap': [1170, 211],
+                         'wait': 3.0},
+            'shop': {'tpl': 'OS_shop.png', 'label': '观测站后勤处',
+                     'roi': [113, 400, 120, 67], 'tap': [172, 460],
+                     'wait': 3.0},
+            # 活动奖励（神谕谜题任务页）：进去后还要点「一键领取」，
+            # 见 claim_reward()
+            'reward': {'tpl': 'OS_reward.png', 'label': '神谕谜题',
+                       'roi': [288, 507, 123, 122], 'tap': [349, 568],
+                       'wait': 3.0},
+        },
+        'claim': {'tpl': 'OS_claim.png', 'label': '一键领取',
+                  'roi': [900, 130, 300, 130], 'tap': [1146, 177],
+                  'wait': 2.0},
     },
 }
 
@@ -90,6 +132,11 @@ ALIASES = ('最新活动', '当期活动', '当前活动', '新活动', '刚开�
 
 # 模板相似度阈值：模板就是从当前 UI 上抠的，真命中 0~6 分，误命中 15 以上
 _MAX_SCORE = 12.0
+
+# 「活动提示条」走定点比对（见 _entry_here），阈值放宽一点：这条横幅每次
+# 重绘的亮度/底色都有细微差别，同一位置实测 0~11 分；而别的页面上同一片
+# 区域是 60 分以上，16 分足够拉开。
+_ENTRY_MAX = 16.0
 
 
 def _tpl_path(name):
@@ -148,8 +195,11 @@ def active(today=None):
         out.append({'prefix': pre, 'name': ent.get('name') or '',
                     'until': ent.get('until') or '',
                     'stage': '%s-1' % pre,
+                    'closed': bool(ent.get('closed')),
+                    'reprint': bool(ent.get('reprint')),
                     'zones': sorted((ent.get('zones') or {}).keys())})
-    out.sort(key=lambda r: r['until'])
+    # 已结束的活动（只剩商店）排后面：用户说「最新活动」时要给正在开的那期
+    out.sort(key=lambda r: (bool(r.get('closed')), r['until']))
     return out
 
 
@@ -210,6 +260,67 @@ def _find(data, spec):
         except Exception:
             pass
     return x, y, sc
+
+
+def _entry_here(data, entry):
+    """终端页上「活动提示条」在不在 → ``(在不在, 分数, 中心像素x, 中心像素y)``
+
+    这条横幅的位置是**钉死的**（终端页底部、tab 栏上方，活动换来换去也在这
+    一格），所以按固定位置 ±8 像素比，别用整屏模板搜索。
+
+    为什么专门写这么一段（2026-11-22 实测，雪山降临导航偶发失败）：它是一行
+    400×44 的长条字，逐像素比对的「像」极其尖锐——对齐是 10 分，错开 2 像素
+    就 30 分。整屏搜索要先缩到 1/4 粗扫，这种细长低对比的模板缩完笔画快没了，
+    粗扫很容易锁到背景渐变的谷底上，精修只在附近几十像素里找，回不到正确位置
+    （同一帧：直接定点比 10 分，整屏搜索报 22 分、坐标跑到下面别的行上）。
+    结果就是日志里「点了六次终端大卡都看不到活动提示条」，白等二十多秒。
+
+    位置口径：``roi``（1280 口径左上角）优先，没有就按 ``tap``（1280 口径中心）
+    反推；两者都要乘 1.5 换到 1920 像素。
+    """
+    tpl_p = _tpl_path((entry or {}).get('tpl') or '')
+    if not tpl_p or not data:
+        return False, 999.0, 0, 0
+    try:
+        from PIL import Image, ImageChops, ImageStat
+        im = Image.open(io.BytesIO(data)).convert('L')
+        tpl = Image.open(tpl_p).convert('L')
+    except Exception:
+        return False, 999.0, 0, 0
+    w, h = im.size
+    k = w / 1920.0
+    tw = max(4, int(round(tpl.width * k)))
+    th = max(4, int(round(tpl.height * k)))
+    try:
+        t = tpl.resize((tw, th), Image.BILINEAR)
+    except Exception:
+        return False, 999.0, 0, 0
+
+    roi = entry.get('roi')
+    tap = entry.get('tap')
+    if roi and len(roi) == 4:
+        bx, by = int(roi[0] * 1.5 * k), int(roi[1] * 1.5 * k)
+    elif tap and len(tap) == 2:
+        bx = int((tap[0] * 1.5 - tpl.width / 2.0) * k)
+        by = int((tap[1] * 1.5 - tpl.height / 2.0) * k)
+    else:
+        return False, 999.0, 0, 0
+
+    best = (999.0, bx, by)
+    # 步长必须是 1：这条横幅靠像素级对齐，隔一格就差十来分（实测 805 对 10 分、
+    # 804 对 13 分、806 对 21 分），走 2 会正好跳过最像的那一行
+    for dy in range(-6, 7):
+        for dx in range(-6, 7):
+            x, y = bx + dx, by + dy
+            if x < 0 or y < 0 or x + tw > w or y + th > h:
+                continue
+            s = ImageStat.Stat(ImageChops.difference(
+                im.crop((x, y, x + tw, y + th)), t)).mean[0]
+            if s < best[0]:
+                best = (s, x, y)
+    score, x, y = best
+    return (score <= _ENTRY_MAX, score,
+            x + tw // 2, y + th // 2)
 
 
 def _tap(touch, data, spec, log, what):
@@ -276,49 +387,73 @@ def _fail_shot(touch, name, log):
         pass
 
 
+def _to_terminal(touch, entry, log, rounds=6):
+    """从任意一页收敛到「终端页」（活动提示条可见的那一页）
+
+    返回 ``(截图, 提示条中心像素x, 中心像素y, 分数)``；没到位返回 ``(b'', 0, 0, 999)``。
+
+    **为什么不直接盲点终端大卡**（2026-11-22 手测踩到的）：那个坐标是按主界面
+    量的（1280 口径 913,173），只在主界面 / 终端页成立。跑完一关之后游戏停在
+    **关卡列表**上，同一坐标正好压在关卡卡片上，一戳就打开关卡详情页，接着点
+    底部「终端」tab 又会戳到列表底部——连跑几个号就会莫名多进一次关卡。在
+    活动地图上则可能戳到奖励 / 商店节点。
+
+    所以先判自己在哪：底部有四块功能格（``stagenav.at_home``）才算主界面系，
+    可以放心点大卡；否则先 ``_to_home`` 一层层退（关卡列表 → 活动地图 →
+    终端页）。返回键在**主界面**上会弹退出确认框，所以退这一步必须挂在
+    at_home 判断之后，不能无条件按。
+    """
+    p = stagenav.points()
+    homed = 0
+    for i in range(rounds):
+        data = touch.shot()
+        ok, sc, ex, ey = _entry_here(data, entry)
+        if ok:
+            return data, ex, ey, sc
+        if not stagenav.at_home(touch):
+            # 关卡列表 / 活动地图 / 主题页 / 剧情页：交给 _to_home 一层层退回
+            # 主界面（它自己会跳剧情、退化到 ESC、最后点左上角「<」）。退回去
+            # 以后重新判一次——退一两层可能已经到终端页了，就不用再点大卡。
+            if homed >= 2:
+                break
+            homed += 1
+            log('不在主界面，先退回主界面')
+            _to_home(touch, log)
+            continue
+        # 固定位置点「终端」大卡，**不认字**：换皮肤会把「终端」两个字
+        # 盖掉，但这块按钮区域一直在（用户 2026-11-19 明确要求）
+        log('点固定位置的「终端」大卡')
+        touch.tap(*p['terminalCard'])
+        time.sleep(2.0)
+        data = touch.shot()
+        ok, sc, ex, ey = _entry_here(data, entry)
+        if ok:
+            return data, ex, ey, sc
+        log('还没看到活动提示条（最像 %.0f 分），点底部「终端」tab 再试（第 %d 次）'
+            % (sc, i + 1))
+        touch.tap(*p['tabTerminal'])
+        time.sleep(1.6)
+    return b'', 0, 0, 999.0
+
+
 def _to_map(touch, pre, ent, log):
     """「终端页 → 点活动提示条 → 活动地图」→ ``(ok, 截图, 说明)``
 
     关卡导航和小游戏/商店入口都要先走这一段，所以单独拎出来：两处如果各写
     一遍，改一处忘另一处就会出现「关卡能进、商店进不去」。
     """
-    p = stagenav.points()
     entry = ent.get('entry') or {}
-    data = touch.shot()
-
-    # ---- 1) 到「终端页」：有活动提示条就说明已经在了 ----
-    if not _find(data, entry)[0]:
-        for i in range(2):
-            # 固定位置点「终端」大卡，**不认字**：换皮肤会把「终端」两个字
-            # 盖掉，但这块按钮区域一直在（用户 2026-11-19 明确要求）
-            log('点固定位置的「终端」大卡')
-            touch.tap(*p['terminalCard'])
-            time.sleep(2.0)
-            data = touch.shot()
-            if _find(data, entry)[0]:
-                break
-            log('还没看到活动提示条，点底部「终端」tab 再点一次（第 %d 次）'
-                % (i + 1))
-            touch.tap(*p['tabTerminal'])
-            time.sleep(1.5)
-            data = touch.shot()
-            if _find(data, entry)[0]:
-                break
-        else:
-            # 可能根本不在主界面（在活动地图 / 商店里点大卡没用）
-            if not _to_home(touch, log):
-                return False, b'', '回不到主界面（可能卡在某个弹窗里）'
-            touch.tap(*p['terminalCard'])
-            time.sleep(2.0)
-            data = touch.shot()
-            if not _find(data, entry)[0]:
-                _fail_shot(touch, pre, log)
-                return False, b'', ('终端页上没找到活动提示条（活动可能已结束，'
-                                    '或这版 UI 改了，要重新标定导航）')
+    data, ex, ey, sc = _to_terminal(touch, entry, log)
+    if not data:
+        _fail_shot(touch, pre, log)
+        return False, b'', ('终端页上没找到活动提示条（最像 %.0f 分，活动可能'
+                            '已结束，或这版 UI 改了，要重新标定导航）' % sc)
 
     # ---- 2) 点活动提示条 → 活动地图（约 5 秒过场动画）----
+    # 点哪一下用固定位置比出来的中心，不再整屏搜索（见 _entry_here）
     before = data
-    _tap(touch, data, entry, log, '活动提示条')
+    log('点活动提示条（%.1f 分，(%d,%d)）' % (sc, ex, ey))
+    touch.tap_px(ex, ey)
     time.sleep(float(entry.get('wait') or 5.0))
     after = touch.shot()
     if before and after and not stagenav._moved(before, after):
@@ -331,6 +466,39 @@ def _to_map(touch, pre, ent, log):
     return True, after, '活动地图'
 
 
+def _near_map(touch, ent, log):
+    """已经在活动地图上就别再绕一圈回主界面 → 截图 or ``b''``
+
+    为什么要这一段：连跑多关时，每关导航前游戏可能就停在活动地图上（上一关
+    跑完、或者小游戏/商店那次导航点回来），照「回主界面 → 终端页 → 点活动
+    提示条」那一路走要多花十来秒。认得到基础区节点就说明已经在地图上，直接用。
+
+    另外「关卡列表」上底部也露着三个分区节点，但位置比地图上低一截、模板认
+    不出；那种页面按一下返回就够了（实测回到的是**活动主题页**，不是地图——
+    主题页也会被后面的 ``_to_terminal`` 接住）。这一下返回反正是回主界面的
+    必经步骤，不算白按。
+
+    只做「看一眼 / 按一下返回」这种**不会误触**的动作：认不到就老实返回
+    ``b''``，交给正规路径。绝不在这里盲点坐标。
+    """
+    zones = ent.get('zones') or {}
+    base = zones.get('base') or {}
+    data = touch.shot()
+    if data and base and _find(data, base)[0]:
+        log('已经在活动地图上，省掉回主界面那一路')
+        return data
+    # 关卡列表 / 分区详情：底部有条纹横幅、认不到分区节点，返回一下就回到地图
+    if data and stagenav.probe_bytes(data) == 'map':
+        log('看着像关卡列表，按一下返回回活动地图')
+        touch.back()
+        time.sleep(1.6)
+        data = touch.shot()
+        if data and base and _find(data, base)[0]:
+            log('回到活动地图了')
+            return data
+    return b''
+
+
 def run(touch, stage_code, log=None):
     """把界面带到某关所在的分区关卡列表 → ``(ok, 说明)``"""
     log = log or (lambda *_: None)
@@ -338,6 +506,11 @@ def run(touch, stage_code, log=None):
     ent = ENTRIES.get(pre)
     if not ent:
         return False, '「%s」没有当期活动导航' % (pre or stage_code)
+    # 活动结束后关卡入口就没了（2026-11-22 TL）：提前说清楚，别导航到地图上
+    # 才发现没有分区按钮，白跑一趟还让用户以为识别坏了
+    if ent.get('closed') and not (ent.get('zones') or {}):
+        return False, ('「%s」已经结束了，关卡入口关了——只能进活动商店'
+                       % (ent.get('name') or pre))
     kind = stagenav.zone_kind(stage_code)
     if kind not in ('base', 'ex', 's', 'mo'):
         kind = 'base'
@@ -349,33 +522,37 @@ def run(touch, stage_code, log=None):
     log('走当期活动导航：%s（%s）→ %s 分区'
         % (ent.get('name') or pre, pre, kind.upper()))
 
-    ok, after, why = _to_map(touch, pre, ent, log)
-    if not ok:
-        return False, why
+    after = _near_map(touch, ent, log)
+    if not after:
+        ok, after, why = _to_map(touch, pre, ent, log)
+        if not ok:
+            return False, why
 
-    # ---- 3) 活动地图 → 基础区（普通关卡界面）----
-    base = (ent.get('zones') or {}).get('base')
+    # ---- 3) 活动地图 → 目标分区 ----
+    # **直接点目标那个节点**，别再绕一遍基础区（2026-11-22 用户实测报「用的还是
+    # 老导航」）：OS 这种新地图上「圣巡之旅 / 变革之路 / 喀兰之心」是同一屏上的
+    # 三个节点，点了基础区就进关卡列表了，EX/S 的模板根本不在那一页上——`_find`
+    # 认不到就按标定坐标兜底点，那一戳可能正好点在某张关卡卡片上。
+    zones = ent.get('zones') or {}
+    base = zones.get('base')
     if not base:
         return False, '这条导航没写基础区（zones.base）'
-    _tap(touch, after, base, log, '基础区「%s」' % (base.get('label') or ''))
-    time.sleep(stagenav.MAP_DELAY)
-    if kind == 'base':
-        return True, '已到基础关卡列表（%s）' % (base.get('label') or '')
-
-    # ---- 4/5) 关卡列表右下角的区域按钮：切 EX / S ----
-    tgt = (ent.get('zones') or {}).get(kind)
+    tgt = base if kind == 'base' else zones.get(kind)
     if not tgt:
         return False, '「%s」这条导航没写 %s 分区（只有 %s）' % (
             ent.get('name') or pre, kind.upper(),
-            '、'.join((ent.get('zones') or {}).keys()))
-    cur = touch.shot()
-    _tap(touch, cur, tgt, log, '%s 分区「%s」' % (kind.upper(),
-                                                tgt.get('label') or ''))
+            '、'.join(zones.keys()))
+    before = after
+    _tap(touch, after, tgt, log, '%s 分区「%s」'
+         % (kind.upper() if kind != 'base' else '基础区', tgt.get('label') or ''))
     time.sleep(stagenav.MAP_DELAY)
-    if cur and not stagenav._moved(cur, touch.shot()):
-        log('点了「%s」画面没变，判定本来就停在这个分区'
+    if before and not stagenav._moved(before, touch.shot()):
+        log('点了「%s」画面没变，可能没切过去（模板过期要重新标定）'
             % (tgt.get('label') or ''))
-    return True, '已切到 %s 分区（%s）' % (kind.upper(), tgt.get('label') or '')
+        return False, ('点了「%s」之后画面没变，没进 %s 关卡列表'
+                       % (tgt.get('label') or '', kind.upper()))
+    return True, '已到 %s 关卡列表（%s）' % (
+        kind.upper(), tgt.get('label') or '')
 
 
 def run_tool(touch, tool, prefix=None, log=None):
@@ -407,9 +584,11 @@ def run_tool(touch, tool, prefix=None, log=None):
             % (ent.get('name') or pre, ent.get('wrote') or '?',
                ent.get('until') or '?'))
 
-    ok, data, why = _to_map(touch, pre, ent, log)
-    if not ok:
-        return False, why
+    data = _near_map(touch, ent, log)
+    if not data:
+        ok, data, why = _to_map(touch, pre, ent, log)
+        if not ok:
+            return False, why
     label = spec.get('label') or tool
     _tap(touch, data, spec, log, '「%s」' % label)
     time.sleep(float(spec.get('wait') or 3.0))
@@ -419,6 +598,37 @@ def run_tool(touch, tool, prefix=None, log=None):
         return True, '点了「%s」，但画面没变化，MAA 可能认不出页面' % label
     log('进「%s」了' % label)
     return True, '已进入「%s」' % label
+
+
+def claim_reward(touch, prefix=None, log=None):
+    """活动奖励页 → 点「一键领取」→ ``(ok, 说明)``
+
+    只有 ``tools.reward`` + ``claim`` 都写了的活动才有（现在只有 OS）：进奖励页
+    后页面上有个「一键领取」，点一下把已完成的任务奖励一次性收掉。已经领完的
+    时候按钮还在，点了没反应——所以这里不校验，点完就回。
+    """
+    log = log or (lambda *_: None)
+    pre = str(prefix or '').strip().upper()
+    ok, why = run_tool(touch, 'reward', prefix=pre or None, log=log)
+    if not ok:
+        return False, why
+    ent = ENTRIES.get(pre) or (ENTRIES.get(active()[0]['prefix'])
+                               if active() else {})
+    spec = (ent or {}).get('claim')
+    if not spec:
+        return False, '这条导航没写领奖按钮（claim），进了奖励页但要手动点'
+    data = touch.shot()
+    x, y, sc = _find(data, spec)
+    if x:
+        touch.tap_px(x, y)
+        log('点「%s」（%.1f 分）' % (spec.get('label') or '一键领取', sc))
+    else:
+        tap = spec.get('tap') or [0, 0]
+        log('没认出「%s」（最像 %.0f 分），按标定坐标兜底点'
+            % (spec.get('label') or '一键领取', sc))
+        touch.tap(int(tap[0]), int(tap[1]))
+    time.sleep(float(spec.get('wait') or 2.0))
+    return True, '已点「%s」' % (spec.get('label') or '一键领取')
 
 
 def describe():
@@ -432,9 +642,11 @@ def describe():
             'name': ent.get('name') or '',
             'until': ent.get('until') or '',
             'expired': bool(d and d < today),
+            'closed': bool(ent.get('closed')),
+            'reprint': bool(ent.get('reprint')),
             'zones': sorted((ent.get('zones') or {}).keys()),
             'tools': sorted((ent.get('tools') or {}).keys()),
             'stage': '%s-1' % pre,
         })
-    rows.sort(key=lambda r: (r['expired'], r['until']))
+    rows.sort(key=lambda r: (r['expired'], r['closed'], r['until']))
     return rows
