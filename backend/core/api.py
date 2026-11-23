@@ -164,6 +164,13 @@ def api_account_maa(_q, body):
     if 'accountNameFrom' in patch:
         v = str(patch.get('accountNameFrom') or '').strip().lower()
         patch['accountNameFrom'] = v if v in ('manual', 'profile') else ''
+    if 'adbAddress' in patch:
+        # 这个号钉在哪台模拟器上。写歪了会连到另一台实例，所以在这里就拦。
+        from . import acctbind
+        addr, why = acctbind.check_addr(patch.get('adbAddress'))
+        if why:
+            raise ValueError('模拟器地址不对：%s' % why)
+        patch['adbAddress'] = addr
     if 'accountName' in patch:
         # 切号名统一走 acctname：用户给「5505」「181 5505」「181****5505」
         # 「157****3635」都能吃下，官服填了昵称则当场拦下——这一格填错的
@@ -184,6 +191,44 @@ def api_account_maa(_q, body):
         else:
             patch['accountName'] = ''
     return {'maa': accounts.save_maa_meta(body['file'], patch)}
+
+
+def api_account_devices(q, _body):
+    """某个账号能选哪些模拟器：在线设备 + 本机有哪些实例 + 现在钉的那台
+
+    设置里「模拟器」下拉用它。多开时地址必须是明示的（见 skills.device_of
+    的规则），所以这里把 adb 现在看到的都列出来，用户点一下就行，不用手抄。
+
+    ``instances`` 是**没开着的实例也列**（雷电用 ``ldconsole list2`` 问出来）：
+    用户想把号钉到第二台时，那台常常正好没开，只列在线设备他就选不到
+    （2026-11-23「只能启动 5554，启动不了 5556」的一半原因在前端这边）。
+    """
+    file = ''
+    try:
+        file = _account_for(q.get('file'))
+    except Exception:
+        file = ''
+    from . import acctbind, envcheck
+    d = acctbind.dir_of(file) if file else None
+    prof = (acctbind.profile_of(file) or None) if file else None
+    try:
+        cfg = envcheck.read_config(d, prof)
+    except Exception:                           # noqa: BLE001
+        cfg = {}
+    devs = envcheck._devices(cfg.get('adb') or 'adb') or {}
+    insts = []
+    try:
+        for idx, up in envcheck.ld_instances(cfg.get('emu_dir') or ''):
+            ser = envcheck.ld_serial(cfg.get('emu_dir') or '', idx)
+            if ser and ser not in [x['address'] for x in insts]:
+                insts.append({'address': ser, 'index': idx, 'running': bool(up)})
+    except Exception:                           # noqa: BLE001
+        insts = []
+    return {'adb': cfg.get('adb') or '',
+            'bound': acctbind.addr_of(file) if file else '',
+            'devices': [{'address': a, 'state': s}
+                        for a, s in sorted(devs.items())],
+            'instances': insts}
 
 
 def api_account_token(_q, body):
@@ -454,8 +499,8 @@ def api_maa_probe(q, _body):
     """检测一个目录是不是 MAA / MAAEND 根目录（首次引导 / 设置里用）
 
     kind=endfield 时按 MAAEND 的主程序名去找：终末地那套是另一个程序，
-    主程序可能叫 MaaEnd.exe 或 mxu.exe（三月七脚本里两种都出现过）。这一步
-    只是把路径先管起来，MAAEND 的任务链还没接。
+    主程序不同版本分别叫 MaaEnd.exe 和 mxu.exe。这一步只是把路径先管起来，
+    MAAEND 的任务链还没接。
     """
     d = (q.get('dir') or '').strip()
     if not d:
@@ -836,6 +881,25 @@ def api_skill_run(_q, body):
     return {'taskId': tid}
 
 
+def api_run_stop(q, body):
+    """停挂机：带 file 就只停那一个号，不带才全停
+
+    界面右栏那个「停止」按钮走这里（只停当前这个账号）。用户 2026-11-23
+    报的是「停止不能指定，会一起停其他任务」——以前只有 agent 的全停接口，
+    两台模拟器一起断，另一台正在打的关就白烧了。
+    """
+    body = body or {}
+    f = str(body.get('file') or q.get('file') or '').strip()
+    all_ = bool(body.get('all') or q.get('all'))
+    if not f and not all_:
+        # 没点名就全停太危险：右栏那个按钮传的是「当前账号」，万一没选中
+        # 就会把两台一起砍掉——正是用户报过的「停止会一起停其他任务」。
+        return {'accounts': [], 'engines': 0, 'processes': 0, 'stopped': 0,
+                'error': '要停哪一路？传 file=账号文件名；全停请显式传 all=true'}
+    files = [] if all_ else [f]
+    return skills.stop_accounts(files)
+
+
 def api_skill_list(_q, _body):
     return {'skills': [{'name': k, 'desc': v[0]} for k, v in sorted(skills.SKILLS.items())]}
 
@@ -896,12 +960,25 @@ def api_schedule_stop(_q, _body):
     return scheduler.stop_current()
 
 
+def api_schedule_presets(_q, _body):
+    """预设表（不含探测）：界面下拉用，纯数据，快"""
+    return {'ok': True, 'presets': scheduler.presets()}
+
+
+def api_schedule_detect(q, _body):
+    """选预设时回填 program / args / cwd；refresh=1 强制重新找"""
+    pid = q.get('id') or ''
+    refresh = str(q.get('refresh') or '') in ('1', 'true', 'yes')
+    return dict(scheduler.fill(pid, refresh=refresh), ok=True)
+
+
 ROUTES = {
     '/api/bootstrap': bootstrap,
     '/api/settings': api_settings,
     '/api/accounts': api_accounts,
     '/api/account': api_account,
     '/api/account/maa': api_account_maa,
+    '/api/account/devices': api_account_devices,
     '/api/account/token': api_account_token,
     '/api/account/token/check': api_account_token_check,
     '/api/account/token/set': api_account_token_set,
@@ -958,6 +1035,7 @@ ROUTES = {
     '/api/watch/start': api_watch_start,
     '/api/watch/stop': api_watch_stop,
     '/api/runs': api_runs,
+    '/api/run/stop': api_run_stop,
     '/api/maa/profiles': api_profiles,
     # 多账号
     '/api/multi/candidates': api_multi_candidates,
@@ -972,6 +1050,8 @@ ROUTES = {
     '/api/schedule/save': api_schedule_save,
     '/api/schedule/run': api_schedule_run,
     '/api/schedule/stop': api_schedule_stop,
+    '/api/schedule/presets': api_schedule_presets,
+    '/api/schedule/detect': api_schedule_detect,
     # 内置助手（M4）
     '/api/agent/status': api_agent_status,
     '/api/agent/config': api_agent_config,

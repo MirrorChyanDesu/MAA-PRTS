@@ -37,6 +37,7 @@ import time
 from . import accounts
 from . import atomicio
 from . import envcheck
+from . import maacore
 from . import maaplan
 from . import multiproc
 from . import resources
@@ -51,13 +52,103 @@ _ADDR = threading.local()
 
 
 def _addr_of(file):
-    return (getattr(_ADDR, 'map', None) or {}).get(file, '')
+    """这个号这次连哪台：本次点名 > 账号绑定 > 空
+
+    绑定（``maa.adbAddress``）是 2026-11-23 加的：以前只有聊天里临时点名这
+    一条路，助手忘一次就把两个号挤到同一台模拟器上。现在钉在账号里，任何
+    入口（单个 skill / run_steps / 界面按钮）都读同一份。
+    """
+    a = (getattr(_ADDR, 'map', None) or {}).get(file, '')
+    if a:
+        return a
+    try:
+        from . import acctbind
+        return acctbind.addr_of(file)
+    except Exception:
+        return ''
+
+
+def _set_addr(file, addr):
+    """把「解析后实际要连的那台」钉到本线程，run_core 就照它连"""
+    if not file or not addr:
+        return
+    m = dict(getattr(_ADDR, 'map', None) or {})
+    if m.get(file) == addr:
+        return
+    m[file] = addr
+    _ADDR.map = m
+
+
+def device_of(file, maa_dir=None, profile=None):
+    """这个号该连哪台模拟器 → ``(地址, 来源, 拦下原因)``
+
+    2026-11-23 用户报「明明指定 5554 挂活动，结果影响 5556 的」，根因是
+    「地址对不上就挑一台在线的」这条兜底：档案里写过期的 5554、实际开着
+    5556 时，程序会**悄悄**改连 5556，用户看到的就是任务跑去动了另一台。
+
+    所以这里把「能不能自己改主意」定死：
+
+    ==================  ============================================
+    地址来源            那台不在线时
+    ==================  ============================================
+    点名 / 账号绑定      **绝不换成别的**，原样交出这台（交给 envcheck
+                        按它的实例序号去启动；能启动就不算错）
+     MAA 档案            只有一台在线才顶上（地址过期很常见，无歧义）
+     ==================  ============================================
+
+    返回的 ``原因`` 非空且 ``地址`` 为空时，调用方必须停下任务，别再往下跑。
+    """
+    from . import acctbind
+    d = maa_dir if maa_dir is not None else acctbind.dir_of(file)
+    prof = profile if profile is not None else (acctbind.profile_of(file) or None)
+    try:
+        cfg = envcheck.read_config(d or None, prof)
+    except Exception:                           # noqa: BLE001
+        cfg = {}
+    adb = cfg.get('adb') or 'adb'
+    devs = envcheck._devices(adb) or {}
+    live = sorted(a for a, s in devs.items() if s == 'device')
+    pinned = _addr_of(file)
+    from_cfg = str(cfg.get('address') or '')
+    want = pinned or from_cfg
+    src = '指定' if pinned else ('档案' if from_cfg else '')
+    if want and devs.get(want) == 'device':
+        return want, src, ''
+    if pinned:
+        # 钉死的这台没在线：**不换台**，原样交出去让 envcheck 去启动它。
+        # 「第二个实例没开」和「地址写错」长得一样：前者该自动开，后者会在
+        # ensure 里回一句「没在线，现在在线：…」，比这里直接拦下更准。
+        return pinned, src, ''
+    if not live:
+        # 一台都没开：交给 envcheck 按档案里的实例去启动，启动的正是 want
+        return '', src, ''
+    if len(live) == 1:
+        return live[0], '自动', ''
+    return '', src, ('档案里写的是「%s」，它不在线；现在有 %d 台在线（%s），'
+                     '分不清这个号该用哪台。请先在设置 → 账号里给它指定一台'
+                     % (want or '未填', len(live), '、'.join(live)))
 
 
 def _addr_kw(file):
     """``{'adbAddress': ...}`` —— 用户点名了模拟器才带这个键"""
     a = _addr_of(file)
     return {'adbAddress': a} if a else {}
+
+
+def _spec_kw(file):
+    """跑机 spec 的公共三件套：``profile`` / ``clientType`` / ``adbAddress``
+
+    另外固定带一个 ``accountFile``：``maaplan.resolve_client`` 拿它回查账号的
+    ``channelName``。2026-11-23 的教训是**每多一条跑机入口就多一次漏传**——
+    ``skill_fight`` 当初只从 :func:`_profile_kw` 里取了 ``profile``，把
+    ``clientType`` 丢了，b 服账号就被按官服包启动。现在 spec 里一律带
+    ``accountFile``，漏传 clientType 也能兜回来（见 maaplan.resolve_client）。
+    """
+    out = dict(_profile_kw(file))
+    out.update(_addr_kw(file))
+    if file:
+        out['accountFile'] = file
+    return out
 
 
 def _profile_kw(file):
@@ -440,7 +531,7 @@ def skill_wakeup(params, log, tid=None):
         # 自己换号——不读也不改用户的 MAA 配置档案
         spec = dict({'tasks': ['startup'], 'accountName': tail,
                      'maaDir': _maa_dir_of(file)},
-                    **_profile_kw(file), **_addr_kw(file))
+                    **_spec_kw(file))
         log('临时配置唤醒：只跑开始唤醒，切到 %s' % tail)
         maaplan.run_core(spec, tid=tid, timeout=360)
         return {'ok': True, 'how': 'maa-startup', 'account': file}
@@ -824,10 +915,15 @@ def _tidy_stage_list(stages, asked, log):
 
 def _prepare_ops(stages, file, log, raid='auto', wants=None, fixed=None,
                  depth=3, strict=False, prereq=None):
-    """``_select_ops`` + 落盘 → ``(copilotList, retry)``
+    """``_select_ops`` + 落盘 → ``(copilotList, retry, raid_missing)``
 
     ``retry`` 直接塞进 ``spec['retry']``，run_core 据此在翻车后换作业重挂。
     每关只有一份候选时不给 retry（没得换，省一轮空转）。
+
+    ``raid_missing`` 是「用户点名要突袭、但作业站只有普通」的那几关。以前这种
+    降级只写一行日志，助手看不到，就照着用户的说法继续回「打的是突袭」——
+    2026-11-23 用户投诉「说突袭、两个号导入的都是普通 EX-8」。现在把它当成
+    返回值的一部分，助手必须如实转告。
     """
     picks, pool = _select_ops(stages, file, log, raid=raid, wants=wants,
                               fixed=fixed, depth=depth, strict=strict,
@@ -836,7 +932,14 @@ def _prepare_ops(stages, file, log, raid='auto', wants=None, fixed=None,
     retry = {}
     if any(len(v) > 1 for v in pool.values()):
         retry = {'pool': pool, 'maxRounds': max(2, min(4, depth))}
-    return rows, retry
+    # 实际排下去的档位 vs 用户点名要的档位
+    asked = {str(k).upper() for k, v in (wants or {}).items()
+             if str(v).lower() == 'raid'}
+    if str(raid).strip().lower() == 'raid':
+        asked |= {str(s).upper() for s in stages}
+    got = {str(r.get('stage_name') or '').upper()
+           for r in rows if r.get('is_raid')}
+    return rows, retry, sorted(a for a in asked if a and a not in got)
 
 
 @skill("fight", "自动战斗：预检练度/前置 → 编队/借人/开打（失败自动换作业）",
@@ -969,7 +1072,7 @@ def skill_fight(params, log, tid=None):
             log('不补前置：%s 在游戏里要先通同分区前面的关；要一起补就说'
                 '「把前置一起补」' % '、'.join(need))
 
-    spec = {
+    spec = dict({
         'tasks': ['startup', 'copilot' if mode == 'copy' else 'fight'],
         'stages': stages,
         'accountName': tail,
@@ -980,28 +1083,36 @@ def skill_fight(params, log, tid=None):
             'support': cop.get('support', True),            # 借助战（缺人时借）
             'sanityPotion': cop.get('sanityPotion', True),  # 理智不够吃药
         },
-        # 这个号绑的档案 + 用户点名的模拟器（多开时靠它们连各自的设备）
-        'profile': params.get('profile') or (_profile_kw(file) or {}).get('profile', ''),
-    }
-    spec.update(_addr_kw(file))
+    }, **_spec_kw(file))
+    # 显式点名的档案优先于账号绑的那份
+    # 2026-11-23 修：以前这里只把 `_profile_kw()['profile']` 抄进来，同一份字典
+    # 里的 clientType 被丢掉，于是 b 服账号的 StartUp 永远按 Official 跑——MAA
+    # 去启动官服包、在官服账号列表里找 b 服号，用户看到的就是「认成官服了」。
+    if params.get('profile'):
+        spec['profile'] = params['profile']
     # 抄作业必须有作业文件：按 stages 现搜（预检那轮已经拉过作业站，这里命中
     # 缓存，不再发请求）。**不能拿预检挑好的那一条直接用**——预检每关只挑
     # 一份，而且不看要打普通还是突袭（`@both` 那种要两条），得在这里按变体拆。
     # 不给 copilotList 的话队列里 Copilot 会被 core_tasks 跳过（见
     # _prepare_ops 注释），noNav 模式下直接空队列报错。
+    raid_missing = []
     if mode == 'copy':
         if params.get('copilotList'):
             spec['copilotList'] = params['copilotList']
         else:
             # 每关多挑几份备选：翻车时 run_core 会自动换下一份重挂
             # （2026-11-19 需求 3），不用整轮重来、也不重打已成功的关
-            spec['copilotList'], retry = _prepare_ops(
+            spec['copilotList'], retry, raid_missing = _prepare_ops(
                 stages, file, log, raid=params.get('raid', 'auto'),
                 wants=wants, fixed=fixed,
                 depth=int(params.get('swapDepth') or 3),
                 prereq=prereq)
             if retry:
                 spec['retry'] = retry
+            if raid_missing:
+                log('这几关要的是突袭，但作业站只有普通版，实际排的是普通：%s'
+                    '（要严格只打突袭就传 raid="raid" 并把这几关去掉）'
+                    % '、'.join(raid_missing))
     log('自动战斗（%s）：%s' % (mode, ' '.join(stages)))
 
     # 把**实际要打的难度**单独打成一行。用户 2026-11-23 报障：「说普通 1 到 5，
@@ -1098,6 +1209,18 @@ def skill_fight(params, log, tid=None):
         log('本轮没正常结束：%s'
             % ((r or {}).get('error') or (r or {}).get('failed_why')
                or '看上面的报错')[:120])
+    # 实际排下去的难度（逐关）。助手回复里说到难度**只能引用这个**：以前它
+    # 照着「EX 关默认突袭」那句描述回话，排进去的却是普通，用户以为是程序坏了。
+    diff = {}
+    for row in (spec.get('copilotList') or []):
+        code = str(row.get('stage_name') or '')
+        if not code:
+            continue
+        one = '突袭' if row.get('is_raid') else '普通'
+        if code in diff and diff[code] != one:
+            diff[code] = '普通+突袭'
+        else:
+            diff[code] = one
     return {'ok': ok_chain, 'mode': mode, 'stages': stages,
             'account': file, 'noNav': not with_nav,
             'prereq': sorted(prereq),
@@ -1106,11 +1229,15 @@ def skill_fight(params, log, tid=None):
             'stagesFailed': [{'stage': x.get('stage'), 'why': x.get('why')}
                              for x in got_bad],
             'swaps': swaps,
+            'difficulties': diff,
+            'raidMissing': raid_missing,
             'notPlayed': rest,
             'blocked': (plan or {}).get('blocked') or [],
             'precheck': plan,
             'summary': (plan or {}).get('summary') or '',
-            'stageNote': 'MAA 只报跑过哪些关和任务链成败，不报逐关成功数'}
+            'stageNote': 'MAA 只报跑过哪些关和任务链成败，不报逐关成功数。'
+                         '回复里说难度只能引用 difficulties 字段；'
+                         'raidMissing 非空时必须如实说这几关只有普通作业'}
 
 
 # ---------------------------------------------------------------- skip_story
@@ -1144,7 +1271,7 @@ def skill_skip_story(params, log, tid=None):
     def probe():
         spec = dict({'tasks': ['startup', 'fight'], 'stages': [stage],
                      'accountName': tail, 'maaDir': d},
-                    **_profile_kw(file), **_addr_kw(file))
+                    **_spec_kw(file))
         try:
             maaplan.run_core(spec, tid=tid, timeout=900)
         except Exception as e:
@@ -1491,7 +1618,7 @@ def skill_train(params, log, tid=None):
         'switchAccount': switch,
         'noStartUp': not wakeup,
         'maaDir': _maa_dir_of(file),
-    }, **_profile_kw(file), **_addr_kw(file))
+    }, **_spec_kw(file))
     r = maaplan.run_core(spec, tid=tid,
                          timeout=params.get('timeout') or 3 * 60 * 60)
     done = r.get('trained') or {}
@@ -1660,7 +1787,7 @@ _SWEEP_TIER_CN = {'base': '普通关', 'ex': 'EX 关', 's': 'S 关',
                   'mo': 'MO 关', 'f': 'F 关'}
 
 
-def _sweep_segments(keyword, log, tiers=None, raid='both'):
+def _sweep_segments(keyword, log, tiers=None, raid='both', s_raid=False):
     """活动 → 分段计划：普通关 / EX 普通 / EX 突袭 / S 关 …
 
     为什么要分段（用户 2026-11-19 需求 4：「挂完普通导航到突袭，再挂突袭的
@@ -1668,6 +1795,10 @@ def _sweep_segments(keyword, log, tiers=None, raid='both'):
     MAA 的 Copilot 只认**当前分区**上的关卡名，中间不重新导航就会「找不到
     关卡」（见 ``_run_fight_batch`` 的注释）。同一段内换难度（普通 ↔ 突袭）
     不用重导航——MaaCore 拿到 ``is_raid=true`` 自己点「切换突袭难度」。
+
+    ``s_raid`` 默认关：**S 关突袭没有奖励**（用户 2026-11-23：「太变态了，
+    刷那个没有奖励」），以前 raid='raid' 会把 S 段一起排成突袭，等于白烧
+    理智。要 S 突袭必须显式传 s_raid=True。
     """
     from . import resources
     res = resources.resolve(keyword)
@@ -1692,8 +1823,9 @@ def _sweep_segments(keyword, log, tiers=None, raid='both'):
             out.append({'name': label + '·突袭', 'codes': codes,
                         'nav': codes[0], 'variant': 'raid'})
         else:
-            # 险地（15+ 章 #s）在 MaaCore 里就是 is_raid=true
-            variant = 'raid' if (k == 's' and raid == 'raid') else 'normal'
+            # 险地（15+ 章 #s）在 MaaCore 里就是 is_raid=true；活动 S 关的突袭
+            # 没奖励，只有显式 s_raid=True 才排
+            variant = 'raid' if (k == 's' and s_raid) else 'normal'
             out.append({'name': label, 'codes': codes, 'nav': codes[0],
                         'variant': variant})
     return out, (res.get('title') or keyword)
@@ -1713,6 +1845,7 @@ def skill_sweep(params, log, tid=None):
 
     段落可以用 ``tiers`` 挑（base / ex / s / mo / f），``raid`` 控制 EX 段：
     ``both``（默认，普通 + 突袭）/ ``raid``（只突袭）/ ``normal``（只普通）。
+    **S 段永远是普通**——活动 S 突袭没有奖励，要排得显式传 ``sRaid=true``。
     """
     raw = (params.get('stage') or params.get('keyword') or '').strip()
     if not raw:
@@ -1724,7 +1857,8 @@ def skill_sweep(params, log, tid=None):
         tiers = [x.strip() for x in tiers.replace('，', ',').split(',')
                  if x.strip()]
     segs, title = _sweep_segments(raw, log, tiers=tiers,
-                                  raid=str(params.get('raid') or 'both'))
+                                  raid=str(params.get('raid') or 'both'),
+                                  s_raid=bool(params.get('sRaid')))
     if not segs:
         raise ValueError('「%s」里没有可挂的关卡' % title)
     log('扫图计划（%s）：%d 段' % (title, len(segs)))
@@ -1766,12 +1900,12 @@ def skill_sweep(params, log, tid=None):
                 'noNav': True,          # 导航已经由上面做过
                 'maaDir': d,
                 'accountName': tail,
-                'clientType': _client_of(file),
                 'copilot': {'formation': params.get('formation', True),
                             'support': True, 'sanityPotion': True},
                 'retry': {'pool': pool, 'maxRounds': 3}}
-        spec.update(_profile_kw(file))
-        spec.update(_addr_kw(file))
+        # 渠道 / 档案 / 模拟器 / accountFile 一次带全（clientType 由
+        # _profile_kw 映射成 Bilibili 这种 MaaCore 认的写法）
+        spec.update(_spec_kw(file))
         # 每段分一份时间预算（段数不定，均分最稳；单段至少 10 分钟）
         share = max(600, int(total / max(1, len(segs))))
         try:
@@ -1872,10 +2006,13 @@ def skill_tool(params, log, tid=None):
     if ent.get('tutorial'):
         log('提醒：%s' % ent['tutorial'])
 
-    spec = {'maaDir': d, 'title': ent.get('name'),
-            'task': task, 'tutorial': ent.get('tutorial') or '',
-            # 连接参数按这个账号绑的档案走（多开时每份档案连各自的模拟器）
-            'profile': params.get('profile') or acctbind.profile_of(file)}
+    spec = dict({'maaDir': d, 'title': ent.get('name'),
+                 'task': task, 'tutorial': ent.get('tutorial') or '',
+                 # 连接参数按这个账号绑的档案走（多开时每份档案连各自的模拟器）
+                 'profile': params.get('profile') or acctbind.profile_of(file)},
+                **_spec_kw(file))
+    if params.get('profile'):
+        spec['profile'] = params['profile']      # 显式点名的档案优先
     r = maaplan.run_custom(spec, tid=tid, timeout=int(ent.get('timeout') or 1800))
 
     out = {'ok': bool(r.get('ok')),
@@ -2004,7 +2141,8 @@ def _emulator_key(file, address=''):
     """
     d = _maa_dir_of(file)
     conn = _conn_of(file, d)
-    addr = str(address or conn.get('address') or '')
+    # 「这台号用哪台」的优先级：批量点名 > 账号绑定 > 档案
+    addr = str(address or _addr_of(file) or conn.get('address') or '')
     key = (os.path.normcase(os.path.abspath(d or '.')), addr)
     return key, d, dict(conn, address=addr)
 
@@ -2076,11 +2214,23 @@ def _run_group(g, step_list, names, log, results, lock, tid=None):
                 ('切号 ' + tail) if tail else '不切号'))
         if any(n in _NEEDS_GAME for n, _ in step_list):
             # 按这个号自己的档案判断模拟器开没开（多开时每份档案
-            # 连的是不同的模拟器，不能一律看全局那份）
+            # 连的是不同的模拟器，不能一律看全局那份）。
+            # 地址先按「绑定 > 点名 > 档案」定下来：钉死的地址不在线直接
+            # 判这个号失败，**不许**换成在线的那台（否则会串到隔壁那台）。
+            addr, _src, bad = device_of(f, g['dir'], g.get('profile') or None)
+            if bad:
+                with lock:
+                    results[f] = {'ok': False, 'name': nm,
+                                  'error': '模拟器不对：%s' % bad}
+                plog('跳过这个号：%s' % bad)
+                continue
+            _set_addr(f, addr)
+            if addr:
+                plog('模拟器 %s' % addr)
             ok, why = envcheck.ensure(
                 plog, maa_dir=g['dir'],
                 profile=g.get('profile') or None,
-                address=(g['address'] or None) if g.get('override') else None)
+                address=addr or None)
             if not ok:
                 with lock:
                     results[f] = {'ok': False, 'name': nm,
@@ -2111,7 +2261,7 @@ def _run_group(g, step_list, names, log, results, lock, tid=None):
 
 def _run_group_proc(tid, idx, g, step_list, names, results, lock, log):
     """把一组账号丢进**独立进程**跑（同进程两个 MaaCore 会抢命名管道）"""
-    got, _rep = multiproc.run_group(
+    got, _rep, stopped = multiproc.run_group(
         'skill', tid, idx,
         {'group': {'dir': g.get('dir') or '',
                    'profile': g.get('profile') or '',
@@ -2124,6 +2274,13 @@ def _run_group_proc(tid, idx, g, step_list, names, results, lock, log):
     with lock:
         for f, v in (got or {}).items():
             results[f] = v
+    if stopped:
+        # 用户点名停了这一组：不是失败，别在汇总里记成「子进程异常」
+        with lock:
+            for f in g.get('files') or []:
+                results.setdefault(f, {'ok': False, 'name': f, 'stopped': True,
+                                       'error': '你手动停止了这一组'})
+        return
     if not got:
         with lock:
             for f in g.get('files') or []:
@@ -2182,11 +2339,13 @@ def run_batch(accounts_list, steps, names=None, emulators=None):
             prof = ''
         g = groups.setdefault(key, {'dir': d, 'conn': conn, 'profile': prof,
                                     'address': conn.get('address') or '',
-                                    'override': bool(emus.get(f)),
+                                    # 「钉死的地址」= 批量点名或账号里绑定过；
+                                    # 这两种都不许 adb 自检自己换一台
+                                    'override': bool(emus.get(f) or _addr_of(f)),
                                     'files': []})
         g['files'].append(f)
-        if emus.get(f):
-            g['address'] = emus[f]
+        if emus.get(f) or _addr_of(f):
+            g['address'] = emus.get(f) or _addr_of(f)
 
     plan = ', '.join('%s（%s 个号）' % (g['address'] or '默认',
                                         len(g['files'])) for g in groups.values())
@@ -2207,8 +2366,22 @@ def run_batch(accounts_list, steps, names=None, emulators=None):
             g = next(iter(groups.values()))
             log('只有一组（%s）：%d 个号排队切号'
                 % (g.get('address') or '默认模拟器', len(g['files'])))
+            need_game = any(n in _NEEDS_GAME for n, _ in step_list)
+            # 单组默认在本进程跑（省一个进程的启动开销）。但**本进程已经有
+            # 另一路在跑 MaaCore 时必须换独立进程**：同进程第二个实例会把
+            # 前一个正在跑的任务链无声打断（2026-11-23 用户报「多开另一个号，
+            # 他把我前面的停了」）。
+            inproc = (not need_game) or maacore.claim_inproc()
             try:
-                _run_group(g, step_list, names, log, results, lock, tid=tid2)
+                if inproc:
+                    if need_game:
+                        log('本进程开跑（这一步只用本进程这一个 MaaCore）')
+                    _run_group(g, step_list, names, log, results, lock, tid=tid2)
+                else:
+                    log('本机已经有一路在跑模拟器，这一组改用独立进程'
+                        '（同一进程里两个 MaaCore 会互相把任务打断）')
+                    _run_group_proc(tid2, 1, g, step_list, names, results,
+                                    lock, log)
             except Exception as e:                  # noqa: BLE001
                 log('[%s] 这一组出错，后面的号没跑：%s: %s'
                     % (g.get('address') or '默认模拟器', type(e).__name__, e))
@@ -2216,6 +2389,9 @@ def run_batch(accounts_list, steps, names=None, emulators=None):
                     results.setdefault(f, {'ok': False, 'name': f,
                                            'error': '%s: %s'
                                            % (type(e).__name__, e)})
+            finally:
+                if inproc and need_game:
+                    maacore.release_inproc()
         else:
             # 多开：每组一个**独立进程**。同进程里两个 MaaCore 会抢命名管道
             # （asst.log: CreateOverlappablePipe failed, err 231），第二台
@@ -2295,6 +2471,67 @@ def _call_skill(name, params, log, tid=None):
     return fn(params or {}, log, tid=tid)
 
 
+def _skill_body(name, params, log, tid):
+    """真正跑一个 skill：过环境闸 → 交给 skill 函数
+
+    单独抽出来是因为它有两个执行位置：本进程（抢到跑机名额时）和独立子进程
+    （本进程已经有一路在跑时，见 :func:`_skill_in_proc`）。父亲/子进程必须
+    共用同一份实现，否则「单开能跑、多开跑不同步」永远查不完。
+    """
+    if name in _NEEDS_GAME:
+        # 多开：模拟器按**这个账号**绑的 MAA 配置来判断，别拿全局默认那份
+        d = prof = None
+        f = ''
+        try:
+            from . import acctbind
+            f = _account_file((params or {}).get('account') or '')
+            d = acctbind.dir_of(f) or None
+            prof = acctbind.profile_of(f) or None
+        except Exception:
+            pass
+        # 先定「这台号连哪台」：钉死的地址不在线就停下，**绝不**自己换
+        # 一台在线的顶上——那正是「指定 5554 却动了 5556」的来源
+        addr, src, bad = device_of(f, d, prof)
+        if bad:
+            raise RuntimeError('模拟器不对：%s' % bad)
+        _set_addr(f, addr)
+        if addr:
+            log('模拟器 %s（%s）' % (addr, src or '档案'))
+        ok, why = envcheck.ensure(log, maa_dir=d, profile=prof,
+                                  address=addr or None)
+        if not ok:
+            raise RuntimeError('环境没准备好：%s' % why)
+    return _call_skill(name, params, log, tid)
+
+
+def _skill_in_proc(name, params, log, tid):
+    """本进程已经有一路在跑 MaaCore：这一路换成独立进程跑
+
+    不是性能优化，是**正确性**：同一个进程里开第二个 MaaCore 实例，它的
+    ``AsstLoadResource`` 动的是进程级全局资源，第一个实例正在跑的任务链会被
+    直接打断（只发 TaskChainStopped，看上去像「自己停了」），接着两边一起
+    报登录失败。2026-11-23 用户报的就是这个。
+    """
+    owner = ''
+    try:
+        owner = _account_file((params or {}).get('account') or '')
+    except Exception:
+        owner = ''
+    log('本机已经有一路在跑模拟器，这一路改用独立进程'
+        '（同一进程里两个 MaaCore 会互相把任务打断）')
+    got, _rep, stopped = multiproc.run_group(
+        'one', tid, 0,
+        {'group': {'files': [owner] if owner else []},
+         'skill': name, 'params': params or {}},
+        log, who='独立进程')
+    if stopped:
+        return {'ok': False, 'stopped': True, 'why': '你手动停止了这一路'}
+    if not got:
+        return {'ok': False, 'why': '独立进程没交回结果（见上面日志）'}
+    one = got.get(owner) or next(iter(got.values()), {})
+    return one if isinstance(one, dict) else {'ok': True}
+
+
 def run_skill(name, params=None):
     """把一个 skill 跑成后台任务，返回 taskId（前端 / 助手轮询 /api/task）
 
@@ -2318,22 +2555,18 @@ def run_skill(name, params=None):
         tid = threading.current_thread().name.replace('task-', '', 1)
         log = tasks.log_factory(tid)
         log('[%s] %s' % (name, desc))
-        if name in _NEEDS_GAME:
-            # 多开：模拟器按**这个账号**绑的 MAA 配置来判断，别拿全局默认那份
-            d = prof = None
-            f = ''
-            try:
-                from . import acctbind
-                f = _account_file((params or {}).get('account') or '')
-                d = acctbind.dir_of(f) or None
-                prof = acctbind.profile_of(f) or None
-            except Exception:
-                pass
-            ok, why = envcheck.ensure(log, maa_dir=d, profile=prof,
-                                      address=_addr_of(f) or None)
-            if not ok:
-                raise RuntimeError('环境没准备好：%s' % why)
-        return _call_skill(name, params, log, tid)
+        if name not in _NEEDS_GAME:
+            return _skill_body(name, params, log, tid)
+        # 要开游戏就得占「本进程跑机名额」。抢不到说明**另一路已经在跑
+        # MaaCore**：再在这个进程里开一个实例，会把正在跑的那一路无声打断
+        # （MaaCore 的 LoadResource 是进程级全局资源），2026-11-23 用户报的
+        #「多开另一个号，他把我前面的停了」就是这个。换独立进程才是正解。
+        if not maacore.claim_inproc():
+            return _skill_in_proc(name, params, log, tid)
+        try:
+            return _skill_body(name, params, log, tid)
+        finally:
+            maacore.release_inproc()
 
     # 日志按账号分栏：任务要记住自己属于哪个号。没指定账号时按「左侧当前
     # 那个号」算（_account_file('') 就是干这个的），算不出来就当全局任务。
@@ -2344,3 +2577,63 @@ def run_skill(name, params=None):
     tid = tasks.create('skill:' + name, job,
                        owners=[owner] if owner else None)
     return tid
+
+
+# ---------------------------------------------------------------- 停止（按账号）
+
+def match_accounts(text):
+    """「文件名 / 昵称 / 别名」→ 账号文件名列表（停止这种破坏性动作用）
+
+    和 :func:`_account_file` 的区别：这边**允许多个命中**，而且子串命中不唯一
+    时直接报错。用户说「停灰」这种半个名字，把那三个灰开头的号全停掉是灾难，
+    宁可回一句「你说的是哪个」。
+    """
+    want = str(text or '').strip()
+    if not want:
+        return []
+    rows = accounts.list_accounts()
+    for r in rows:                                  # 1) 文件名完全相等
+        if r['file'] == want:
+            return [r['file']]
+    stem = want[:-5] if want.lower().endswith('.json') else want
+    low = stem.lower()
+    hit = [r for r in rows                       # 2) 昵称/别名完全相等
+           if (r.get('nickName') or '').lower() == low
+           or (r.get('alias') or '').lower() == low]
+    if len(hit) == 1:
+        return [hit[0]['file']]
+    if not hit:                                  # 3) 子串命中
+        hit = [r for r in rows
+               if low and (low in (r.get('nickName') or '').lower()
+                           or low in r['file'].lower())]
+    if len(hit) == 1:
+        return [hit[0]['file']]
+    if not hit:
+        raise ValueError('没有叫「%s」的账号（左边那列里的名字都行）' % want)
+    raise ValueError('「%s」对上了 %d 个账号（%s），说清楚停哪个'
+                     % (want, len(hit),
+                        '、'.join(str(r.get('nickName') or r['file'])
+                                 for r in hit)))
+
+
+def stop_accounts(files=None):
+    """停掉指定账号正在跑的活（``files`` 空 = 全停）
+
+    三处都要停，少一处就等于没停：
+      1. 本进程里的 MaaCore 实例（单账号 / 直连跑）→ ``maacore.stop_live``
+      2. 多开时每一组那个**独立子进程**（同进程两个 MaaCore 会抢命名管道，
+         所以多开一定是子进程）→ ``multiproc.stop_groups``
+      3. 用户没点名时，顺带把 MAA 本体关掉（``maa.close``）——那是旧的
+         「跑 MAA 自己的任务队列」模式，关进程就是停
+
+    用户 2026-11-23 的原话：「停止的话不能指定停止，会一起停其他任务」。
+    这条函数就是给他一个「只停这一路」的入口，agent 的 ``stop_run`` 和
+    界面上的「停止」按钮都走它。
+    """
+    wants = [str(x) for x in (files or []) if str(x).strip()]
+    from . import maacore, multiproc
+    engines = maacore.stop_live(wants or None)
+    procs = multiproc.stop_groups(wants or None)
+    out = {'accounts': wants, 'engines': engines, 'processes': procs,
+           'stopped': engines + procs}
+    return out

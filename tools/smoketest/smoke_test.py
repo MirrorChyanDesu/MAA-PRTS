@@ -1881,16 +1881,16 @@ def check_multiacct(tmp):
                       ('１２３＊５５０５', '123****5505'),
                       ('181****  5505', '181****5505')):
         assert M.norm_account_name(raw) == want, (raw, M.norm_account_name(raw))
-    assert M.norm_account_name('小卡拉帕鲁灰') == '小卡拉帕鲁灰'
-    assert M.norm_account_name('灰bao#0384') == '灰bao#0384', 'B 服用户名带 # 别被吃掉'
+    assert M.norm_account_name('示例昵称') == '示例昵称'
+    assert M.norm_account_name('abc示例#0384') == 'abc示例#0384', 'B 服用户名带 # 别被吃掉'
     assert M.norm_account_name('') == ''
     # 校验：官服只拦昵称，格式问题不归用户
     assert acctname.check('5505', '官服') == ('5505', '')
     assert acctname.check('136', '官服') == ('136', ''), '本机档案里就有 3 位片段'
     assert acctname.check('23****45', '官服')[0] == '23****45'
-    nm, why = acctname.check('小卡拉帕鲁灰', '官服')
+    nm, why = acctname.check('示例昵称', '官服')
     assert nm is None and '后 4 位' in why, (nm, why)
-    assert acctname.check('小卡拉帕鲁灰', 'bilibili服')[0] == '小卡拉帕鲁灰'
+    assert acctname.check('示例昵称', 'bilibili服')[0] == '示例昵称'
     assert acctname.is_official_channel('') is True, '渠道缺失按官服算'
     assert acctname.is_official_channel('B服') is False
     # 档案名撞了就加序号，不覆盖用户原来的档案
@@ -3509,8 +3509,8 @@ def check_settings_panel(tmp):
     snap['account']['channelName'] = 'B服'
     accounts.save_account('smoke-acc.json', snap)
     m = api.api_account_maa({}, {'file': 'smoke-acc.json',
-                                 'patch': {'accountName': '灰bao#7986'}})['maa']
-    assert m['accountName'] == '灰bao#7986', m
+                                 'patch': {'accountName': 'abc示例#7986'}})['maa']
+    assert m['accountName'] == 'abc示例#7986', m
 
     # 5) bootstrap 要把日志目录一起给界面（「数据与日志」页要用）
     boot = api.bootstrap({}, {})
@@ -3976,31 +3976,35 @@ def check_raid_order(tmp):
     skills._default_maa_dir = lambda: tmp
     try:
         logs = []
-        rows, _retry = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '',
-                                          logs.append)
+        rows, _retry, _miss = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '',
+                                                  logs.append)
         seq = [(r['stage_name'], r['is_raid']) for r in rows]
         # ① 默认只打普通：没明说难度就不许替用户升级到突袭
         assert seq == [('SV-EX-1', False), ('SV-EX-2', False)], seq
 
         # ①b 显式 raid='raid' 才只排突袭
-        rows_r, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='raid')
+        rows_r, _, _m = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                            raid='raid')
         assert [(r['stage_name'], r['is_raid']) for r in rows_r] == [('SV-EX-1', True)]
 
         # ② both：普通 → 突袭两条，顺序不能反
-        rows_b, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='both')
+        rows_b, _, _mb = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                             raid='both')
         seq_b = [(r['stage_name'], r['is_raid']) for r in rows_b]
         assert seq_b == [('SV-EX-1', False), ('SV-EX-1', True)], seq_b
 
         # ③ raid=False / 'normal'：只排普通
-        rows2, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid=False)
+        rows2, _, _m2 = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                            raid=False)
         assert [(r['stage_name'], r['is_raid']) for r in rows2] == [('SV-EX-1', False)]
-        rows2b, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append, raid='normal')
+        rows2b, _, _m2b = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                              raid='normal')
         assert [(r['stage_name'], r['is_raid']) for r in rows2b] == [('SV-EX-1', False)]
 
         # ④ 逐关覆盖：EX-1 只突袭、EX-2 普通+突袭（agent 承诺的混合计划）
         want = {'SV-EX-1': 'raid', 'SV-EX-2': 'both'}
-        rows_w, _ = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '', logs.append,
-                                       raid='auto', wants=want)
+        rows_w, _, _mw = skills._prepare_ops(['SV-EX-1', 'SV-EX-2'], '',
+                                            logs.append, raid='auto', wants=want)
         seq_w = [(r['stage_name'], r['is_raid']) for r in rows_w]
         assert seq_w == [('SV-EX-1', True), ('SV-EX-2', False),
                          ('SV-EX-2', True)], seq_w
@@ -4023,8 +4027,8 @@ def check_raid_order(tmp):
             return fake_search(st, snap, pages=pages, limit=limit)
 
         copilot.search = fake_search_mixed
-        rows_skip, _ = skills._prepare_ops(['SV-EX-1', 'XX-1'], '',
-                                           logs_skip.append)
+        rows_skip, _, _ms = skills._prepare_ops(['SV-EX-1', 'XX-1'], '',
+                                                logs_skip.append)
         assert [r['stage_name'] for r in rows_skip] == ['SV-EX-1'], rows_skip
         assert any('跳过 XX-1' in x for x in logs_skip), logs_skip
         copilot.search = fake_search
@@ -4129,8 +4133,8 @@ def check_agent_tool_chain(tmp):
     skills._default_maa_dir = lambda: tmp
     try:
         logs = []
-        rows, _ = skills._prepare_ops(['SV-EX-1'], '', logs.append,
-                                      fixed={'SV-EX-1': 98765}, raid='raid')
+        rows, _, _m = skills._prepare_ops(['SV-EX-1'], '', logs.append,
+                                          fixed={'SV-EX-1': 98765}, raid='raid')
         assert hits['search'] == 0, '指名作业后不许再搜作业站'
         assert rows[0]['filename'].endswith('98765.json'), rows
         assert rows[0]['is_raid'] is True, rows
@@ -4147,6 +4151,7 @@ def check_battle_retry(tmp):
     ② 作业翻车时日志明确「✘ X 翻车：原因」，能看出是哪一关
     ③ 失败后换下一份作业，**从卡住的那关往后重挂**（前面的关不重打）
     ④ skill_sweep 的分段顺序：普通关 → EX 普通 → EX 突袭 → S 关
+    ⑤ S 段只打普通（突袭没奖励），要突袭得显式 s_raid=True
     """
     _reset_config(tmp)
     from core import copilot, maaplan, resources, skills
@@ -4291,6 +4296,16 @@ def check_battle_retry(tmp):
         assert [s['name'] for s in segs2] == ['普通关', 'EX 关', 'S 关'], segs2
         segs3, _ = skills._sweep_segments('SV', lambda *_: None, tiers=['ex'])
         assert [s['name'] for s in segs3] == ['EX 关·普通', 'EX 关·突袭'], segs3
+        # ⑤ S 关突袭没奖励（用户 2026-11-23「太变态了，刷那个没有奖励」）：
+        #    raid='raid' 只把 EX 排成突袭，S 段仍得是普通；要 S 突袭必须
+        #    显式 s_raid=True
+        segs4, _ = skills._sweep_segments('SV', lambda *_: None, raid='raid')
+        assert [(s['name'], s['variant']) for s in segs4] == [
+            ('普通关', 'normal'), ('EX 关·突袭', 'raid'),
+            ('S 关', 'normal')], segs4
+        segs5, _ = skills._sweep_segments('SV', lambda *_: None, raid='raid',
+                                          s_raid=True)
+        assert [s['variant'] for s in segs5] == ['normal', 'raid', 'raid'], segs5
     finally:
         resources.resolve = old_res
 
@@ -4535,7 +4550,7 @@ def check_stage_infer(tmp):
     try:
         skills._account_file = lambda n: 'x.json'
         skills._default_maa_dir = lambda: 'MAA'
-        skills._prepare_ops = lambda *a, **k: ([], {})
+        skills._prepare_ops = lambda *a, **k: ([], {}, [])
         skills.maaplan.run_core = lambda *a, **k: {
             'ok': True, 'stages_ok': [], 'stages_failed': [], 'swaps': []}
 
@@ -5143,7 +5158,828 @@ def check_scheduler(tmp):
     assert isinstance(st['log'], list) and isinstance(st['seq'], int)
 
 
+def check_schedule_presets(tmp):
+    """B59 定时任务预设：预设表 / 找程序 / 缺路径按预设兜底 / 脱敏守卫
+
+    定时任务只干「到点启动一个程序」，程序从预设里挑：本程序自己、MAA 官方
+    客户端，以及常见其它游戏的自动化工具。预设只说「先试哪几个 exe 名」和
+    默认参数，路径一律现场探测 + 允许手改——所以这里钉四件事：
+
+    ① 探测优先看设置里的 MAA 目录，不靠扫盘运气；
+    ② 任务没填 program 时，运行时按预设再找一次（换机器/挪目录不用改任务）；
+    ③ 用户手填的值绝不被预设覆盖；
+    ④ 代码 / 文档 / 用例里不留三方项目名、真实昵称、本人机器路径。
+    """
+    sys.path.insert(0, os.path.join(REPO, 'backend'))
+    from core import scheduler, settings
+
+    _reset_config(tmp)
+    scheduler._cache = None
+    scheduler._preset_cache[:] = [None, None]
+    scheduler._scan_cache.clear()
+
+    # 1) 预设表：自定义打头，本体 / MAA / 其它游戏都在
+    ids = [p['id'] for p in scheduler.presets()]
+    assert ids[0] == 'custom' and ids[1] == 'self', ids
+    for want in ('maa', 'bettergi', 'onedragon', 'okww', 'maaend', 'm9a', 'mfaa'):
+        assert want in ids, ids
+    assert all(p['name'] for p in scheduler.presets())
+    assert scheduler.preset_id('MAA') == 'maa', '预设 id 大小写不敏感'
+    assert scheduler.preset_id('不存在') == 'custom', '乱填的预设回落自定义'
+
+    # 2) 自定义预设不许「猜」：没填程序就是要报错
+    try:
+        scheduler._argv({'program': '', 'args': '', 'preset': 'custom'})
+        assert False, '自定义预设没填程序不该通过'
+    except ValueError:
+        pass
+
+    # 3) MAA 预设按设置里的 MAA 目录找
+    maa_dir = os.path.join(tmp, 'MAA-test')
+    os.makedirs(maa_dir)
+    open(os.path.join(maa_dir, 'MAA.exe'), 'w').close()
+    settings.save({'maaDir': maa_dir, 'maaDirs': [maa_dir]})
+    scheduler._scan_cache.clear()
+    hit = scheduler.detect('maa')
+    want = os.path.normcase(os.path.join(maa_dir, 'MAA.exe'))
+    assert os.path.normcase(hit) == want, hit
+    # 任务里没填 program：运行时按预设再找一次
+    argv = scheduler._argv({'program': '', 'args': '', 'preset': 'maa'})
+    assert os.path.normcase(argv[0]) == want, argv
+
+    # 4) 其它游戏按 exe 名找：只扫给定目录（不真的扫全盘）
+    games = os.path.join(tmp, 'games')
+    os.makedirs(os.path.join(games, 'BetterGI', 'bin'))
+    exe = os.path.join(games, 'BetterGI', 'bin', 'BetterGI.exe')
+    open(exe, 'w').close()
+    assert os.path.normcase(scheduler._scan_exe(('BetterGI.exe',), roots=[games])) == \
+        os.path.normcase(exe)
+    assert scheduler._scan_exe(('Nope.exe',), roots=[games]) == ''
+    assert scheduler._scan_exe((), roots=[games]) == '', '没有 exe 名就什么都别扫'
+
+    # 5) 本体：本进程的 python（源码）或 exe（打包）
+    d = scheduler.fill('self')
+    assert d['id'] == 'self' and d['program'] == sys.executable, d
+    if not settings.FROZEN:
+        assert 'main.py' in d['args'], d
+    keep = scheduler.resolve({'preset': 'self', 'program': 'C:/mine/x.exe', 'args': '--a'})
+    assert keep['program'] == 'C:/mine/x.exe' and keep['args'] == '--a', keep
+
+    # 6) 自己的预设：config/schedule-presets.json，同 id 覆盖内置那条
+    with open(os.path.join(tmp, 'config', 'schedule-presets.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump([{'id': 'mygame', 'name': '我的游戏', 'exes': ['my.exe'], 'args': '--x'},
+                   {'id': 'maa', 'name': 'MAA（我改的）'}], f, ensure_ascii=False)
+    scheduler._preset_cache[:] = [None, None]
+    ps = {p['id']: p for p in scheduler.presets()}
+    assert ps['mygame']['name'] == '我的游戏' and ps['mygame']['builtin'] is False, ps.keys()
+    assert ps['maa']['name'] == 'MAA（我改的）', ps['maa']
+    assert ps['maa']['exes'] == (), '覆盖时不写 exes 就别把内置的 exe 名带回来'
+
+    # 7) 保存清洗：认识的预设留着，乱填的回落自定义，老配置没这字段也不报错
+    cfg = scheduler.save({'tasks': [
+        {'name': 'A', 'program': 'a.exe', 'preset': 'maa'},
+        {'name': 'B', 'program': 'b.exe', 'preset': '乱写'},
+        {'name': 'C', 'program': 'c.exe'},
+    ]})
+    assert [t['preset'] for t in cfg['tasks']] == ['maa', 'custom', 'custom']
+
+    # 8) 脱敏守卫：三方项目名 / 真实昵称 / 本人机器路径都不许往回长
+    #    关键词拆开写——本文件也在扫描范围里，整词写进来就成了「自己漏自己」
+    bad = ('三月' + '七', '小卡拉' + '帕鲁灰', '灰' + 'bao', '2.' + 'game',
+           '小卡' + '.json')
+    leaks = []
+    for part in ('backend', 'frontend', 'docs', 'tools'):
+        for dirpath, dirs, files in os.walk(os.path.join(REPO, part)):
+            dirs[:] = [x for x in dirs if x != '__pycache__']
+            for fn in files:
+                if not fn.lower().endswith(('.py', '.js', '.md', '.css', '.html', '.json')):
+                    continue
+                path = os.path.join(dirpath, fn)
+                try:
+                    txt = open(path, encoding='utf-8').read()
+                except Exception:
+                    continue
+                for word in bad:
+                    if word in txt:
+                        leaks.append('%s: %s' % (os.path.relpath(path, REPO), word))
+    assert not leaks, leaks
+
+
 # ---------------------------------------------------------------- 入口
+
+
+def check_emu_binding(tmp):
+    """B60 实例绑定与渠道：地址钉在账号上 / 钉死的不许换台 / b 服按 Bilibili 连
+
+    2026-11-23 用户报两件事：①「明明指定 5554 挂活动，却会影响 5556 那台」；
+    ②「启动账号不看 b 服还是官服」。根因各一个：
+
+    - 「地址对不上就挑一台在线的顶上」——档案里写着过期的 5554、实际开着
+      5556 时，程序悄悄改连 5556。现在钉死的地址不在线就停手。
+    - ``ConnectSettings.Config`` 是**模拟器类型**（LDPlayer），被当成
+      ``AsstConnect`` 的客户端类型传下去，MaaCore 按官服兜底，b 服账号就按
+      官服包启动。现在客户端类型只认账号渠道。
+    """
+    _reset_config(tmp)
+    import json
+    from core import acctbind, api, envcheck, maaplan, settings, skills
+
+    # ---- ① 客户端类型：档案里的 Config(LDPlayer) 只当**连接配置名** ----
+    # 2026-11-23 修：AsstConnect 第 4 个参数是连接配置名（General/LDPlayer…），
+    # 客户端类型只能进任务参数（StartUp.client_type）。以前把客户端类型塞进
+    # AsstConnect，asst.log 每次都留一行 `config Official not found`。
+    old_conn = maaplan._connection
+    maaplan._connection = lambda d, p=None: {
+        'adb_path': 'adb', 'address': 'emulator-5554', 'emu_kind': 'LDPlayer',
+        'config': 'LDPlayer', 'touch': 'MiniTouch', 'maa_dir': d}
+    try:
+        c = maaplan._conn_for({'maaDir': r'D://M', 'profile': 'moren',
+                               'clientType': 'Bilibili'})
+        assert c['config'] == 'LDPlayer', c
+        assert c['client'] == 'Bilibili' and c['emu_kind'] == 'LDPlayer', c
+        c2 = maaplan._conn_for({'maaDir': r'D://M', 'clientType': 'Official',
+                                'adbAddress': 'emulator-5556'})
+        assert c2['address'] == 'emulator-5556' and c2['config'] == 'LDPlayer', c2
+        c3 = maaplan._conn_for({'maaDir': r'D://M'})   # 档案没写连接配置 → General
+        assert c3['config'] == 'LDPlayer' and c3['client'] == 'Official', c3
+        assert maaplan._client_cn(c) == 'b服', maaplan._client_cn(c)
+    finally:
+        maaplan._connection = old_conn
+
+    # ---- ② 地址格式：写歪了当场拦，别等到连不上 ----
+    assert acctbind.check_addr('emulator-5556') == ('emulator-5556', '')
+    assert acctbind.check_addr('127.0.0.1:16384')[0] == '127.0.0.1:16384'
+    assert acctbind.check_addr('')[0] == ''
+    bad_addr = acctbind.check_addr('5556')
+    assert bad_addr[0] == '' and 'emulator-5554' in bad_addr[1], bad_addr
+
+    # ---- ③ 绑定落盘 → 所有入口都读同一份 ----
+    file = '测试号 bilibili服.json'
+    with io.open(os.path.join(settings.CONFIG_DIR, file), 'w',
+                 encoding='utf-8', newline='') as f:
+        json.dump({'account': {'uid': '1', 'nickName': '测试号',
+                               'channelName': 'bilibili服'}, 'maa': {}},
+                  f, ensure_ascii=False)
+    r = api.api_account_maa({}, {'file': file,
+                                 'patch': {'adbAddress': 'emulator-5556'}})
+    assert r['maa']['adbAddress'] == 'emulator-5556', r
+    assert acctbind.addr_of(file) == 'emulator-5556'
+    skills._ADDR.map = {}
+    try:
+        assert skills._addr_of(file) == 'emulator-5556'
+        # 本次点名优先于绑定（临时换一次不用改设置）
+        skills._ADDR.map = {file: 'emulator-5554'}
+        assert skills._addr_of(file) == 'emulator-5554'
+        assert skills._strict_addr(file) is True
+    finally:
+        skills._ADDR.map = {}
+    try:
+        api.api_account_maa({}, {'file': file, 'patch': {'adbAddress': '5556'}})
+    except ValueError as e:
+        assert '模拟器地址' in str(e), e
+    else:
+        raise AssertionError('写歪的地址应该被拦下')
+    row = next((x for x in api.api_accounts({}, {})['accounts']
+                if x['file'] == file), {})
+    assert row.get('maaAdbAddress') == 'emulator-5556', row
+
+    # ---- ④ device_of：钉死的不换台；档案过期只在单台在线时顶上 ----
+    old_rc, old_dev = envcheck.read_config, envcheck._devices
+    envcheck.read_config = lambda d=None, p=None: {'adb': 'adb',
+                                                   'address': 'emulator-5554'}
+    envcheck._devices = lambda adb: {'emulator-5554': 'device',
+                                     'emulator-5556': 'device'}
+    try:
+        skills._ADDR.map = {}
+        assert skills.device_of(file)[:2] == ('emulator-5556', '指定')
+        # 钉的那台没在线 → **不换台**，原样交出去（由 envcheck 按实例号去启动；
+        # 见 B62。「第二个实例没开」和「地址写错」长得一样，前者该自动开）
+        api.api_account_maa({}, {'file': file,
+                                 'patch': {'adbAddress': 'emulator-9999'}})
+        addr, src, why = skills.device_of(file)
+        assert addr == 'emulator-9999' and not why and src == '指定', (addr, src, why)
+        # 解绑 → 按档案；档案那台在线就用它
+        api.api_account_maa({}, {'file': file, 'patch': {'adbAddress': ''}})
+        assert skills.device_of(file)[:2] == ('emulator-5554', '档案')
+        # 档案地址不在线 + 两台在线 → 分不清，拦下要用户指定
+        envcheck.read_config = lambda d=None, p=None: {'adb': 'adb',
+                                                       'address': 'emulator-9999'}
+        addr, _src, why = skills.device_of(file)
+        assert not addr and '分不清' in why and 'emulator-5556' in why, why
+        # 只剩一台在线 → 无歧义，顶上
+        envcheck._devices = lambda adb: {'emulator-5556': 'device'}
+        assert skills.device_of(file)[0] == 'emulator-5556'
+        # 一台都没开 → 返回空，交给 envcheck 按档案去启动
+        envcheck._devices = lambda adb: {}
+        assert skills.device_of(file)[0] == ''
+        # 设备下拉：在线列表 + 现在钉的那台
+        envcheck._devices = lambda adb: {'emulator-5556': 'device'}
+        dev = api.api_account_devices({'file': file}, {})
+        assert dev['devices'] == [{'address': 'emulator-5556',
+                                   'state': 'device'}], dev
+    finally:
+        envcheck.read_config, envcheck._devices = old_rc, old_dev
+        skills._ADDR.map = {}
+
+
+def check_emu_auto_start(tmp):
+    """B62 「只能启动 5554，启动不了 5556」：按地址反查实例号，启动那一台
+
+    2026-11-23 用户报：只能帮我启动 5554 adb 的模拟器，启动不了 5556 的。
+    两个洞叠在一起：
+
+    ① 启动用的实例号取自 MAA 档案的 ``InstanceIndex``——多开用户那儿八份
+       档案几乎全写 0，于是不管要哪台，``launch --index 0`` 永远拉起第一个；
+    ② ``ensure(address=...)`` 只查不启：目标不在线就回一句「先把它开起来再
+       重跑」，等于把「第二个实例没开」当成用户填错了地址。
+
+    现在用 ``ldconsole adb --index N --command get-serialno`` 把序号换成
+    序列号（实例没开时那行 ``error: device 'emulator-5558' not found`` 里
+    也写着序列号），反过来就能问出「5556 是第几个实例」；序号由调用方点名
+    的地址说了算、压过档案；目标没开就启动那一台，并且只等那台上线。
+    """
+    _reset_config(tmp)
+    from core import api, envcheck, maa
+
+    fake_dir = os.path.join(tmp, 'fakeemu')
+    if not os.path.isdir(fake_dir):
+        os.makedirs(fake_dir)
+    # ld_instances / ld_serial 只检查这个文件在不在，命令输出由 _run 兜
+    io.open(os.path.join(fake_dir, 'ldconsole.exe'), 'w',
+            encoding='utf-8', newline='').close()
+
+    def fake_run(cmd, timeout=15):
+        s = ' '.join(str(x) for x in cmd)
+        if 'list2' in s:
+            return 0, ('0,雷电模拟器,1,1,1,100,101,1920,1080,280\n'
+                       '1,雷电模拟器-1,2,2,0,0,0,1920,1080,280\n')
+        if 'get-serialno' in s:
+            i = int(cmd[cmd.index('--index') + 1])
+            return 0, 'emulator-%d' % (5554 + 2 * i)
+        if 'devices' in s:
+            return 0, 'List of devices attached\nemulator-5554\tdevice\n'
+        return -1, ''
+
+    old_run = envcheck._run
+    envcheck._run = fake_run
+    try:
+        cfg = {'kind': 'LDPlayer', 'emu_dir': fake_dir + os.sep}
+        # ---- ① 地址 → 实例序号：靠 get-serialno 反查，不按端口公式猜 ----
+        assert envcheck.ld_instances(cfg['emu_dir']) == [(0, True), (1, False)]
+        assert envcheck.ld_serial(cfg['emu_dir'], 1) == 'emulator-5556'
+        # 实例没开也能反查：错误行里带着序列号
+        assert envcheck.ld_serial(cfg['emu_dir'], 2) == 'emulator-5558'
+        assert envcheck.index_of_address(cfg, 'emulator-5556') \
+            == (1, 'emulator-5556')
+        # adb 口写法（控制台口 +1）指向同一台
+        assert envcheck.index_of_address(cfg, '127.0.0.1:5557')[0] == 1
+        # 本机没有的序号不许瞎猜，别去启动一台不存在的实例
+        assert envcheck.index_of_address(cfg, 'emulator-9999') == (None, '')
+        assert envcheck.index_of_address(
+            {'kind': 'MuMuEmulator12', 'emu_dir': fake_dir},
+            'emulator-5556') == (None, '')
+
+        # ---- ② 档案写 InstanceIndex=0，点名 5556 → 序号按地址算成 1 ----
+        old_load = maa._load_cfg
+        maa._load_cfg = lambda d=None: {
+            'Current': 'moren',
+            'Configurations': {'moren': {'Gui': {'ConnectSettings': {
+                'Config': 'LDPlayer', 'Address': 'emulator-5554',
+                'AdbPath': os.path.join(fake_dir, 'adb.exe'),
+                'Extras': {'LDPlayer': {'EmulatorPath': fake_dir,
+                                        'InstanceIndex': 0}}}}}}}
+        try:
+            c0 = envcheck.read_config('M', 'moren')
+            assert (c0['index'], c0['indexFrom']) == (0, '档案'), c0
+            c1 = envcheck.read_config('M', 'moren', address='emulator-5556')
+            assert (c1['index'], c1['indexFrom']) == (1, '地址'), c1
+            assert c1['serial'] == 'emulator-5556', c1
+
+            # 设置页的「模拟器」下拉：没开的实例也要列出来，否则用户根本
+            # 选不到第二台（只列 adb 在线设备时，5556 关着就无从绑定）
+            dev = api.api_account_devices({'file': ''}, {})
+            assert [x['address'] for x in dev['instances']] \
+                == ['emulator-5554', 'emulator-5556'], dev
+            assert dev['instances'][1]['running'] is False, dev
+
+            # ---- ③ 目标没开：启动**那一台**，且只等那台上线 ----
+            calls = {}
+            logs = []
+
+            def fake_launch(c):
+                calls['launched'] = c.get('index')
+                return True, 'ldconsole launch --index %s' % c.get('index')
+
+            def fake_wait(c, timeout=0, log=None, quiet_until=8.0, wants=None):
+                calls['wants'] = list(wants or [])
+                return True, 'emulator-5556', 'adb 正常（emulator-5556）'
+
+            old_launch, old_wait = envcheck.launch, envcheck.wait_ready
+            old_auto, old_dev = envcheck._auto_start, envcheck._devices
+            envcheck.launch, envcheck.wait_ready = fake_launch, fake_wait
+            envcheck._auto_start = lambda: True
+            envcheck._devices = lambda adb: {'emulator-5554': 'device'}
+            try:
+                ok, why = envcheck.ensure(logs.append, maa_dir='M',
+                                          profile='moren',
+                                          address='emulator-5556')
+                assert ok, why
+                assert calls['launched'] == 1, calls     # 不是档案里的 0
+                assert calls['wants'][0] == 'emulator-5556', calls
+                assert '实例 1' in ''.join(logs), logs
+
+                # 目标已经在线 → 立刻放行，不启动、一行日志都不写
+                envcheck._devices = lambda adb: {'emulator-5556': 'device'}
+                logs2 = []
+                calls.clear()
+                ok2, why2 = envcheck.ensure(logs2.append, maa_dir='M',
+                                            profile='moren',
+                                            address='emulator-5556')
+                assert ok2 and not logs2 and 'launched' not in calls, \
+                    (ok2, logs2, calls)
+
+                # 关了自动启动 → 只提示，不动手
+                envcheck._devices = lambda adb: {'emulator-5554': 'device'}
+                envcheck._auto_start = lambda: False
+                ok3, why3 = envcheck.ensure(None, maa_dir='M', profile='moren',
+                                            address='emulator-5556')
+                assert not ok3 and '自动启动' in why3, (ok3, why3)
+                assert 'launched' not in calls, calls
+
+                # 反查不到是哪台实例（别的模拟器）→ 不猜、也不乱启动
+                envcheck._auto_start = lambda: True
+                old_idx = envcheck.index_of_address
+                envcheck.index_of_address = lambda c, a: (None, '')
+                try:
+                    calls.pop('launched', None)
+                    ok4, why4 = envcheck.ensure(None, maa_dir='M',
+                                                profile='moren',
+                                                address='emulator-5556')
+                    assert not ok4 and '没在线' in why4, (ok4, why4)
+                    assert 'launched' not in calls, calls
+                finally:
+                    envcheck.index_of_address = old_idx
+            finally:
+                envcheck.launch, envcheck.wait_ready = old_launch, old_wait
+                envcheck._auto_start, envcheck._devices = old_auto, old_dev
+        finally:
+            maa._load_cfg = old_load
+    finally:
+        envcheck._run = old_run
+
+
+def check_one_engine_per_proc(tmp):
+    """B63 一路一个进程：多开第二个号不许把前面那路跑挂
+
+    2026-11-23 用户报「我多开另一个号，他把我前面的停了」。asst.log 实证：
+    5556 那组 12:59:50 开跑，13:01:37 另一个账号在**同一个进程**里开了第二个
+    MaaCore，13 秒后 5556 的 StartUp 链就自己「结束」了（只发 TaskChainStopped，
+    不是 Error，上层看上去就像「有人按了停止」），接着两边一起报登录失败。
+
+    根因：MaaCore 的 ``AsstSetUserDir`` / ``AsstLoadResource`` /
+    ``AsstCreateEx`` 动的是**进程级**全局资源，同进程第二个实例会把第一个
+    正在跑的链打断。所以跑机前先抢一个「本进程名额」，抢不到就换独立进程。
+    """
+    _reset_config(tmp)
+    from unittest import mock
+
+    from core import maaplan, maacore, multiproc, settings, skills, tasks
+
+    cfg = settings.CONFIG_DIR
+    with io.open(os.path.join(cfg, '示例号.json'), 'w', encoding='utf-8',
+                 newline='') as fh:
+        json.dump({'account': {'uid': '1', 'nickName': '示例号',
+                               'channelName': '官服'}, 'maa': {}}, fh,
+                  ensure_ascii=False)
+
+    def wait_task(tid, timeout=10.0):
+        end = time.time() + timeout
+        t = None
+        while time.time() < end:
+            t = tasks.get(tid)
+            if t and t['status'] != 'running':
+                return t
+            time.sleep(0.02)
+        return t
+
+    # ---- 1) 名额只有一个，抢到的必须还 ----
+    assert maacore.claim_inproc() is True
+    assert maacore.claim_inproc() is False
+    maacore.release_inproc()
+    assert maacore.claim_inproc() is True
+    maacore.release_inproc()
+
+    # ---- 2) live_others：Engine.open 的闸门按它判断「本进程已经有核心了」----
+    class _E(object):
+        def __init__(self):
+            self._handle = 1
+
+    a, b = _E(), _E()
+    old_live = maacore._LIVE
+    maacore._LIVE = {a, b}
+    try:
+        assert maacore.live_others() == 2
+        assert maacore.live_others(exclude=a) == 1
+    finally:
+        maacore._LIVE = old_live
+
+    # 账号文件写进**当前生效的** config（测试夹具会把 settings.CONFIG_DIR
+    # 指到 tmp，别按 tmp/config 硬拼路径）
+    cfg = settings.CONFIG_DIR
+    os.makedirs(cfg, exist_ok=True)
+    with io.open(os.path.join(cfg, '示例号.json'), 'w', encoding='utf-8',
+                 newline='') as fh:
+        json.dump({'account': {'uid': '1', 'nickName': '示例号',
+                               'channelName': '官服'}, 'maa': {}}, fh,
+                  ensure_ascii=False)
+
+    # ---- 3) 本进程已有一路 → run_skill 换独立进程（kind='one'）----
+    calls, ran = [], []
+
+    def fake_group(kind, tid, idx, payload, log, who=''):
+        calls.append((kind, dict(payload)))
+        return {'示例号.json': {'ok': True, 'via': 'worker'}}, [], False
+
+    entry = skills.SKILLS['wakeup']
+    skills.SKILLS['wakeup'] = (entry[0], lambda *x, **k: ran.append(1))
+    assert maacore.claim_inproc()              # 假装另一路正在跑
+    try:
+        with mock.patch.object(multiproc, 'run_group', fake_group), \
+                mock.patch.object(skills, '_skill_body',
+                                  lambda *x, **k: ran.append(1)):
+            t = wait_task(skills.run_skill('wakeup', {}))
+    finally:
+        skills.SKILLS['wakeup'] = entry
+        maacore.release_inproc()
+    assert not ran, '本进程已经有一路在跑了，还在本进程开了第二个 MaaCore'
+    assert calls and calls[0][0] == 'one', calls
+    assert calls[0][1].get('skill') == 'wakeup', calls[0][1]
+    assert t and t['status'] == 'done', (t or {}).get('status')
+    assert (t.get('result') or {}).get('via') == 'worker', t.get('result')
+
+    # ---- 4) 单组批量：本进程忙 → 整组丢给子进程 ----
+    used = []
+    old_rg, old_proc = skills._run_group, skills._run_group_proc
+    skills._run_group = lambda *x, **k: used.append('inproc')
+    skills._run_group_proc = lambda *x, **k: used.append('proc')
+    # 分组要读「这号在哪台模拟器」，这里不真读 MAA 配置（临时 config 里没有）
+    fake_key = lambda f, a='': (('k', tmp), tmp, {'address': 'emulator-5556'})
+    try:
+        with mock.patch.object(skills, '_emulator_key', fake_key):
+            assert maacore.claim_inproc()
+            try:
+                wait_task(skills.run_batch(['示例号.json'],
+                                           [{'skill': 'wakeup'}]))
+            finally:
+                maacore.release_inproc()
+            assert used == ['proc'], used
+            # 没人占名额时照旧在本进程跑（别为单开白起一个进程）
+            used[:] = []
+            wait_task(skills.run_batch(['示例号.json'],
+                                       [{'skill': 'wakeup'}]))
+            assert used == ['inproc'], used
+    finally:
+        skills._run_group, skills._run_group_proc = old_rg, old_proc
+
+    # ---- 5) maaplan.run_plan 单台也一样 ----
+    plan_calls = []
+
+    def fake_plan(kind, tid, idx, payload, log, who=''):
+        plan_calls.append(kind)
+        return [{'file': '示例号.json', 'ok': True}], [{'file': '示例号.json',
+                                                       'ok': True}], False
+
+    assert maacore.claim_inproc()
+    try:
+        with mock.patch.object(multiproc, 'run_group', fake_plan):
+            maaplan.run_plan([{'file': '示例号.json', 'name': '示例号',
+                               'address': 'emulator-5556'}], {'maaDir': tmp})
+    finally:
+        maacore.release_inproc()
+    assert plan_calls == ['plan'], plan_calls
+
+
+def _bars_frame(bright, width=1920, height=1080):
+    """合成一帧带「左 ✕ 右 ✓」按钮条的图（bright=False = 基建那种暗底）
+
+    按钮条用的是真模板原位贴上去，所以定点比对必然是 0 分；亮度那一层由
+    底色决定。抓不到真机截图时靠它验判据。
+    """
+    from PIL import Image
+    from core import pages
+    base = 225 if bright else 40
+    im = Image.new('RGB', (width, height), (base, base, base))
+    for name, (fx, fy) in pages._CONFIRM_ICONS:
+        tpl = pages._tpl(name)
+        assert tpl is not None, name
+        t = tpl.convert('RGB')
+        im.paste(t, (int(width * fx) - t.width // 2,
+                     int(height * fy) - t.height // 2))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+def _plain_frame(level=230, width=1920, height=1080):
+    from PIL import Image
+    im = Image.new('RGB', (width, height), (level, level, level))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+class _FakeTouch(object):
+    """只实现 pages.to_home 用到的几个方法"""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.taps = []
+        self.keys = []
+        self.n = 0
+
+    def shot(self):
+        i = min(self.n, len(self.frames) - 1)
+        self.n += 1
+        return self.frames[i]
+
+    def tap_px(self, x, y):
+        self.taps.append((x, y))
+        return True
+
+    def tap(self, x, y):
+        self.taps.append((x, y))
+        return True
+
+    def back(self):
+        self.keys.append('back')
+        return True
+
+    def esc(self):
+        self.keys.append('esc')
+        return True
+
+    def size(self):
+        return (1920, 1080)
+
+
+def check_exit_confirm(tmp):
+    """B64 「是否确认退出游戏？」要认出来点 ✕，不许再按 ESC 把游戏关掉
+
+    2026-11-23 用户实测：S 关入口没认出来 → 一路 ESC → 主页也没认出来 → 停在
+    「是否确认退出游戏？」→ 程序接着按 ESC，游戏直接退出，整轮挂机白跑。
+
+    两种确认弹窗（基建离开 / 退出游戏）按钮条完全一样（左 ✕ 右 ✓），以前的
+    代码把它们当同一种，点右边 ✓ = 替用户退出游戏。现在靠「背后亮不亮」分开：
+    退出确认背后是模糊的主界面（亮），基建背后是基地（暗）。
+    """
+    from core import pages
+
+    plain = _plain_frame()
+    bright = _bars_frame(True)
+    dark = _bars_frame(False)
+
+    # ① 亮底 + 按钮条 = 退出确认；暗底 = 基建，别认成退出
+    assert pages.confirm_leave_bytes(bright) is not None
+    assert pages.exit_confirm_bytes(bright) is not None
+    assert pages.exit_confirm_bytes(dark) is None, '暗底被认成退出确认了'
+    assert pages.confirm_leave_bytes(dark) is not None
+    # 没按钮条的亮帧两个都不认（别在普通页面上乱点）
+    assert pages.exit_confirm_bytes(plain) is None
+    assert pages.confirm_leave_bytes(plain) is None
+
+    # ② to_home 认到退出确认：只点左边的 ✕，一次返回/ESC 都不许按
+    t = _FakeTouch([bright, plain, plain, plain])
+    assert pages.to_home(t, lambda *_: None) is True
+    assert t.keys == [], t.keys
+    assert len(t.taps) == 1, t.taps
+    x, y = t.taps[0]
+    assert abs(x / 1920.0 - 0.3464) < 0.02, t.taps
+    assert abs(y / 1080.0 - 0.6870) < 0.02, t.taps
+
+    # ③ 基建那个（暗底）照旧点右边的 ✓，别把「离开基建」也取消了
+    t2 = _FakeTouch([dark, plain])
+    pages.to_home(t2, lambda *_: None, rounds=1)
+    assert t2.taps, '暗底确认框没点'
+    assert t2.taps[0][0] / 1920.0 > 0.6, t2.taps
+
+
+def check_raid_variant(tmp):
+    """B65 难度口径：说要突袭就真排突袭；排不出来必须如实报 raidMissing
+
+    2026-11-23 用户报「我让他打 OS-EX-8 突袭，结果两个账号导入的都是普通」。
+    根因是提示词里写着「EX 关默认只打突袭」，代码默认却是普通（auto→normal），
+    助手照描述办、不传 raid，排下去的就是普通，嘴上还在说突袭。所以：
+      · 工具描述统一写成「省略 = 普通」，要突袭必须显式传；
+      · ``_prepare_ops`` 把「要突袭但只有普通作业」的关回成 raidMissing；
+      · add_stages / build_run 真的收 raid 参数，不再永远取每关第一行（普通）。
+    """
+    from core import agent, maaplan, skills
+
+    assert agent._variant_arg('突袭') == 'raid'
+    assert agent._variant_arg('raid') == 'raid'
+    assert agent._variant_arg('only') == 'raid'
+    assert agent._variant_arg('普通') == 'normal'
+    assert agent._variant_arg('both') == 'both'
+    assert agent._variant_arg('') == ''
+
+    old_sel, old_prep = skills._select_ops, maaplan.prepare_copilot
+    old_dir = skills._maa_dir_of
+    skills._maa_dir_of = lambda f: tmp
+    try:
+        skills._select_ops = lambda *a, **k: (
+            [{'copilotId': 1, 'stageCode': 'OS-EX-8', 'variant': 'normal'}], {})
+        normal = [{'filename': 'a.json', 'stage_name': 'OS-EX-8',
+                   'is_raid': False}]
+        raid = [{'filename': 'b.json', 'stage_name': 'OS-EX-8',
+                 'is_raid': True}]
+        maaplan.prepare_copilot = lambda *a, **k: normal
+        _r, _t, miss = skills._prepare_ops(
+            ['OS-EX-8'], '示例号.json', lambda *_: None, raid='raid')
+        assert miss == ['OS-EX-8'], miss
+        _r, _t, miss = skills._prepare_ops(
+            ['OS-EX-8'], '示例号.json', lambda *_: None, raid='normal')
+        assert miss == [], miss           # 本来就要普通，不算缺
+        maaplan.prepare_copilot = lambda *a, **k: raid
+        _r, _t, miss = skills._prepare_ops(
+            ['OS-EX-8'], '示例号.json', lambda *_: None, raid='raid')
+        assert miss == [], miss           # 真排到突袭了
+    finally:
+        skills._select_ops, maaplan.prepare_copilot = old_sel, old_prep
+        skills._maa_dir_of = old_dir
+
+    # add_stages：raid 真的筛行，缺突袭行时不许拿普通顶上
+    def rows(raid_ops):
+        return {'stages': [
+            {'stage': {'code': 'OS-EX-8', 'variant': 'normal'},
+             'ops': [{'copilotId': 11, 'mode': 'ready'}]},
+            {'stage': {'code': 'OS-EX-8', 'variant': 'raid'},
+             'ops': raid_ops},
+        ]}
+
+    old_rows = agent._stage_rows
+    old_load = agent.settings.load
+    old_apply = agent.maa.start_apply
+    old_acct = agent.accounts.get_account
+    cap = {}
+    agent.settings.load = lambda: {'agent': {'autoApply': True}}
+    agent.accounts.get_account = lambda f: {'maa': {}}
+    agent.maa.start_apply = lambda items, **kw: (
+        cap.setdefault('items', items), 'tid')[1]
+    try:
+        # 突袭行没有可用作业 → 报错 + raidMissing，绝不写普通
+        agent._stage_rows = lambda kw, acc=None: rows([])
+        out = agent._tool_add_stages({'keyword': 'OS-EX-8', 'raid': 'raid',
+                                      'account': '示例号.json'})
+        assert out.get('error') and out.get('raidMissing') == ['OS-EX-8'], out
+        assert 'items' not in cap, cap
+
+        # 两行都有作业：突袭只要突袭那行
+        agent._stage_rows = lambda kw, acc=None: rows(
+            [{'copilotId': 22, 'mode': 'ready'}])
+        out = agent._tool_add_stages({'keyword': 'OS-EX-8', 'raid': 'raid',
+                                      'account': '示例号.json'})
+        assert out.get('count') == 1, out
+        assert [i['variant'] for i in cap['items']] == ['raid'], cap
+        assert out.get('difficulties') == {'OS-EX-8': '突袭'}, out
+    finally:
+        agent._stage_rows, agent.settings.load = old_rows, old_load
+        agent.maa.start_apply, agent.accounts.get_account = old_apply, old_acct
+
+
+def check_client_and_stop(tmp):
+    """B61 客户端类型落到任务参数 / 停止能按账号点名
+
+    2026-11-23 用户报两件事，同一条跑机链上两个洞：
+
+    ① 「还是把我 b 服账号认成官服的，毫不犹豫启动了官服，在一群数字里找我
+       b 服账号」。asst.log 实证 ``append_task StartUp {"client_type":
+       "Official"}`` + ``am start -n com.hypergryph.arknights/...``。根因不是
+       判定写错，而是 ``skill_fight`` 建 spec 时只从 ``_profile_kw`` 里取了
+       ``profile``，把 ``clientType`` 丢了，``core_tasks`` 只能按 Official
+       兜底。现在 ``resolve_client`` 收口，并且 spec 固定带 ``accountFile``。
+
+    ② 「停止的话不能指定停止，会一起停其他任务」。以前只有全停入口
+       （``stop_all_live``），停 b 服会把官服那台正在打的关也砍掉。
+    """
+    _reset_config(tmp)
+    import json
+    from core import acctbind, api, maacore, maaplan, settings, skills
+
+    # ---- ① 渠道判定只有一个入口 ----
+    assert maaplan.resolve_client({'clientType': 'Bilibili'}) == 'Bilibili'
+    assert maaplan.resolve_client({'clientType': 'bilibili服'}) == 'Bilibili'
+    assert maaplan.resolve_client({'channel': '官服'}) == 'Official'
+    assert maaplan.resolve_client({'clientType': '乱写'}) == 'Official'
+    assert maaplan.resolve_client({}) == 'Official'
+
+    # 账号文件兜底：以后谁再加一条跑机入口忘了带 clientType，也不会按官服跑
+    file = '测试号 bilibili服.json'
+    with io.open(os.path.join(settings.CONFIG_DIR, file), 'w',
+                 encoding='utf-8', newline='') as f:
+        json.dump({'account': {'uid': '1', 'nickName': '测试号',
+                               'channelName': 'bilibili服'}, 'maa': {}},
+                  f, ensure_ascii=False)
+    with io.open(os.path.join(settings.CONFIG_DIR, '别的号 官服.json'), 'w',
+                 encoding='utf-8', newline='') as f:
+        json.dump({'account': {'uid': '2', 'nickName': '别的号',
+                               'channelName': '官服'}, 'maa': {}},
+                  f, ensure_ascii=False)
+    assert maaplan.resolve_client({'accountFile': file}) == 'Bilibili'
+    kw = skills._spec_kw(file)
+    assert kw.get('clientType') == 'Bilibili' and kw.get('accountFile') == file, kw
+
+    # ---- ② StartUp 的 client_type 才是决定启哪个包的参数 ----
+    spec = dict({'tasks': ['startup']}, **skills._spec_kw(file))
+    tasks = maaplan.core_tasks(spec, maa_dir=tmp)
+    assert tasks and tasks[0][0] == 'StartUp', tasks
+    assert tasks[0][1]['client_type'] == 'Bilibili', tasks[0]
+    tasks2 = maaplan.core_tasks({'tasks': ['startup'],
+                                 'accountFile': '别的号 官服.json'}, tmp)
+    assert tasks2[0][1]['client_type'] == 'Official', tasks2[0]
+    # 简报里说的是人话（b服 / 官服），不是 Bilibili
+    assert 'b服' in maaplan._brief('StartUp', tasks[0][1]), \
+        maaplan._brief('StartUp', tasks[0][1])
+
+    # ---- ③ 停止按账号点名：只停那一路 ----
+    class _Fake(object):
+        def __init__(self, owner):
+            self.owner = owner
+            self._handle = 1
+            self.stopped = False
+            self.stopped_by_user = False
+
+        def stop(self, external=False):
+            # 点名停（stop_live）传 external=True；超时收尾自己调的 stop()
+            # 不算「用户按了停止」，所以两个标记分开记
+            self.stopped = True
+            if external:
+                self.stopped_by_user = True
+
+    a = _Fake(file)
+    b = _Fake('别的号 官服.json')
+    c = _Fake('')                      # 没挂归属的实例：点名永远停不到它
+    old_live = maacore._LIVE
+    maacore._LIVE = {a, b, c}
+    try:
+        assert maacore.owner_match(file, [file[:-5]]) is True    # 不带 .json 也认
+        assert maacore.owner_match(file, ['别的号 官服.json']) is False
+        assert maacore.owner_match('', [file]) is False
+        assert maacore.owner_match_any([file, '别的号 官服.json'], ['别的号'])
+        assert maacore.stop_live(['测试号 bilibili服']) == 1
+        assert a.stopped and not b.stopped and not c.stopped
+        # 点名停要打成「用户按了停止」；别的路不能被带上去
+        assert a.stopped_by_user and not b.stopped_by_user
+        assert maacore.stop_live(['不存在的号']) == 0
+        assert maacore.stop_live(None) == 2              # 全停：剩下两个
+        assert b.stopped and c.stopped
+    finally:
+        maacore._LIVE = old_live
+
+    # 名字 → 账号文件：完全相等优先，子串对上多个就报错（停错号代价太大）
+    assert skills.match_accounts('测试号') == [file]
+    assert skills.match_accounts(file) == [file]
+    try:
+        skills.match_accounts('号')
+    except ValueError as e:
+        assert '对上了' in str(e) and '个账号' in str(e), e
+    else:
+        raise AssertionError('对上多个账号时应该拦下')
+
+    # 界面上那个「停止」（/api/run/stop）只传当前账号
+    out = api.api_run_stop({}, {'file': file})
+    assert out.get('accounts') == [file] and out.get('stopped') == 0, out
+    allstop = api.api_run_stop({}, {'all': True})
+    assert allstop.get('accounts') == [], allstop
+    # 既没点名也没说全停 → 拦下，绝不默认全停（右栏按钮没选中账号时会这样）
+    blank = api.api_run_stop({}, {})
+    assert blank.get('stopped') == 0 and blank.get('error'), blank
+
+    # 多开时停的是**子进程**：注册表按账号筛，杀不中的不动
+    from core import multiproc
+    killed = []
+
+    class _Proc(object):
+        def __init__(self, name):
+            self.name = name
+
+        def kill(self):
+            killed.append(self.name)
+
+    old_running, old_stopped = multiproc._RUNNING, multiproc._STOPPED
+    multiproc._RUNNING = {
+        ('t1', 1): {'proc': _Proc('p1'), 'files': [file], 'tag': 'emu-5556'},
+        ('t1', 2): {'proc': _Proc('p2'), 'files': ['别的号 官服.json'],
+                    'tag': 'emu-5554'},
+    }
+    multiproc._STOPPED = set()
+    try:
+        assert multiproc.stop_groups(['测试号 bilibili服']) == 1
+        assert killed == ['p1'] and ('t1', 1) in multiproc._STOPPED
+        assert ('t1', 2) not in multiproc._STOPPED
+        assert multiproc.stop_groups(None) == 1 and killed == ['p1', 'p2']
+    finally:
+        multiproc._RUNNING, multiproc._STOPPED = old_running, old_stopped
 
 
 def check_account_bind(tmp):
@@ -5377,7 +6213,7 @@ def check_multi_emu_batch(tmp):
                      for s in payload.get('steps') or []]
             skills._run_group(payload['group'], steps, payload.get('names') or {},
                               log, res, lk, tid=None)
-            return res, []
+            return res, [], False
 
         multiproc.run_group = local_proc
         t = None
@@ -5758,11 +6594,11 @@ def check_task_log_isolation(tmp):
     _reset_config(tmp)
     from core import accounts, multiproc, tasks
 
-    p = '[灰bao#0384]'
+    p = '[abc示例#0384]'
     dec = tasks._decorate
     assert dec('MaaCore v6.23.0 已加载', p) == p + ' MaaCore v6.23.0 已加载'
     assert dec('[组 emulator-5556] 开始：MAA -1', p) == p + ' 开始：MAA -1'
-    assert dec('[小卡拉帕鲁灰#6408] 排队（官服）', p) == '[小卡拉帕鲁灰#6408] 排队（官服）'
+    assert dec('[示例昵称#6408] 排队（官服）', p) == '[示例昵称#6408] 排队（官服）'
     assert dec('[MAA] 事件', p) == '[MAA] 事件'
     assert dec('裸行', '') == '裸行'
 
@@ -5786,9 +6622,9 @@ def check_task_log_isolation(tmp):
 
     # 一组一个号 → tag 用昵称；多号组不硬塞（每行本来就有各自前缀）
     old = accounts.get_account
-    accounts.get_account = lambda f: {'account': {'nickName': '灰bao#0384'}}
+    accounts.get_account = lambda f: {'account': {'nickName': 'abc示例#0384'}}
     try:
-        assert multiproc.group_tag({'files': ['x.json']}) == '灰bao#0384'
+        assert multiproc.group_tag({'files': ['x.json']}) == 'abc示例#0384'
     finally:
         accounts.get_account = old
     assert multiproc.group_tag({'files': ['a.json', 'b.json']}) == ''
@@ -6632,6 +7468,20 @@ def main():
                 lambda: check_cross_zone_segments(tmp))
         r.check('B58 散点关卡（S 关）：认格子→点进编队→单作业模式一关一趟',
                 lambda: check_scatter_stages(tmp))
+        r.check('B59 定时任务预设（预设表/找程序/缺路径兜底/脱敏守卫）',
+                lambda: check_schedule_presets(tmp))
+        r.check('B60 实例绑定与渠道（地址钉在账号上/钉死不换台/b服按Bilibili）',
+                lambda: check_emu_binding(tmp))
+        r.check('B61 客户端类型进任务参数 / 停止能按账号点名',
+                lambda: check_client_and_stop(tmp))
+        r.check('B62 多开启动（按地址反查实例号/启动那一台/只等那台上线）',
+                lambda: check_emu_auto_start(tmp))
+        r.check('B63 一路一个进程（多开第二个号不再把前面那路跑挂）',
+                lambda: check_one_engine_per_proc(tmp))
+        r.check('B64 退出确认点 ✕（不再按 ESC 把游戏关掉）',
+                lambda: check_exit_confirm(tmp))
+        r.check('B65 难度口径（要突袭就排突袭 / 排不出来报 raidMissing）',
+                lambda: check_raid_variant(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

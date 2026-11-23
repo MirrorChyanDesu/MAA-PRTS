@@ -155,7 +155,9 @@ MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度，
   绝不出现已成功的 `SV-EX-1`；返回值 `mark` 非 None
 - `_sweep_segments`：`['SV-1','SV-2','SV-EX-1','SV-S-1']` → 段名
   `普通关 / EX 关·普通 / EX 关·突袭 / S 关`，variant `normal/normal/raid/normal`；
-  `raid='normal'` 塌成三段；`tiers=['ex']` 只出 EX 两段；剧情关（ST）不进计划
+  `raid='normal'` 塌成三段；`tiers=['ex']` 只出 EX 两段；剧情关（ST）不进计划；
+  **`raid='raid'` 时 S 段仍是 normal**（S 突袭没奖励），要突袭得显式
+  `s_raid=True` 才会变 `raid`
 
 ### B44 当期活动导航（2026-11-19）
 
@@ -413,6 +415,133 @@ MaaCore 的 `ClickStageName` 只在关卡列表里 OCR，认不出。这条路�
   `open_stage` 依次收到 `(1,False)/(1,True)/(2,False)`，`stage_trail` 三条；
   界面上没有的格子（未解锁）跳过不排作业；点开了但没进编队（理智不够）记进
   `stages_failed` 并接着跑下一关
+
+### B59 定时任务预设（2026-11-23）
+
+定时任务从「只能填路径」扩成「预设里挑」，预设只负责猜程序在哪。用例钉四件
+事，不碰真实安装位置（临时目录造假 exe）：
+
+- **预设表**：`custom` 打头、`self` 第二，`maa` 与六个其它游戏预设都在；
+  `preset_id('MAA')` 大小写不敏感，乱填的 id 回落 `custom`
+- **不猜的地方不猜**：`custom` 没填程序必须报错，不许偷偷换成别的 exe
+- **MAA 预设**：把 `maaDir` 指到临时目录里的假 `MAA.exe` → `detect('maa')`
+  命中的就是它；任务里 `program` 空着，`_argv` 跑时按预设补上同一个路径
+- **扫盘**：给定目录里造 `BetterGI/bin/BetterGI.exe` → 按文件名找到；换名字
+  找不到；没给 exe 名就一次都不扫
+- **本体**：`fill('self')` 给的是本进程 python（源码模式带 `main.py` 参数）；
+  用户手填的 `program`/`args` 不许被 `resolve()` 覆盖
+- **自己的预设**：`config/schedule-presets.json` 能新增、能同 id 覆盖内置
+  （覆盖时不写 `exes` 就为空，不把内置的 exe 名带回来）
+- **保存清洗**：认识的 `preset` 留着，乱写回落 `custom`，老配置没这字段也对
+- **脱敏守卫**：遍历 `backend/` `frontend/` `docs/` `tools/`，三方项目名、真实
+  账号昵称、本人机器路径一个都不许出现（关键词在用例里拆成两半写，否则本文件
+  自己就先违规）
+
+### B60 实例绑定与渠道（2026-11-23）
+
+用户报「指定 5554 却影响 5556」和「启动不看 b 服还是官服」，一个用例钉住两条
+链路，全程不动真模拟器（`_devices` / `read_config` 换成假数据）：
+
+- **连接参数 vs 客户端类型**：假档案返回 `Config: LDPlayer` + `clientType:
+  Bilibili` → `_conn_for` 出来的 `config` 必须是 `LDPlayer`（那是 AsstConnect
+  认的连接配置名）、`client` 才是 `Bilibili`；档案没写连接配置时兜底 `General`
+- **地址校验**：`emulator-5556` / `127.0.0.1:16384` 收，`5556` 当场报错并提示
+  正确写法
+- **绑定落盘**：`/api/account/maa` 写 `adbAddress` → `acctbind.addr_of` /
+  `skills._addr_of` 都读到；本次点名（`_ADDR.map`）优先于绑定；`list_accounts`
+  带出 `maaAdbAddress`
+- **绝不换台**：钉的那台不在线 → `device_of` 原样返回钉的地址（不换成在线的
+  那台，交给 `envcheck` 按实例号去启动它，见 B62）；解绑后按档案走
+- **档案过期**：档案地址不在线时，两台在线 → 拦下要用户指定；只剩一台 → 顶上；
+  一台都没开 → 返回空交给 `envcheck` 去启动
+- **设备下拉**：`/api/account/devices` 返回在线列表（地址 + 状态）、本机实例
+  （`instances`，含没开的）和当前绑定
+
+### B61 客户端类型进任务参数 / 停止能按账号点名（2026-11-23）
+
+同一条跑机链上两个洞，一个用例一起钉住：
+
+- **渠道判定一个入口**：`resolve_client` 认 `Bilibili` / `bilibili服` / `官服`
+  / 乱写（→ `Official`）/ 空；只给 `accountFile` 时也能从账号的 `channelName`
+  回查出 `Bilibili`——上游漏传 `clientType` 也不会再按官服跑
+- **落进任务参数**：b 服账号的 `core_tasks` 里 `StartUp.client_type` 必须是
+  `Bilibili`（asst.log 里那个值才决定 `am start` 哪个包），官服账号是
+  `Official`；`_brief` 说的是人话「b服」
+- **停止按账号**：`owner_match` 认带/不带 `.json` 的文件名、不认空归属；
+  `stop_live([这个号])` 只停它一个，全停才把剩下的停掉，已停过的不重复计数
+- **名字解析**：`match_accounts` 完全相等优先，子串对上多个 → 报错（停错号
+  代价太大）
+
+### B62 多开启动：按地址反查实例号（2026-11-23）
+
+用户报「只能帮我启动 5554 的模拟器，启动不了 5556 的」。假 `ldconsole`（把
+`envcheck._run` 换掉，`list2` 回两个实例、`get-serialno` 回
+`emulator-5554/5556/5558`）钉住四件事：
+
+- **地址 → 序号**：`emulator-5556` → 实例 1；`127.0.0.1:5557`（adb 口）也是
+  实例 1；本机没有的 `emulator-9999` 和「明确是别的模拟器」都返回 `None`
+- **序号压过档案**：假档案 `InstanceIndex: 0`，`read_config(address=
+  'emulator-5556')` 必须给出 `index=1 / indexFrom='地址'`
+- **启动那一台**：`ensure(address='emulator-5556')` 时只有 5554 在线 →
+  `launch` 拿到的序号是 **1**（不是档案里的 0），日志说「实例 1」，并且
+  `wait_ready` 的 `wants` 里带着 `emulator-5556`
+- **三种边界**：目标已在线 → 放行且**零日志**；关了自动启动 → 只提示不动手；
+  反查不到是哪台实例 → 不猜也不启动，回「没在线」让用户自己开
+- **下拉里能选到没开的实例**：`/api/account/devices` 的 `instances` 同时给出
+  5554（开着）和 5556（`running=false`）——设置页要能选到关着的第二台
+- **界面接口**：`/api/run/stop {file}` 的 `accounts` 只含这个号；`{all:true}`
+  才是全停
+- **多开子进程**：`multiproc.stop_groups` 按这一组的 `files` 匹配，命中才
+  `kill`，并把 key 记进 `_STOPPED`（`run_group` 据此返回 `stopped=True`，
+  不记「子进程异常」）
+
+### B63 一路一个进程：多开第二个号不把前面那路跑挂（2026-11-23）
+
+用户报「我多开另一个号，他把我前面的停了」。asst.log 里没有 `TaskChainError`，
+只有 `Stop | block` + `~Assistant`：同一进程里开第二个 MaaCore，第一个正在跑的
+链被进程级全局资源重置打断，上层只看到 `TaskChainStopped`。用例钉住：
+
+- **名额只有一个**：`maacore.claim_inproc()` 第二次返回 `False`，`release` 之后
+  又能抢到（不释放就是「以后的跑机永远走子进程」）
+- **`live_others`**：本进程活着的实例计数，`exclude=` 不算自己（`Engine.open`
+  的闸门按它判）
+- **`run_skill` 让位**：主线程先占住名额 → 跑 `wakeup` 时必须走
+  `multiproc.run_group(kind='one')`，`_skill_body` 一次都不能在本进程被调用，
+  结果从子进程的 `results` 取回
+- **单组批量让位**：同样占住名额 → `run_batch` 走 `_run_group_proc`；没人占时
+  仍在本进程跑（别为单开白起一个进程）
+- **`run_plan` 单台同理**：占住名额 → 走 `multiproc.run_group(kind='plan')`
+- **停止不再默认全停**：`/api/run/stop` 既没 `file` 也没 `all` → 回 `error`
+  且 `stopped=0`
+
+### B64 退出确认点 ✕：不再按 ESC 把游戏关掉（2026-11-23）
+
+用户报「S 关入口没认出来 → 一路按 ESC → 主页也没认出来 → 停在『是否确认退出
+游戏？』→ 继续按 ESC，游戏直接退出」。两种确认弹窗的按钮条一模一样（左 ✕ 右 ✓），
+以前统一当基建框点了右边 ✓ = 替用户退出。用例用 PIL 合成帧（真模板原位贴，
+底色亮/暗两版）钉住：
+
+- **亮底 + 按钮条 = 退出确认**：`exit_confirm_bytes` 返回左半 ✕ 的坐标；
+  `confirm_leave_bytes` 也认得（两者都命中，谁先谁后由调用方保证——`to_home`
+  里退出确认排在前面）
+- **暗底 + 按钮条 = 基建确认**：`exit_confirm_bytes` 必须返回 `None`，
+  `confirm_leave_bytes` 返回右边 ✓（别把「离开基建」也取消了）
+- **没有按钮条的亮帧两个都不认**（别在普通页面上乱点）
+- **`to_home` 一次返回/ESC 都不许按**：喂「亮底按钮条 → 空白帧」，`to_home`
+  返回 `True`、`keys == []`、只 tap 一次且 x≈0.3464w
+
+### B65 难度口径：要突袭就真排突袭（2026-11-23）
+
+用户报「我让他打 OS-EX-8 突袭，结果两个账号导入的都是普通 EX-8」。根因是提示词
+写着「EX 关默认只打突袭」、代码默认已是普通（`auto→normal`），助手照描述办不传
+`raid`。用例钉住三处：
+
+- `_variant_arg`：`raid/突袭/only → raid`，`普通 → normal`，空 → 不筛
+- `_prepare_ops` 的第三个返回值 `raidMissing`：要突袭却只拿到普通 → 列出那几关；
+  本来要普通、或真排到突袭 → 必须为空
+- `add_stages` 真的按 `raid` 筛行：突袭行没有可用作业时**报错 + raidMissing、
+  一份都不写**（绝不拿普通顶上）；两行都有作业时只写突袭那条，
+  `difficulties` 回 `{关卡: '突袭'}`
 
 ## 什么时候跑
 

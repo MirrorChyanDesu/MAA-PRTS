@@ -40,7 +40,7 @@
 | `core/multiacct.py` | 多账号编排：MAA「一个配置档案 = 一个账号」，按各账号练度各挑作业，串行切换执行。档案一律新建 `PRTS-` 前缀的那份，用户自己的档案一个字段都不动。切号名统一走 `acctname.check()`；`maaProfile` 是档案名不是切号名，别混用 |
 | `core/maaplan.py` | 把「用户想怎么挂」翻成可执行的东西，两条路线：① `build_queue`/`ensure_profile` 写 GUI 的 `TaskQueue` + `RunDirectly`（能看界面，但**不能抄作业**：MAA 的 `InitializeItems` 不认 CopilotTask，会抛 NotImplementedException 让整个任务列表空白）；② `core_tasks`/`run_core` 生成 MaaCore 的任务序列直接驱动（能抄作业、能跑 Custom 小活动、自己按开始）。`run_core` 跑抄作业固定四段：**登录（StartUp）→ `AsstStop` 把 MAA 停住 → 用 `stagenav` 点到关卡地图 → 再 append Copilot + `AsstStart`**。停这一步不能省：不停的话 MaaCore 还在按自己的逻辑截屏/滑动，和我们的 adb 点击抢界面。导航失败且这一关有卡片模板（老故事集）时**直接报错**，不把作业交给 MAA——它只会横向滑主线，白跑 30 秒再失败（2026-11-17 SV 实测：停住后 24 秒内 MAA 就在地图上 OCR 到 SV-1、点开始行动、自动编队开打） |
 | `core/maacore.py` | MaaCore 直连：`AsstCreateEx` → `AsstLoadResource` → `AsstConnect` → `AsstAppendTask` → `AsstStart`，回调翻成事件流。三个坑写在文件头：`AsstCreateEx` 的 restype 必须是 `c_void_p`（否则 64 位句柄截断成 32 位，每次 append 都 access violation）、Copilot 的 `filename` 必须绝对路径、`copilot_list` 的键是 `filename` 不是 `file_name`（写错会让进程 C++ 异常崩溃）；还有第四个**静默**坑——子任务回调码是 20000 段不是 70000 段（见下一节） |
-| `core/pages.py` | 认「现在停在哪一页」+ 回主界面。主页 = 左上角「设置齿轮 + 邮件」两个图标定点比对（实测 0.0 分；活动地图/设置页/基建都不命中）；基建「是否确认离开罗德岛基建？」= 底部按钮条上左「✕」右「✓」两个白圆钮同时定点命中，认出就点右半「确认」的中心（这个弹窗按 ESC / 返回都退不出去）。`to_home()` 每轮先看一帧再决定按返回 / ESC / 点确认。 |
+| `core/pages.py` | 认「现在停在哪一页」+ 回主界面。主页 = 左上角「设置齿轮 + 邮件」两个图标定点比对（实测 0.0 分；活动地图/设置页/基建都不命中）；基建「是否确认离开罗德岛基建？」= 底部按钮条上左「✕」右「✓」两个白圆钮同时定点命中，认出就点右半「确认」的中心（这个弹窗按 ESC / 返回都退不出去）。**「是否确认退出游戏？」按钮条长得一样**，靠「背后是模糊的主界面（亮）」区分，认出点左边「✕」取消并直接当到家——点错右边就是把游戏关掉。`to_home()` 每轮先看一帧再决定按返回 / ESC / 点确认。 |
 | `core/stagenav.py` | 把界面带到活动关的关卡列表。**MAA 自己做不到**：`TL-Open`/`TLChapterToTL` 那套模板图在当前活动 UI 上全匹配失败，Copilot 的 `FullStageNavigation` 又只会横向滑动切章节（这版游戏改成点底部 EPISODE 了）。这条路是真机一步步点出来的：底部「终端」tab → 主界面活动大图 → 主题页区域名 → 活动地图区域列表第 N 行。两个坑：① 主界面点大图是**记忆位置**的，所以流程按 `probe()` 判出的页面状态收敛，不是死按顺序点；② `AsstAsyncClick` 一次连接只能点中第一下，所以点击/截图都走 adb（`Touch`）。坐标 1280×720 口径，可用 `config/nav.json` 覆盖 |
 | `core/stagenav.py`（老故事集） | 当期活动之外的第二条路：**曲谱 → 乐章收录 → 网格找卡片 → 进入活动 →（EX / S / MO 关再点右下角那排分区图标里的对应格子）**。老活动 MAA 资源里压根没有导航配置（`Fight` 直接拒收），只能从「曲谱」这个统一索引里进。网格里卡片位置跟滚动位置绑定、新活动还会把顺序挤动，所以**按模板图找**（`navtpl/<代号>.png`，46 张随包发布，覆盖全部有战斗关的常驻活动；代号是 2026-11-17 真机把 48 张卡逐个导航进图、读落图关卡前缀核出来的，易错对照见 `stagenav.EVENTS` 注释）。分发双闸：模板存在**或**代号在 `EVENTS` 表里都走这条路；`EVENTS` 里的活动导航失败会**直接报错停止**，绝不交给 MAA——它只会横向滑主线，白跑 30 秒再失败。匹配是「1/4 降采样粗扫 + 全分辨率两轮精修 + 全程只记最像那一屏」，粗扫明显不像（>32 分）就跳过精修：真卡 0~7 分、无关卡 21 分起，**阈值 12**（暗色模板在相邻暗卡上能拿 14~19 分，18 挡不住）。五个坑：① 主界面有两套视图，不带底部 tab 的那套要先点中央「终端」大卡（`at_home()` 用底部功能格白像素判，主界面 0.45 / 其它 ≤0.07；带白色 EX 徽章的活动地图上白像素也会超 0.2，所以回主界面的判据是 `at_home AND not in_story_page AND not in_story_dialog AND not on_login_page` 四条件——后两个是 2026-11-17 补的：明亮沙地 CG 回放连 `at_home` 都能骗过，登录页浅灰底 + 白 logo 也能骗过）；② **扫描步长别贪快**：整张表（主线 + 各 Story Line + 未归组的新活动）11 屏，`_SWIPE_STEP` 360 配 1.4 秒等待刚好一张不漏；560 那版实测会漏屏——玛莉娅·临光（MN）正好落在两张截图之间，翻完 34 屏报「没找到」，用 360 重扫第 5 屏 1.0 分命中；③ **`in_story_page()` 必须两条同时成立**（底部左 tab 白 <0.05 且左上灰度 <90）：只看灰度会把主界面判成曲谱页（皮肤立绘压在左边，灰度 98.5 卡在旧阈值 100 下面），于是登录后一步没走就开始翻屏，报「翻了几十屏没找到」；④ **滑动起点必须在最左边缘 x=20 的空白处**，压到卡片上会被判成点击、直接跳进那个活动的详情页，之后分数一动不动（`goto_story_activity` 里躺过一次）；⑤ 退回上一层**先按返回键、再按 ESC**（有些详情页对 `keyevent 4` 完全没反应，ESC 一下就退）；⑥ **剧情页判定换了三版才站住**：白像素占比会把主界面右上角的货币数字（合成玉/342）当成「跳过▶」，于是「剧情排水」在主界面按返回键弹「退出游戏」又点中确认——**游戏被自己关掉**；灰度模板又把 TG 的亮天空烤进了模板，暗背景剧情全失配（而且模板匹配锚点一度把「中心」当「左上角」，全体错位）；最终用**字形掩码 XOR**（两边 >235 二值化后比对差异占比，剧情页 0.00~0.14 / 非剧情 ≥1.0，阈值 0.55），背景无关且天然排除登录页；⑦ **登录页判定也得用模板**：「开始唤醒」按钮（navtpl/_wakeup.png，820,726 起 280×90）匹配认页，整屏均值判据对登录页失效（底部深色横带把均值拉到 ~150，过不了 >165）；⑧ **重启流程**（`restart_app`）：先 `pidof` 查游戏进程（不在就直接拉起，别在安卓桌面上按返回键空转），`am start` 后 30 秒内要看到进程、没看到再拉（最多 3 次），轮询 600 秒、每轮先 `game_alive`（游戏半路崩了要重新拉起——实测强杀后重启会走到 START 页又崩），轮询里**先认拦截页再判主界面**（顺序反了会在登录页误报回主界面）；START 页点**黄色菱形质心**（真实中心 (0.474w,0.949h)，按亮度判会把主界面亮皮肤/公告弹窗误判成 START 页、在主界面上连点几十下）；⑨ **`run_core` 的顺序铁律**：登录（StartUp）没跑完绝不能开始导航——两者并发时导航点在启动页甚至桌面上（nav-fail 现场图是一张桌面截图），作业也永远没排队；队列头是 StartUp 就只排它、等完、`eng.stop()`、导航、再排剩下的；作业列表给了但队列没勾「抄作业」时自动补一条 Copilot；B 服账号要把 `com.hypergryph.arknights.bilibili` 包名传给 Touch，否则「游戏进程不在」的检测永远为真。每一步点完都用 `_moved()`（截图差值 >3.0）验证页面真的切了——「OK」不等于「到对了」，RS/DL/BY 三个模板都曾经匹配到相邻错误卡上还报成功。模板本身也可能过期：卡片改成 214×204 的斜切框以后，早期按「卡片+周边背景」裁的 400×258 图会失配，正确裁法是取卡片中心 200×165、避开左上进度徽章和 NEW! 角标；新活动上线后按 `docs/config.md` 的裁法补一张即可 |
 | `core/scatter.py` | 散点关卡（S 关）：活动地图上浮着的是 `OS-S-1`~`OS-S-5` 五个按钮，不在关卡列表里，MaaCore 的 `ClickStageName` 认不出。这里用定点模板认格子 → 点「开始行动」/「突袭模式→开始突袭」→ 等编队页，再交给 `maaplan.run_scatter` 用单作业模式（只给 `filename`、不给 `copilot_list`）一关一趟打。格子的 `roi` 把命中位置也锁死（模板带雪山背景会认到隔壁）；编队页判据用右上「快捷编队」而不是右下那条有滑入动画的「开始行动」 |
@@ -674,7 +674,8 @@ MAA 事件日志通过 tid 透传进同一条任务日志，右栏日志栏与�
 - **不再有「结算页识别」**：先按两颗亮星裁模板（`result_star1/2.png`）被用户
   否掉——三星 / 一星 / 直接失败都停在同一个结算页，只有星亮几颗不同；后来
   改成「行动结束」标题 mask 也被否掉（仍是自识别）。现在 `pages.py` 只认
-  主页和基建确认框，翻车界面靠「先点后判」。
+  主页 + 基建确认框 + 退出游戏确认框（后者点 ✕ 取消，不是失败识别），
+  翻车界面靠「先点后判」。
 - 收尾判失败只从 `eng.chains[mark:]` 看，否则第一轮的失败会把重试成功盖掉。
   `mark is None` 表示压根没重试（**0 是合法分界**，别拿它当「没重试」）。
 
@@ -751,12 +752,60 @@ adb 路径；不同就多开并行；同一台就切号 → 普通 → 突袭 �
 |---|---|---|
 | `dir` | 这个号归哪份 MAA 目录管 | 回落 `settings.maaDir` |
 | `profile` | 用哪份配置档案（`moren` / `136`…） | 回落 MAA `gui.new.json` 的 `Current` |
+| `adbAddress` | 这个号钉在哪台模拟器（`emulator-5556`） | 回落档案里的 `Address` |
 
-解析只有一处：`acctbind.dir_of(file)` / `acctbind.profile_of(file)`。
-`skills._maa_dir_of(file)` / `_conn_of(file, d)` 都走它，所以唤醒、导航、
-战斗、培养、扫图、牛杂**每一项**都会连到「这个号自己那台模拟器」上，不再一律
-用全局那台。`envcheck.ensure(..., maa_dir=, profile=)` 也跟着改，判断模拟器开没
-开、要不要替用户启动，看的都是这个号的那份配置。
+解析只有一处：`acctbind.dir_of(file)` / `acctbind.profile_of(file)` /
+`acctbind.addr_of(file)`。`skills._maa_dir_of(file)` / `_conn_of(file, d)` 都走它，
+所以唤醒、导航、战斗、培养、扫图、牛杂**每一项**都会连到「这个号自己那台模拟器」
+上，不再一律用全局那台。`envcheck.ensure(..., maa_dir=, profile=)` 也跟着改，
+判断模拟器开没开、要不要替用户启动，看的都是这个号的那份配置。
+
+**①b 地址钉死 + 客户端类型（2026-11-23 两个「不听命令」的根因）**
+
+用户报「明明指定 5554 挂活动，却会影响 5556 那台」和「启动账号不看 b 服还是官服」，
+查下来是两处独立的问题，都出在连接这一段：
+
+1. **地址兜底会偷偷换台**。`envcheck.adb_now` / `stagenav.Touch.ready` 原来都是
+   「档案地址连不上就挑 `adb devices` 里第一台在线的」。档案里写着过期的 5554、
+   实际开着 5556 时，任务就自己跑去连 5556——在用户看来就是「串台了」。
+   现在按**地址来源**决定能不能改主意（`skills.device_of`）：
+
+   | 来源 | 那台不在线时 |
+   |---|---|
+   | 聊天里点名 / 账号 `adbAddress` | **绝不自愈**，直接停下并列在线设备 |
+   | MAA 档案 `Address` | 只有一台在线才顶上（地址过期很常见，无歧义） |
+   | 都没写 | 一台在线用它；多台在线停下要用户指定 |
+
+   `skills.run_skill` 和 `_run_group` 起跑前都会先过这一层，把解析结果用
+   `_set_addr` 钉到线程上，`run_core` / `run_scatter` / `run_custom` 全按它连。
+2. **客户端类型没落到任务参数上**。这块踩了两次，一次比一次深，记清楚：
+
+   | 参数 | 认的是什么 | 写错的症状 |
+   |---|---|---|
+   | `AsstConnect(adb, address, config)` 第 4 个 | **模拟器连接配置名**（`General` / `LDPlayer` / `MuMuEmulator12`，就是 `resource/config.json` 里 `connection[].configName`） | 传 `Official` / `Bilibili` → `ConnectionInfo why=ConfigNotFound` + `ERR config  Official not found`，MAA 退回 `General` 才连上（能用，但每次先报一次错，且丢了模拟器专属的 adb 调优） |
+   | 任务参数 `StartUp.client_type` | **客户端类型**（`Official` / `Bilibili` / `YoStarJP`…） | 传成 `Official` → `am start -n com.hypergryph.arknights/...`，b 服账号去启动**官服包**、在官服账号列表里找 b 服昵称，表现就是「认成官服了」 |
+
+   两个参数长得像，**混一次就是一轮空跑**。现在的口径：
+
+   - `maaplan._conn_for(spec)`：`config` 只取档案的 `ConnectSettings.Config`
+     （空则 `General`），客户端类型放在 `conn['client']` 里只用于人话日志
+     （`连接 emulator-5556（b服）`）
+   - `maaplan.resolve_client(spec)`：客户端类型的**唯一判定入口**。优先级
+     `spec['clientType']`（`Bilibili` 或 `bilibili服` 都吃）> `spec['channel']`
+     > `spec['accountFile']` 里的 `account.channelName` > `Official`
+   - `maaplan.core_tasks` 用 `resolve_client` 填 `StartUp.client_type`
+
+   光有判定入口还不够——2026-11-23 用户第二次报「还是把我 b 服账号认成官服的」，
+   asst.log 实证 `append_task StartUp {"client_type": "Official"}`。根因是
+   `skill_fight` 建 spec 时只从 `skills._profile_kw()` 里取了 `profile`，同一份
+   字典里的 `clientType` 被丢掉了，`core_tasks` 拿不到只能兜底。现在 spec 统一
+   用 `skills._spec_kw(file)` 展开（`profile` + `clientType` + `adbAddress` +
+   `accountFile`），并且 `resolve_client` 最后那层能拿 `accountFile` 回查渠道，
+   **以后新加一条跑机入口漏传也不会再按官服跑**。
+
+设置界面对应「账号 → 模拟器」下拉（`/api/account/devices` 返回 `devices` 在线设备
++ `instances` 本机实例，没开的也列，否则那台关着时用户没得选），助手侧对应
+`bind_emulator` 工具——两边写的是同一个 `maa.adbAddress`，不靠谁记得传参。
 
 **② 分组：同模拟器串行，不同模拟器并行**
 
@@ -796,14 +845,44 @@ Engine）一切正常，两台同时跑就只有 5554 能动。
 - `backend/core/multiproc.py`：写 payload → `MAA-PRTS --skill-worker <payload>`
   （源码模式跑 `python backend/main.py --skill-worker ...`）→ tail 子进程的
   日志文件转发进任务日志 → 读回 `{results, report}`；
-- `backend/core/skillworker.py`：子进程入口，`kind` 分 `skill`（run_batch 一组）
-  和 `plan`（run_plan 一组），日志落到父进程指定的
-  `debug/tasks/<tid>-g<i>.log`，任务结束删 payload / 结果，日志留着排障；
+- `backend/core/skillworker.py`：子进程入口，`kind` 分 `skill`（run_batch 一组）、
+  `plan`（run_plan 一组）和 `one`（run_skill 单跑，见 ②e），日志落到父进程
+  指定的 `debug/tasks/<tid>-g<i>.log`，任务结束删 payload / 结果，日志留着排障；
 - `skills.run_batch` / `maaplan.run_plan` 在 `len(groups) > 1` 时全部走子进程；
-  单组仍就地跑（不起进程，省 1~2 秒，日志即时）。
+  单组仍就地跑（不起进程，省 1~2 秒，日志即时），**除非本进程已经有一路在跑**
+  （见 ②e）。
 
 冒烟 B52 里 `multiproc.run_group` 被换成「就地执行」——否则测试里的假 skill
 不会出现在子进程里，会真的去连模拟器。
+
+**②e 一路一个进程：后开的那路必须让位（2026-11-23）**
+
+用户报「我多开另一个号，他把我前面的停了」。两份日志对起来看：5556 那组
+12:59:50 开跑，13:01:37 另一个号**在同一个进程里**开了第二个 MaaCore，13 秒后
+5556 的 StartUp 链就自己「结束」了——`asst.log` 里只有 `Stop | block` 和
+`~Assistant`，没有 `TaskChainError`，上层看到的是 `TaskChainStopped`，于是就写成
+「已停止（你按了停止）」，用户当然以为是新任务把旧的停了。
+
+根因不在「停止」，在**同进程第二个实例**：`AsstSetUserDir` / `AsstLoadResource` /
+`AsstCreateEx` 动的是 MaaCore 的**进程级全局资源**，第二个实例一 open，
+第一个正在跑的链就被打断。err 231 那条（②b）只是它的另一种表现。
+
+落地成三件事：
+
+- `maacore.claim_inproc()` / `release_inproc()`：本进程「跑机名额」只有一个。
+  `skills.run_skill`、`skills.run_batch`（单组）、`maaplan.run_plan`（单台）开跑
+  前抢，抢不到就把这一路交给独立进程（`kind='one'` / `'skill'` / `'plan'`），
+  抢到的用 `try/finally` 还回去；
+- `maacore.Engine.open()` 兜底：本进程已经有活着的实例就直接抛
+  `EngineError`（「多开必须一路一个独立进程」），宁可这一路明着失败，也不许
+  把已经在跑的那一路拖死；
+- `Engine.stopped_by_user`：只有 `stop_live()`（点名停）会置位。超时收尾自己
+  调的 `eng.stop()` 不再冒充「你按了停止」——`run_core` 的 `timed_out` /
+  `paused='手动停止'` 都改看这个标记。顺带把「等了 %d 分钟」改成**实际耗时**
+  （以前打的是时间预算，跑两分钟也能写「等了 60 分钟」）。
+
+客户端这边也收紧了 `/api/run/stop`：既没 `file` 也没 `all=true` 直接回错误，
+不再默认全停——右栏那个按钮没选中账号时就是这种情况。
 
 **②c 官服 / b 服是两个包（2026-11-22）**
 
@@ -887,8 +966,9 @@ tab 里」。
   钉在组上，`_conn_of` / `_addr_kw` 都读它
 - `stagenav.Touch(strict=...)`：指定过地址的号，adb 自检连不上就**报错**，
   不再「自动换第一台在线设备」——换了等于两组同时戳一台，另一台一动不动
-- `envcheck.ensure(address=...)`：多开时只查点名那台在不在线，不在就直说，
-  不会去启动档案里那台
+- `envcheck.ensure(address=...)`：多开时按点名那台的**实例序号**启动它（不在线
+  就拉起这一台，只等这一台上线），绝不换成档案里那台；见「开跑前的环境闸 →
+  多开：启动哪一台由地址说了算」
 
 **④ 领奖 skill（`skill_claim`）**
 
@@ -923,9 +1003,21 @@ skill_claim({'account': ..., 'stage': 'OS', 'wakeup': False})
   于是关卡列表 / 主页的红色角标也能凑够数，真机日志里冒出过一次假弹窗。
   换模板后主页 0.0、其余页面 85 分以上。打包漏了模板才退回
   `_bar_bytes()`：按「左半很暗 + 右半偏红」的色彩签名找按钮条（`_BAR_*`）。
-- **`to_home(touch, log)`**：每轮先看一帧 → 主页就停；认到确认框就点「✓」
-  （返回键对这个弹窗无效）；剧情页跳幕；否则前 3 轮返回键、再 3 轮 ESC、最后点左上
-  「<」。`eventnav._to_home` 已改成直接调它。
+- **`to_home(touch, log)`**：每轮先看一帧 → 主页就停；认到**退出确认**就点左
+  边「✕」并直接当到家（见下条）；认到基建确认框就点「✓」（返回键对这个弹窗
+  无效）；剧情页跳幕；否则前 3 轮返回键、再 3 轮 ESC、最后点左上「<」。
+  `eventnav._to_home` 已改成直接调它。
+- **「是否确认退出游戏？」必须点 ✕，不能当基建框点 ✓**（2026-11-23 用户报障：
+  「S 关入口没认出来 → 一路按 ESC → 主界面也没认出来 → 停在退出确认 →
+  继续按 ESC，游戏直接退出了」）。两种弹窗**按钮条一模一样**（左 ✕ 右 ✓），
+  但点 ✓ 就是替用户退出游戏。区分靠**背后亮不亮**：退出确认只在主界面弹，
+  背后是模糊掉的主界面，按钮条上方（0.10~0.26 屏高）平均亮度 125~155；基建
+  确认背后是基地，是暗的。判据 `exit_confirm_bytes()` = 按钮条命中 **且**
+  该段亮度 ≥ `_EXIT_LUM`(100)，认到返回左半「✕」的坐标（0.3464, 0.6870）。
+  阈值故意压低：把基建框误认成退出框只会少退一层（✕ 是无害的取消），反过来
+  就是把游戏关掉。`to_home` 点完 ✕ **直接 return True**（这个框只在主界面弹，
+  取消完必然还在家），不再补返回/ESC 把它弹回来；`stagenav` 那条回主页的老
+  循环（曲谱导航前）也加了同一道闸。
 
 
 ## 当期活动导航（`eventnav.py`，2026-11-19 / 2026-11-22 改）
@@ -1160,6 +1252,36 @@ ex 16 分、s 12.5 分、reward 17.5 分、claim 21~23 分，全都压着阈值 
 **已知限制**：理智不足时「开始行动」点不动（弹理智不足框），`open_stage` 会
 返回「点开始后没进到编队界面」并按关跳过；用户要自己补理智或勾吃药。
 
+### 停止：必须能按账号点名（2026-11-23）
+
+用户原话：「停止的话不能指定停止，会一起停其他任务」。他让停 b 服那个号，
+结果两台模拟器一起断，官服那轮正在打的关白烧。以前只有 `stop_all_live()`
+一个全停入口，现在按账号筛：
+
+| 停什么 | 在哪 | 怎么筛 |
+|---|---|---|
+| 本进程里的 MaaCore 实例 | `maacore.stop_live(owners)` | `Engine.owner` 是账号文件名，比较走 `maacore.owner_match`（忽略 `.json`、认昵称） |
+| 多开时的独立子进程 | `multiproc.stop_groups(owners)` | `_RUNNING` 注册表按这一组的 `files` 匹配，命中就 `proc.kill()` |
+| MAA 本体（跑 GUI 任务队列那条老路） | `maa.close(dir)` | 只在**全停**时做 |
+
+```python
+skills.stop_accounts(['示例昵称#0384 bilibili服.json'])   # → {'engines':1,'processes':0,'stopped':1}
+skills.stop_accounts()                                    # 全停
+skills.match_accounts('b服那个')                           # 名字 → 文件名，对上多个直接报错
+```
+
+- `skills.match_accounts`：完全相等的优先（文件名 / 昵称 / 别名），子串命中
+  **只允许唯一**。守住这条是因为停止是破坏性操作——用户说「停灰」，把三个
+  「灰」开头的号全停了比多问一句亏得多。
+- 子进程被 kill 的那一组，`multiproc.run_group` 返回的第三个值是 `True`，
+  调用方按「你手动停了这一组」记账（`stopped=True`），不记「子进程异常」。
+- `Engine.stop()` 会置 `self.stopped`，已停过的实例不会再被重复计数，
+  所以工具返回的 `engines` 就是「这次实际停了几路」。
+- 入口三处共用同一套：agent 的 `stop_run(account=...)`、
+  `/api/run/stop`（body `{file}` 或 `{all:true}`）、界面右栏「停止」按钮
+  （只传当前账号）。返回里带 `accounts / engines / processes`，**说话照它说**，
+  别把「停了一个号」讲成「都停了」。
+
 ## MAA 小工具（牛杂，`maatools.py`，2026-11-19）
 
 MAA GUI 的「小工具 → 牛杂」里那些按钮**不在一键长草队列里**，但 MaaCore
@@ -1261,7 +1383,7 @@ MaaCore v6.20+ 有个 `OperProgress` 任务（GUI 里叫「干员培养」），
 清一色 `AttributeError: 'str' object has no attribute 'get'`。
 
 根因不在 skill，在 `accounts.list_accounts`：培养暂停时 `skills._save_train_plan`
-把 `config/train-plan.json` 落盘，里面 `"account": "灰bao#7986 官服.json"` 是
+把 `config/train-plan.json` 落盘，里面 `"account": "abc示例#7986 官服.json"` 是
 **文件名字符串**；账号扫描把这个文件当账号读，`(snap.get('account') or {}).get('uid')`
 撞上字符串 → 整个账号列表抛异常。所有 skill 开跑第一句都是 `_account_file('')`
 → 全部一起挂。这也解释了「突然」：文件是**上一次培养暂停时才生成**的，
@@ -1417,7 +1539,7 @@ core_tasks 的 Copilot 分支要求 spec['copilotList'] 非空否则 continue；
    `search_stages` 返回补 `prefix` / `activity`（EVENTS 反查），SYSTEM 硬规矩
    加「活动代号一律查，不许凭记忆换算（孤星=CW，覆潮之下=SV，愚人号=SN）」。
 
-真机验证（dev 环境、灰bao 官服、游戏停在主界面）：
+真机验证（dev 环境、abc示例 官服、游戏停在主界面）：
 `POST /api/skill/run {"skill":"navigate","params":{"stage":"孤星"}}` →
 `「孤星」→ CW-1（孤星（29 关））` → 走曲谱 → 第 9 屏命中（1.5 分）→ 进图，
 落图确认是孤星关卡地图（CW-1/CW-2/CW-ST-1 + 右下三个区域）。全程约 2.5 分钟。
@@ -1474,7 +1596,7 @@ break，循环后再调一次 `really_home()`——两次之间隔着几百毫�
 好端端在主界面（2026-11-18 RI 实测踩到）。现在循环结果存进 `home`，不成立时
 等 1.2 秒再复核一次。
 
-真机复验（dev 环境、灰bao 官服）：
+真机复验（dev 环境、abc示例 官服）：
 `RI-1` → 第 13 屏命中 4.4 分 → 进图；`IW-1` → 第 8 屏命中 2.6 分 → 进图
 （重裁模板前是翻到底 17.9 分 FAIL）；`CV-1`（靠底部）第 15 屏命中 1.1 分 →
 进图，全程 2 分 36 秒。走缓存的第二次 `RI-1`：回顶 → 直接翻到第 12 屏 → 第 14 屏
@@ -1733,6 +1855,37 @@ MaaCore 只会报 `adb 连不上`，用户第一反应是程序坏了。放一�
 （`wait` 参数可覆盖），期间每 15 秒往日志写一句进度。真机实测雷电 14
 从冷启动到 `emulator-5554 device` 是 **20.7 秒**。
 
+### 多开：启动哪一台由**地址**说了算（2026-11-23）
+
+用户报「只能帮我启动 5554 的模拟器，启动不了 5556 的」。两个洞叠在一起：
+
+1. 实例号取自 MAA 档案的 `InstanceIndex`，而多开用户那八份档案几乎全写 0
+   → 不管要哪台，`launch --index 0` 永远拉起第一个实例；
+2. `ensure(address=...)` 只查不启：目标不在线就回一句「先把它开起来再重跑」，
+   等于把「第二个实例没开」当成用户填错了地址。
+
+现在 `read_config(..., address=...)` 会把序号按地址反查出来（`indexFrom='地址'`，
+**压过**档案）：
+
+```
+ldconsole adb --index N --command get-serialno
+  → emulator-5554            （实例开着：回序列号）
+  → error: device 'emulator-5558' not found   （没开：错误行里也带序列号）
+```
+
+拿 `list2` 的每个序号跑一遍，`序列号 == 地址`（或 `地址端口 == 序列号端口` 或
+`== 序列号端口 + 1`，`emulator-5556` 与 `127.0.0.1:5557` 是同一台）就是那台。
+序号在本机 `list2` 里**不存在**时返回 `(None, '')`——宁可不启动，也不去拉
+一台不存在的实例。MuMu 之类没有反查手段的返回 `None`，走老口径「只检查、
+不代启动」。
+
+启动后 `wait_ready(..., wants=[地址, 序列号])` **只等这几台**：以前是「有任意
+一台在线就算通」，多开时第一台一响就往下跑，最后连到错的那台。
+
+配合 `skills.device_of` 的改动：钉死/点名的地址不在线时**不换台**，原样返回
+那个地址（交给 `ensure` 去启动它），只有档案地址（没钉过）才有「单台在线就
+顶上」的老兜底。
+
 ### 日志口径（用户要的「不显示出来」）
 
 | 情况 | 日志 | 返回值 |
@@ -1859,16 +2012,39 @@ MAA 的 `gui.new.json` 里 `ConnectSettings` 抄（MuMu→`mumu`+Extras 快速�
 
 ## 定时任务（`scheduler.py`，2026-11-22）
 
-设置里的「定时任务」页：到点启动外部程序，支持链式启动。只做「把用户的脚本
-按时拉起来」这一件事——`autostart-*.exe`、`OneDragon-Launcher.exe`、cmd
-批处理这类现成脚本都能原样填进来（程序 + 参数照抄）。
+设置里的「定时任务」页：到点启动外部程序，支持链式启动。只做「把用户的程序
+按时拉起来」这一件事——挂机脚本、模拟器启动器、别的游戏的自动化工具、cmd
+批处理都能原样填进来（程序 + 参数照抄）。
 
 | 概念 | 实现 |
 |---|---|
 | 触发 | `mode=time`：`weekdays`（1=周一…7=周日）+ `time`（HH:MM）；`mode=chain`：接在上一条后面 |
 | 动作 | 启动一个程序（exe / bat / cmd）。bat/cmd 走 `cmd /d /c "<整条命令行>"`，路径带空格也不会拆错 |
+| 预设 | `preset`：`custom` / `self` / `maa` / 其它游戏，只决定「先试哪几个 exe 名」和默认参数 |
 | 冲突 | 同一时刻只跑一个：`conflict=stop` 停掉在跑的，`skip` 跳过本次 |
 | 链式失败 | `onChainFail=continue` 继续下一个，`stop` 停掉整条链 |
+
+### 程序预设（2026-11-23）
+
+预设解决「别让用户自己去找 exe 在哪」，但不写死路径——各家装在哪差别太大，
+猜错比不猜更烦人。预设只给 `exes`（按文件名去常见位置找）和 `args`（参数栏
+留空时的兜底）：找到就回填，找不到让用户点「浏览」。
+
+| id | 名称 | 怎么找 |
+|---|---|---|
+| `custom` | 自定义程序 | 不猜，必须自己填 |
+| `self` | MAA-PRTS 本体 | 打包＝本进程 exe；源码＝同一个 python + `backend/main.py` |
+| `maa` | MAA 官方客户端 | 设置里的 `maaDir` → `maaDirs` 历史 → 正在跑的 MAA 进程 → 扫盘 |
+| `bettergi` / `onedragon` / `okww` / `maaend` / `m9a` / `mfaa` | 原神 / 绝区零 / 鸣潮 / 终末地 / 重返未来 / MFA | 按 `exes` 名扫盘（限深 2 层、限时 1.5 秒、跳过系统目录） |
+
+- **预设只是「猜」，不是「覆盖」**：`resolve()` 只补空的 `program` / `args` /
+  `cwd`，用户填了的一律不动；任务里 `program` 空着也能存，跑的时候按预设再
+  找一次（换机器、挪目录都不用改任务）。
+- **想加自己的预设**：`config/schedule-presets.json` 写
+  `[{"id": "xx", "name": "显示名", "exes": ["xx.exe"], "args": "--foo"}]`，
+  同 id 覆盖内置那条，不用改代码。
+- **探测结果缓存 5 分钟**（`_scan_cache`）：界面每次打开对话框不必重扫全盘；
+  要强制重找用 `detect(id, refresh=True)` 或 `/api/schedule/detect?id=xx&refresh=1`。
 
 几个踩过的点：
 
@@ -1886,8 +2062,9 @@ MAA 的 `gui.new.json` 里 `ConnectSettings` 抄（MuMu→`mumu`+Extras 快速�
   `events`（带 seq，同一个事件不会弹两遍）。
 
 接口：`/api/schedule/status`（`?since=<seq>` 拿增量事件）、`/api/schedule/save`
-（整表）、`/api/schedule/run`、`/api/schedule/stop`。以后让 agent 帮用户写
-定时，直接调这四个就行，不需要另开一套。
+（整表）、`/api/schedule/run`、`/api/schedule/stop`、`/api/schedule/presets`
+（预设表）、`/api/schedule/detect`（选预设时回填 program/args/cwd）。以后让
+agent 帮用户写定时，直接调这些就行，不需要另开一套。
 
 线程在 `main()` 里起（`scheduler.start()`：tick + worker 两个守护线程），
 起不来只记一行警告，不影响主流程。
