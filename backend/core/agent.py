@@ -357,6 +357,12 @@ TOOLS = [
                                     '（如 157****3635）；B 服填游戏内用户名。'
                                     '缺的时候要问用户，**原样传**，别自己拼格式'},
            'limitStages': {'type': 'integer', 'description': '最多挂几关，默认 8'},
+           'raid': {'type': 'string', 'enum': ['normal', 'raid', 'both'],
+                    'description': '抄作业的难度，**照用户原话传**：说「突袭」→ '
+                                   '必须显式传 raid；说「普通」→ normal；说'
+                                   '「都要」→ both。**省略 = 只打普通**。'
+                                   '要突袭却漏了这个参数，排下去的就是普通'
+                                   '（2026-11-23 用户报过这个）'},
            'profile': {'type': 'string',
                        'description': '档案名后缀，比如「活动-时间啊向前」。不给就自动起名'},
            'start': {'type': 'boolean', 'description': '写完是否立刻启动，默认 true'}},
@@ -371,15 +377,34 @@ TOOLS = [
            'accountName': {'type': 'string',
                            'description': '用户给的尾号/切号名，**原样传**，别自己拼格式'}},
           ['accountName']),
+    _tool('bind_emulator',
+          '**把账号钉到某台模拟器**：用户说「这个号用第二台 / 用 5556 / 别和'
+          '那个号挤一台」时调用。存进那个账号的设置（设置 → 账号 → 模拟器），'
+          '以后每次跑机都连这一台，不靠聊天里临时指定——助手忘一次就不会串。'
+          '只改本程序自己的账号配置，不动 MAA。',
+          {'account': _ACC,
+           'address': {'type': 'string',
+                       'description': 'adb 地址，如 emulator-5556 或 127.0.0.1:16384'}},
+          ['account', 'address']),
     _tool('list_profiles',
           '看 MAA 里现在有哪些配置档案、当前用的是哪个、各自挂了几个作业。'
           '用户问「现在跑的是哪个号」时用它。'),
     _tool('stop_run',
-          '停掉正在跑的 MAA（关进程）。用户说「停下来」时用。',
-          {'maa_dir': {'type': 'string', 'description': '留空用默认目录'}}),
+          '停挂机。**指定账号就只停那一个号**（account 传昵称或文件名，'
+          '如「示例昵称#0384」「b服那个」），不传才全部停。用户说'
+          '「停 b 服」「停那个号」时必须带 account，别把别人正在打的关一起砍了。',
+          {'account': {'type': 'string',
+                       'description': '要停哪个账号（昵称 / 文件名都行）；'
+                                      '留空=全停'},
+           'maa_dir': {'type': 'string', 'description': '留空用默认目录'}}),
     _tool('add_stages',
           '给**一个**账号挂一组关卡的快捷方式（等价于 mode=copy 的 build_run）。',
           {'account': _ACC, 'keyword': _STAGE,
+           'raid': {'type': 'string', 'enum': ['normal', 'raid', 'both'],
+                    'description': '难度，**照用户原话传**：说「突袭」→ raid，'
+                                   '「普通」→ normal，「都要」→ both；省略=只写'
+                                   '普通行。要突袭却没有突袭作业的关会被跳过并'
+                                   '在 raidMissing 里列出来'},
            'start': {'type': 'boolean', 'description': '写完是否立刻启动，默认 true'}},
           ['keyword']),
     # ---- 挂关 skill 化（2026-11-17）：唤醒 / 导航 / 剧情 / 战斗 / 签到 / 周目 ----
@@ -418,20 +443,27 @@ TOOLS = [
           '**默认不唤醒不导航**——界面在哪就从哪直接开打；'
           '用户还在主界面 / 游戏没开时要先 skill_navigate 或 skill_wakeup，'
           '或传 wakeup=true 走全套。**调用前先跟用户确认要打哪些关**。'
-          '**每关只打要打的那一档**：EX 关默认只打突袭；普通还没通关、要一次'
-          '打通就写 stages=["SV-EX-1@both"]；只刷材料写 @normal 或 raid="normal"。'
+          '**难度必须显式说**：不传 raid、也不带 @ 后缀 = **只打普通**（跟着'
+          '用户原话走，别自动升级）。要突袭就写 raid="raid" 或 '
+          'stages=["SV-EX-1@raid"]；普通还没通关、要一次打通写 @both。'
+          '用户说「打突袭」时**漏了这两个字段，实际排下去的就是普通**——'
+          '2026-11-23 用户报「说突袭、两个号导入的都是普通 EX-8」就是这么来的。'
           '**用户点名某份作业（「用 41624」「换成令的单核」）时必须用 ops 传 '
           'copilotId**，光说"已经换了"没用——不传 ops 就会重新搜索挑回同一份。'
-          '每关会自动准备 2~3 份备选作业：某一关打不过就换下一份重挂这一关'
-          '（从卡住的那关往后重排，前面的关不再重打）。'
+          '每关会自动准备 2~3 份备选作业：某一关打不过（比如只打 2 星）就'
+          '**先回关卡菜单、再只换那一关的作业重挂**，后面的关照原样继续；'
+          '这关没有别的作业就同一份再试一次。前面已打完的关不会重打。'
+          '翻车重挂是自动的，别让用户自己再喊一遍。'
           '**日志只报「跑到哪一关」和任务链成败**——MAA 不提供逐关结果，'
           '别对用户说「成功几关」。'
           '返回 taskId。',
           {'stages': {'type': 'array', 'items': {'type': 'string'},
                       'description': '关卡代号，可加 @ 后缀逐关指定难度：'
-                                     '"SV-EX-1@raid" 只打突袭（默认）、'
+                                     '"SV-EX-1@raid" 只打突袭、'
                                      '"SV-EX-1@both" 普通+突袭、'
-                                     '"SV-EX-1@normal" 只打普通。不带后缀走 raid 参数'},
+                                     '"SV-EX-1@normal" 只打普通。**不带后缀'
+                                     '就走 raid 参数，而 raid 不传只打普通**：'
+                                     '用户说突袭就必须写 @raid 或传 raid="raid"'},
            'mode': {'type': 'string', 'enum': ['copy', 'fight']},
            'wakeup': {'type': 'boolean',
                       'description': 'true=连唤醒+导航一起跑（默认 false 直跑）'},
@@ -440,12 +472,16 @@ TOOLS = [
                                          'true=把前置关也补进计划（补进来的只打普通）'
                                          '。用户说「S-3 点不开/没解锁，把前置一起补」'
                                          '时才传 true，别自己默认补'},
-           'raid': {'type': 'string', 'enum': ['auto', 'both', 'normal'],
-                    'description': '没写 @ 后缀的关怎么打：auto（默认）=有突袭'
-                                   '作业就只打突袭；both=普通+突袭都打（普通还没'
-                                   '通关时用）；normal=只打普通（刷材料）。复刻活动'
-                                   '用户说去年打过、不要突袭时传 normal。主线'
-                                   '磨难/险地不是突袭，不受这个参数影响'},
+           'raid': {'type': 'string', 'enum': ['normal', 'raid', 'both'],
+                    'description': '难度档位，**照用户原话传**：'
+                                   '用户说「突袭/突袭模式」→ 必须显式传 raid；'
+                                   '说「普通」→ normal；说「普通和突袭都打」'
+                                   '→ both。**省略 = 只打普通**（不是突袭，'
+                                   '也不是自动）。**绝不许因为「EX 关」「复刻'
+                                   '活动」「一般都要打突袭」之类理由替用户升级'
+                                   '或降级**——2026-11-23 用户投诉过一次说普通'
+                                   '排成突袭、一次说突袭结果排成普通。'
+                                   '主线磨难/险地不是突袭，不受影响'},
            'ops': {'type': 'array',
                    'description': '指定用哪一份作业（用户点名「用 41624 那份」'
                                   '「换成令的单核」时**必须**传，否则每次都重新'
@@ -459,7 +495,9 @@ TOOLS = [
                                                'description': '作业 id'},
                                  'raid': {'type': 'string',
                                           'enum': ['raid', 'normal', 'both'],
-                                          'description': '这关打哪档，默认 raid'}},
+                                          'description': '这关打哪档；不写就按'
+                                                         ' skill_fight 的 raid '
+                                                         '参数（默认只打普通）'}},
                              'required': ['stage', 'copilotId']}},
            'account': _ACC}, ['stages']),
     _tool('skill_weekly',
@@ -518,8 +556,9 @@ TOOLS = [
     _tool('skill_sweep',
           '**一键扫图**：把一个活动按「普通关 → EX 普通 → EX 突袭 → S 关」'
           '逐段挂完。段与段之间会自己重新导航（EX / S 是活动地图里不同的分区，'
-          '不导航 MAA 认不出关卡名）。每关打不过会自动换一份作业重挂这一关'
-          '（从卡住的那关往后重排），日志报「跑到哪几关 + 卡在哪 + 为什么」。'
+          '不导航 MAA 认不出关卡名）。**S 段只打普通**——活动 S 突袭没有奖励。'
+          '每关打不过会自动回关卡菜单、只换那一关'
+          '的作业重挂（没候选就同一份再试），日志报「跑到哪几关 + 卡在哪 + 为什么」。'
           '用户说「把这个活动从头打到尾」「EX 和 S 都帮我清了」时用它。'
           '**调用前先跟用户确认：哪个活动、哪个号、要不要打突袭**。返回 taskId。',
           {'stage': _STAGE,
@@ -592,15 +631,27 @@ TOOLS = [
                                                             'fight / skip_story / '
                                                             'sweep / tool / claim / '
                                                             'weekly / train / signin'},
+                                   'assumeStageList': {
+                                       'type': 'boolean',
+                                       'description': '仅 fight：用户明确说'
+                                                      '「我已经在关卡列表了」'
+                                                      '才传 true（直跑，不导航）'},
+                                   'noSwitch': {
+                                       'type': 'boolean',
+                                       'description': '仅 fight：用户明确说'
+                                                      '「不要切号，直接开始」'
+                                                      '才传 true（直跑，不导航）'},
                                },
                                'required': ['skill']}},
            'names': {'type': 'object',
                      'description': '{账号文件名: 切号名}（缺的才要问用户）'},
            'emulators': {'type': 'object',
                          'description': '{账号文件名或昵称: adb 地址}，'
-                                        '如 {"灰bao#0384 bilibili服": '
-                                        '"emulator-5556"}。用户说「这个号用'
-                                        '第二台」时传；不传按账号绑的 MAA 档案连'}},
+                                        '如 {"abc示例#0384 bilibili服": '
+                                        '"emulator-5556"}。**只覆盖这一次**；'
+                                        '用户说「这个号固定用第二台」时应该先'
+                                        '调 bind_emulator 钉进账号，别指望每次'
+                                        '都记得传这个参数'}},
           ['steps']),
 ]
 
@@ -618,6 +669,22 @@ MODE_DESC = {
     'daily': '日常一条龙（公招 / 基建 / 领奖）',
     'daily_copy': '日常一条龙 + 抄作业',
 }
+
+
+def _variant_arg(raw):
+    """raid 参数归一：``'raid'/'突袭'`` → raid，``'both'`` → both，
+    ``'normal'`` / 空 → normal / 不筛
+
+    用户说的是中文还是英文都收，别让「突袭」两个字在参数里变成普通。
+    """
+    v = str(raw or '').strip().lower()
+    if v in ('raid', '突袭', 'only', 'onlyraid'):
+        return 'raid'
+    if v in ('both', 'all', '都要'):
+        return 'both'
+    if v:
+        return 'normal'
+    return ''
 
 
 def _stage_rows(keyword, account=None):
@@ -673,12 +740,17 @@ def _tool_list_accounts(args):
         except Exception:
             d = ''
         addr = ''
+        pinned = ''
+        try:
+            pinned = acctbind.addr_of(c['file'])
+        except Exception:
+            pinned = ''
         try:
             from . import maaplan
-            addr = maaplan._connection(d, acctbind.profile_of(c['file'])
-                                       or None).get('address') or ''
+            addr = pinned or (maaplan._connection(d, acctbind.profile_of(c['file'])
+                                                  or None).get('address') or '')
         except Exception:
-            addr = ''
+            addr = pinned
         p = c.get('progress') or {}
         out.append({
             # 账号列表给的是 nickName / alias / channelName，没有 name / channel
@@ -700,6 +772,9 @@ def _tool_list_accounts(args):
             # 排队切号，不同的会同时跑（见 skills.run_batch / maaplan.run_plan）
             'maaDir': d,
             'emulator': addr,
+            # true = 这个号在设置里钉过模拟器（钉过的地址绝不自动换，
+            # 没钉的才可能按档案 / 在线设备去猜）
+            'emulatorPinned': bool(pinned),
             # 字段名对齐 progress.summary()：mainRemaining / activityLeft /
             # activityStages 才是真名（曾经写成 mainLeft / activityZones，
             # 结果每个账号都返回 null，模型只能挨个再问一遍 account_progress）
@@ -782,6 +857,50 @@ def _tool_set_account_name(args):
                     '没改 MAA 里任何配置' % (row.get('nickName') or file)}
 
 
+def _tool_bind_emulator(args):
+    """把账号钉到某台模拟器：写账号 json 的 ``maa.adbAddress``
+
+    为什么要有这一步（2026-11-23 用户报「又忘了实例控制」）：之前「哪个号
+    用哪台」只在聊天里说一次，助手下一轮就忘了，两个号挤一台；MAA 里八份
+    档案又全写 ``emulator-5554``，档案本身分不出来。钉进账号以后，任何跑机
+    入口（skill / run_steps / 界面按钮）都读同一份，忘不忘都不影响。
+    """
+    addr, why = acctbind.check_addr(args.get('address') or '')
+    if why:
+        return {'error': why}
+    if not addr:
+        return {'error': '没给模拟器地址（emulator-5554 / 127.0.0.1:16384）'}
+    rows = [c for c in accounts.list_accounts()
+            if (c.get('game') or 'arknights') == 'arknights']
+    if not rows:
+        return {'error': '左侧还没有明日方舟账号'}
+    want = str(args.get('account') or '').strip()
+    file = ''
+    if want:
+        for c in rows:
+            if want in (c['file'], c.get('nickName') or '', c.get('alias') or ''):
+                file = c['file']
+                break
+        if not file:
+            return {'error': '找不到账号：%s' % want,
+                    'accounts': [{'file': c['file'], 'name': c.get('nickName')}
+                                 for c in rows],
+                    'hint': '按 list_accounts 的 file 或昵称再传一次'}
+    elif len(rows) == 1:
+        file = rows[0]['file']
+    else:
+        return {'need_info': 'account',
+                'accounts': [{'file': c['file'], 'name': c.get('nickName')}
+                             for c in rows],
+                'note': '有多个账号，问用户这个模拟器是给哪个号的'}
+    accounts.save_maa_meta(file, {'adbAddress': addr})
+    row = next((c for c in rows if c['file'] == file), {})
+    return {'ok': True, 'account': file,
+            'name': row.get('nickName') or file, 'address': addr,
+            'note': '已钉进「设置 → 账号 → %s 的模拟器」，以后跑这个号只连 %s；'
+                    '没改 MAA 里任何配置' % (row.get('nickName') or file, addr)}
+
+
 def _tool_list_activities(args):
     n = max(1, min(40, int(args.get('limit') or 12)))
     rows = resources.activity_list(n) or []
@@ -802,7 +921,9 @@ def _tool_list_activities(args):
                                   'OS-S-1。reprint=true 的是**复刻活动**：用户要刷'
                                   '它的 EX / S 时，先问「要不要连突袭一起打」和'
                                   '「去年打过吗」——去年打过的话突袭没有首通奖励，'
-                                  '默认只排普通（@normal）')
+                                  '按用户的说法传 raid；**这条只影响排单难度，'
+                                  '不代表某关没有突袭，也不许据此推断**。'
+                                  'S 关和 EX 关一样都有普通+突袭两档')
     except Exception:
         pass
     return out
@@ -1013,20 +1134,46 @@ def _tool_add_stages(args, session=None):
     acc = args.get('account') or _default_account()
     if not acc:
         return {'error': '还没有账号'}
+    raid = _variant_arg(args.get('raid'))
     res = _stage_rows(kw, acc)
-    items, skipped = [], []
+    items, skipped, raid_missing = [], [], []
+    seen_code, seen_key = set(), set()
     for packed in (res.get('stages') or []):
         st = packed.get('stage') or {}
+        code = st.get('code')
+        variant = st.get('variant') or 'normal'
+        if code:
+            seen_code.add(code)
+        # 用户点名要突袭：只收突袭行。**不许拿普通行顶上**——「说要突袭、导入
+        # 的却是普通 EX-8」就是这么来的（2026-11-23 用户报障）。
+        if raid == 'raid' and variant != 'raid':
+            continue
+        if raid == 'normal' and variant == 'raid':
+            continue
+        # 同一关的普通/突袭两行只写一条；要 both 就两行都留
+        key = (code, variant) if raid == 'both' else code
+        if code and key in seen_key:
+            continue
         best = next((o for o in (packed.get('ops') or [])
                      if o.get('mode') != 'blocked'), None)
         if not best:
-            skipped.append(st.get('code'))
+            if raid in ('raid', 'both') and variant == 'raid':
+                raid_missing.append(code)
+            skipped.append(code)
             continue
+        seen_key.add(key)
         items.append({'copilotId': best.get('copilotId'),
-                      'stageCode': st.get('code'), 'title': best.get('title'),
-                      'variant': st.get('variant'), 'name': st.get('code')})
+                      'stageCode': code, 'title': best.get('title'),
+                      'variant': variant, 'name': code})
+    if raid == 'raid':
+        # 这些关有普通版、但压根没有突袭行 → 用户要的那一档排不出来
+        raid_missing += [c for c in sorted(seen_code - {i['stageCode'] for i in items})
+                         if c and c not in raid_missing]
     if not items:
-        return {'error': '这份关键词下没有能打的作业', 'skipped': skipped}
+        return {'error': '这份关键词下没有能打的作业', 'skipped': skipped,
+                'raidMissing': raid_missing,
+                'note': ('要求突袭，但这几关只有普通作业（或突袭作业缺干员），'
+                         '没有偷偷用普通顶上' if raid_missing else '')}
     start = args.get('start')
     start = True if start is None else bool(start)
     summary = '给「%s」挂 %d 关：%s\n（会替换 MAA 里现有的作业列表，原来的会被清掉）' % (
@@ -1039,8 +1186,16 @@ def _tool_add_stages(args, session=None):
                           auto_start=start,
                           maa_dir=(accounts.get_account(acc).get('maa') or {}).get('dir') or None,
                           account=acc)   # 带上账号：写盘时做干员替换（#92）
-    return {'started': True, 'taskId': tid, 'count': len(items),
-            'skipped': skipped, 'note': '已提交写入 MAA，不要在这里等它跑完'}
+    out = {'started': True, 'taskId': tid, 'count': len(items),
+           'difficulties': {i['stageCode']: ('突袭' if i.get('variant') == 'raid'
+                                             else '普通') for i in items},
+           'skipped': skipped,
+           'note': '已提交写入 MAA，不要在这里等它跑完'}
+    if raid_missing:
+        out['raidMissing'] = raid_missing
+        out['note'] += ('；这几关要的是突袭，但作业站只有普通（或突袭作业缺'
+                        '干员），没有偷偷用普通顶上——照实告诉用户')
+    return out
 
 
 def _tool_maa_capabilities(args, session=None):
@@ -1077,21 +1232,50 @@ def _tool_list_profiles(args, session=None):
 
 
 def _tool_stop_run(args, session=None):
-    watch.stop_all()
+    """停挂机：点名了账号就只停那一路，没点名才全停
+
+    2026-11-23 用户报障：「停止的话不能指定停止，会一起停其他任务」。他让停
+    b 服那个号，结果两台模拟器一起断，官服正在打的关白烧。现在按账号停：
+    本进程里的 MaaCore 实例（``stop_live``）+ 多开时的独立子进程
+    （``stop_groups``）都按账号筛，别的路继续跑。
+    """
+    from . import skills
+    want = str(args.get('account') or '').strip()
+    files = []
+    if want and want.lower() not in ('all', '全部', '所有', '*'):
+        try:
+            files = skills.match_accounts(want)
+        except ValueError as e:
+            # 「对上多个账号」是用户/模型给的信息不够，不是程序 bug：
+            # 别让外层包成「内部错误」，直接把候选列表回给模型去问
+            return {'error': str(e), 'need_info': 'account',
+                    'candidates': [{'file': r['file'],
+                                    'nickName': r.get('nickName') or ''}
+                                   for r in accounts.list_accounts()
+                                   if want.lower() in (r.get('nickName') or r['file']).lower()]}
+    res = skills.stop_accounts(files)
     d = args.get('maa_dir') or None
-    # 直连跑的时候机器上没有 MAA 进程，光关进程是关不掉的，得让引擎自己 AsstStop
-    from . import maacore
-    n = maacore.stop_all_live()
-    ok = maa.close(d)
-    return {'stopped': bool(ok) or bool(n),
-            'engines': n,
-            'note': '已经停下。没跑完的关卡不会自己续上，下次要重挂。'}
+    if not files:
+        # 全停才动 MAA 本体（那是「跑 MAA 自己的任务队列」那条路）
+        watch.stop_all()
+        try:
+            res['maaClosed'] = bool(maa.close(d))
+        except Exception:
+            res['maaClosed'] = False
+    res['stopped'] = bool(res.get('stopped')) or bool(res.get('maaClosed'))
+    if files:
+        res['note'] = ('停了 %s 这一路（引擎 %d / 子进程 %d），别的账号没动。'
+                       '没跑完的关不会自己续上，下次要重挂。'
+                       % ('、'.join(files), res['engines'], res['processes']))
+    else:
+        res['note'] = '全停了。没跑完的关卡不会自己续上，下次要重挂。'
+    return res
 
 
 # 官服「账号管理器」里显示的条目是打码手机号：181****5505。MAA 切号就是拿
 # AccountName 去 OCR 全匹配这一行，写昵称永远匹配不到 —— 表现是 select_account
 # 死循环几十次、最后 "Account switch failed after restart"（2026-11-17 实测，
-# 档案 moren 里 AccountName 存的是昵称「小卡拉帕鲁灰」，跑了 4 分钟没进去）。
+# 档案 moren 里 AccountName 存的是昵称，跑了 4 分钟没进去）。
 # B 服显示的是游戏内用户名，昵称才是对的。
 #
 # 但「必须 3+4 星+4」是错的：MAA 是子串匹配，官方说明写的是「可输入
@@ -1207,6 +1391,10 @@ def _tool_build_run(args, session=None):
     start = args.get('start')
     start = True if start is None else bool(start)
     limit = max(1, min(20, int(args.get('limitStages') or 8)))
+    # 难度：用户说突袭就只排突袭行（以前这个工具压根没这个参数，永远取每关
+    # 第一行=普通——2026-11-23「说突袭、导入的都是普通 EX-8」就是这条）
+    raid = _variant_arg(args.get('raid'))
+    raid_missing = []
     names = {str(k): v for k, v in (args.get('names') or {}).items()}
     want_files = [str(x) for x in (args.get('accounts') or []) if str(x).strip()]
 
@@ -1253,6 +1441,7 @@ def _tool_build_run(args, session=None):
             return {'error': '关卡「%s」没找到，换个关键词' % kw}
 
     if need_ops:
+        raid_all, raid_got = set(), set()
         for r in rows:
             try:
                 snap = multiacct._snap_of(r['file'])
@@ -1260,22 +1449,42 @@ def _tool_build_run(args, session=None):
             except Exception as e:
                 r['note'] = '搜作业失败：%s' % e
                 continue
+            seen = set()
             for packed in (res.get('stages') or [])[:limit]:
                 st = packed.get('stage') or {}
+                code = st.get('code') or ''
+                variant = st.get('variant') or 'normal'
+                if code:
+                    raid_all.add(code)
+                # 用户点名要突袭就只排突袭行，**不拿普通行顶上**（「说突袭、
+                # 导入的却是普通 EX-8」，2026-11-23 用户报障）
+                if raid == 'raid' and variant != 'raid':
+                    continue
+                if raid == 'normal' and variant == 'raid':
+                    continue
+                if code and code in seen:
+                    continue            # 同一关的普通/突袭两行只排一条
                 best = next((o for o in (packed.get('ops') or [])
                              if o.get('mode') != 'blocked'), None)
                 if not best:
                     continue
+                seen.add(code)
+                if variant == 'raid':
+                    raid_got.add(code)
                 r['ops'].append({'copilotId': best.get('copilotId'),
-                                 'stageCode': st.get('code') or '',
+                                 'stageCode': code,
                                  'title': best.get('title') or '',
-                                 'variant': st.get('variant')})
+                                 'variant': variant})
             r['stages'] = [o['stageCode'] for o in r['ops']]
         usable = [r for r in rows if r['ops']]
         if not usable:
             return {'error': '这些账号在这批关卡里一份能打的作业都没有',
-                    'hint': '换个关键词；或者用 mode=fight 直接刷关卡（不抄作业）'}
+                    'hint': '要求突袭时还会更少——换成「普通」或 raid="both" 再试'}
         rows = usable
+        if raid == 'raid' and raid_all - raid_got:
+            raid_missing = sorted(raid_all - raid_got)
+        else:
+            raid_missing = []
 
     profile_hint = str(args.get('profile') or '').strip()
     head = '%s · %d 个账号' % (
@@ -1292,11 +1501,20 @@ def _tool_build_run(args, session=None):
         lines.append('· %s（切号名 %s）→ %s' % (r['name'], r['accountName'], tail))
     if formation and need_ops:
         lines.append('抄作业时自动编队：开')
+    if need_ops:
+        # 难度写清楚：不写这一行，助手很容易按自己刚才的说法回答用户
+        diff = {('突袭' if o.get('variant') == 'raid' else '普通')
+                for r in rows for o in (r['ops'] or [])}
+        lines.append('难度：%s' % ('、'.join(sorted(diff)) or '（没排作业）'))
+    if raid_missing:
+        lines.append('注意：这几关要的是突袭，但作业站只有普通版，**没有排**：%s'
+                     % '、'.join(raid_missing[:8]))
     lines.append('会直接驱动 MAA 核心跑（不用手动点开始），跑完自动切下一个账号。')
 
     payload = {'rows': rows, 'tasks': tl, 'formation': formation,
                'fightStages': fight_stages, 'profileHint': profile_hint,
-               'start': start, 'maaDir': d, 'mode': mode}
+               'start': start, 'maaDir': d, 'mode': mode,
+               'raidMissing': raid_missing}
     pid = 'b:' + uuid.uuid4().hex[:8]
     with _plans_lock:
         now = time.time()
@@ -1646,6 +1864,7 @@ def _tool_run_steps(args, session=None):
 _HANDLERS = {
     'list_accounts': _tool_list_accounts,
     'set_account_name': _tool_set_account_name,
+    'bind_emulator': _tool_bind_emulator,
     'list_activities': _tool_list_activities,
     'search_stages': _tool_search_stages,
     'find_ops': _tool_find_ops,
@@ -1761,6 +1980,21 @@ SYSTEM = """你是 MAA-PRTS 的内置助手，帮用户管理明日方舟的挂�
 - 作业 id 必须来自 find_ops 的返回
 - 账号的 file 必须来自 list_accounts
 
+**被问「你可以帮我干什么」时**，用人话列清单（别丢工具名），只列下面这些
+真做了的，一条都不许编：
+
+- 挂关卡：抄作业自动战斗（普通 / 突袭 / 两档都打）、纯刷理智、过剧情关
+- 活动一条龙：唤醒 → 导航进活动（当期 OS 走终端页横幅）→ 普通/EX/S 逐段扫
+  → 领奖励 → 搬商店（黑名单可配）
+- 多账号：同一台模拟器排队切号，不同模拟器真并行；能按账号单独停
+- 日常：开始唤醒、自动公招、基建换班、理智作战、信用收支、领取奖励
+- 森空岛签到、培养干员（精英化 / 技能 / 专精）、MAA 小工具（活动小游戏 / 商店）
+- 看状态：跑到第几关、卡在哪、为什么失败
+- 配任务：新建 PRTS- 开头的独立档案，**用户自己的配置一个字段都不动**
+
+列完补一句具体的（「现在开的是雪山降临 1101，要我把 OS 关卡挂上吗」），
+别只丢一张清单就完事。
+
 ## 挂机怎么配（这是你最该会的）
 
 **用 build_run，别自己拼任务。**
@@ -1813,6 +2047,18 @@ build_run（mode=fight、keyword=1-7）。纯理智作战，不抄作业。
 **「这周活动帮我打一下」**
 list_activities 确认哪个 → build_run（mode=copy 或 daily_copy，keyword=活动前缀）
 
+**OS（雪山降临 1101）现在值得打的就这几件**（用户 2026-11-23 口径，别自己加戏）：
+- 普通 OS-1 ~ OS-10
+- EX-1 ~ EX-8（普通）
+- **EX-8 单关补一次突袭**（只有 EX-8 要突袭，别的 EX 关没提就别排）
+- S-1 ~ S-5（**普通**）
+- **S 关突袭没有奖励，用户说「太变态了，刷那个没有奖励」——绝对不要主动
+  给 S 关排突袭，也别在回话里建议他打 S 突袭**
+- 收尾照旧：领奖励 + 搬商店（黑名单默认那四个）
+
+用户只说「挂一下 OS」时，按上面这套排（S 用普通、EX 用普通、不排 S 突袭），
+回话里把「EX-8 要不要补突袭」问一句就行。
+
 **「把这 5 个号的 OS 活动挂一下（普通、突袭、S、领奖、搬商店）」**
 1. list_accounts —— 看 `current`（用户在左侧点开的那个号）和各自的 `emulator`
 2. 按「复刻突袭」那两条先问：要突袭吗？去年打过吗？（OS 是复刻活动）
@@ -1839,6 +2085,12 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 想看跑到第几个作业，用返回里的 stage / index / total。
 
 **「停下来」** → stop_run
+- 用户说清楚是哪个号（「停 b 服那个」「停示例昵称#0384」）**必须带 account**，
+  只停那一路；不说才全停。停之前先用一句话说清你要停谁。
+- 停完照实报：停了哪个号；**别把「停了一个号」说成「都停了」**。
+  用户 2026-11-23 就是被这句坑过（他说停 b 服，结果两台都断，官服那轮
+  正在打的关白烧）。工具返回里有 `accounts` / `engines` / `processes`，
+  按它说。
 
 ## 挂关 skill（2026-11-17 新增）：把流程拆开一步一步来
 八个 skill，各自独立跑后台、失败单独停：
@@ -1852,13 +2104,14 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - skill_skip_story：过剧情关（ST 关自动点开 + 跳剧情）
 - skill_fight：自动战斗（编队 / 借助战 / 吃理智药）。**默认不唤醒不导航**，
   界面在哪就从哪直接开打；要全套（唤醒+导航）得用户明说或传 wakeup=true。
-  **打不过会自动换一份作业，从卡住的那关往后重挂**，日志报「跑到哪几关 / 卡在哪」
+  **打不过会自动回关卡菜单、只换那一关的作业重挂**（没候选就同一份再试一次，
+  前面打完的关不重打），日志报「跑到哪几关 / 卡在哪 / 为什么」
 - skill_signin：森空岛签到
 - skill_weekly：**周目编排**——ST 剧情自动过、主线按序批量打、EX 收尾
 - skill_train：**培养干员**——升精英化 / 技能等级 / 专精，可一次排多个
-- skill_sweep：**一键扫图**——普通关 → EX 普通 → EX 突袭 → S 关，逐段重新
-  导航 + 挂机。用户说「这个活动从头打到尾」「EX 和 S 都清了」就用它，
-  比 skill_weekly 更适合「只要战斗、不要剧情编排」的场景
+- skill_sweep：**一键扫图**——普通关 → EX 普通 → EX 突袭 → S 关（S 只打普通，
+  突袭没奖励），逐段重新导航 + 挂机。用户说「这个活动从头打到尾」「EX 和 S
+  都清了」就用它，比 skill_weekly 更适合「只要战斗、不要剧情编排」的场景
 - skill_tool：**MAA 小工具（牛杂）**——`name="wartime_press"` 战时新闻委员会
   （TL）、`name="os_rd"` 喀兰贸易技术研发部（OS）、`name="event_shop"` 活动商店。
   三项都自己导航到活动地图再点入口。只给「小游戏」这种泛称时**必须带 prefix**
@@ -1890,19 +2143,41 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - 每个号用的是**它自己绑的 MAA 目录和配置文件**（设置 → MAA 路径），
   不需要你传 maaDir
 - **但要并行两台，光靠档案常常不够**：MAA 里好几份档案可能全写着
-  `emulator-5554`，而用户其实开着两台。`list_accounts` 的 `devices` 才是
-  现在真在线的设备列表：
-  - 用户说「两台一起跑」而 `devices` 比分组多 → **问一句**「哪个号用哪台」，
-    然后 `run_steps(..., emulators={"灰bao#0384 bilibili服": "emulator-5556"})`
-  - 不问也能跑，但会串行排队，用户看到的还是「只有一台在动」
-  - 传了 emulators，程序会**严格**连那台：连不上就报错，不会偷偷换回 5554
+  `emulator-5554`，而用户其实开着两台。`list_accounts` 里看两个字段：
+  `emulator` 是这个号实际会连的那台，`emulatorPinned` 是「用户钉过没有」。
+  - **用户说「这个号用第二台 / 用 5556 / 别挤一台」→ 先调
+    `bind_emulator(account=..., address="emulator-5556")`**。这一步把地址
+    写进账号设置，以后每轮跑机都连这台——不做这一步，下一轮你就忘了，
+    两个号又挤到同一台上（2026-11-23 用户报的正是这个）。
+  - 绑定后再说 `run_steps(accounts=[...], steps=[...])` 就行，不用每次传
+    `emulators`；临时改某一次也可以传，优先级最高。
+  - 钉过的地址**绝不自动换成别的**：那台不在线时，不是换一台在线的顶上，
+    而是**按它自己的实例序号把那台启动起来**（雷电用 `ldconsole adb --index
+    N get-serialno` 反查，5556 就是实例 1）。所以用户说「帮我开第二台」时，
+    直接按那个号跑机就行，前检会拉起 5556 而不是永远拉起 5554 那台
+    （2026-11-23 用户报「只能启动 5554，启动不了 5556」）。反查不到是哪台
+    实例的模拟器（MuMu 等）不猜，只提示用户自己开。没钉过、档案地址又过期
+    时，只有**一台**在线才会顶上；两台都在线会直接拦下要用户指定——这是
+    故意的，别绕过。
+  - 同一台模拟器的号排队切号，不同的号多开并行（每组一个独立进程）
+- **官服 / b 服是两个不同的包**：账号的渠道自动判定（b 服走
+  `com.hypergryph.arknights.bilibili` + MaaCore 的 `Bilibili`），你**不用**
+  也别自己切客户端。两个参数容易搞混，这里记清楚（2026-11-23 两次翻车）：
+  - `AsstConnect` 第 4 个参数是**模拟器连接配置名**（`General` / `LDPlayer`），
+    传客户端类型会报 `ConfigNotFound`（b 服账号仍按官服包启动）
+  - 客户端类型只走**任务参数** `StartUp.client_type`（`Official` / `Bilibili`）
+  - 日志里「连接 emulator-5556（b服）」这行就是实际生效的客户端；写错渠道
+    说明账号文件的 `channelName` 不对，让用户在设置里改，别自己瞎试.
 - 每组跑在**自己的进程**里（不是线程）：同一个进程里两个 MaaCore 会抢
   命名管道，第二台永远连不上（asst.log 里 `CreateOverlappablePipe failed,
   err 231`）——以前「说好并行，另一台一动不动」就是这个。现在多组=多进程，
   两台会真的同时动
-- **官服 / b 服是两个不同的包**：账号的渠道自动判定（b 服走
-  `com.hypergryph.arknights.bilibili` + MaaCore 的 `Bilibili`），你**不用**
-  也别自己切客户端；同一个模拟器上装了两个包时，按账号自己的渠道来
+- **正在跑一路时再起另一路，后起的那路会自动换独立进程**（`claim_inproc`
+  抢不到就让位），所以用户可以放心「再加一个号」。以前两路挤在一个进程里，
+  后来的那个会把**先跑的**任务链打断（只发 TaskChainStopped，日志写「已停止
+  （你按了停止）」，其实没人按）——2026-11-23 用户报「多开另一个号，他把我
+  前面的停了」就是它。日志里看到「这一路改用独立进程」是正常提示，不用解释
+  成出错
 - 日志每行带 `[账号名]`，右栏按账号分栏（切到哪个号只看那个号的日志）；
   完整日志另存在 `debug/tasks/<任务号>.log`，出问题让用户把这个文件发你
 
@@ -1912,8 +2187,11 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   遇 ST 自动过剧情、连续战斗关合并成批。build_run 遇到剧情关会卡死，用不了。
 - 只想导航到某活动看看 / 手动接管 → skill_navigate
 - 游戏没开、卡登录页 → skill_wakeup
-- **单独打一组关**（界面已在关卡列表 / 用户自己导航好了）→ skill_fight，
-  不要再补导航；游戏没开或还在主界面才需要先 skill_wakeup / skill_navigate
+- **单独打一组关**（用户明说「我已经在关卡列表」/「别切号，直接开始」）→
+  skill_fight 并传 `assumeStageList=true`（或 `noSwitch=true`），不要补导航。
+- **多账号批量**：除非用户明确上面两句之一，`fight` **一律先唤醒 + 导航**
+  （程序在 run_steps 里自动加，不用你手动写）。因为上一个号可能停在关卡
+  列表、主页、基建或结算页，界面状态无从判断（2026-11-22 用户口径）。
 - **把一个活动的普通关、EX（含突袭）、S 全清一遍** → skill_sweep。它自己
   分段导航、每关失败换作业重挂，不用一段段手动调 skill_navigate + skill_fight
 - 签到 → skill_signin
@@ -1983,12 +2261,17 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
   启动（路径从 MAA 配置里读）。任务报「环境没准备好」时，把日志那句话原样转给
   用户让他手动开，别自己反复重试、也别去改 MAA 的连接设置
 - **突袭不是磨难**：EX/活动关的「突袭」和主线的「磨难/险地」是两回事（用户
-  2026-11-19 明确）。**默认每关只打真正要打的那一档**：EX 关有突袭作业就只打
-  突袭，不再先打一遍普通（用户实测抱怨过「说好只排突袭，结果又从头挂普通
-  EX-1」）。普通还没通关、要一次打通时，把那一关写成 ``SV-EX-1@both``。
+  2026-11-19 明确）。**难度按用户原话，一个字都不许替他改**：代码里
+  `raid='auto'`（不传）= **只打普通**，所以用户说「打突袭」时必须显式写
+  `raid="raid"` 或把那一关写成 `SV-EX-1@raid`，否则排下去的真是普通——
+  2026-11-23 用户报「说突袭，两个号导入的都是普通 EX-8」就是这么来的（嘴上
+  突袭、参数没传）。反过来，用户说「普通」也绝不能升成突袭。
+  普通还没通关、要一次打通时，把那一关写成 ``SV-EX-1@both``。
   同一次计划里可以逐关分开写：``["SV-EX-1@raid", "SV-EX-6@both"]``。
-  只刷材料写 ``@normal`` 或 raid=normal。磨难/险地是主线独立难度，不用后缀。
-  **不要**跟用户说「突袭打不了」——作业站有突袭作业就能排。
+  磨难/险地是主线独立难度，不用后缀。
+  **不要**跟用户说「突袭打不了」——作业站有突袭作业就能排；真搜不到突袭
+  作业时日志里会写「这关没有突袭作业，只打普通」，**照实转告用户**，别
+  顺着自己刚才说的话继续吹。
 - **复刻活动的 EX / S：先把突袭问清楚**（用户 2026-11-22 要求）：list_activities
   里 `reprint: true`（现在 OS = 雪山降临1101）或活动导航标了复刻的，用户说要刷
   它的 EX / S 时，**先问两句**：「要不要连突袭一起打」「去年这个活动打过吗」。
@@ -2000,9 +2283,32 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
   文案改成"已换"是没用的——不传 ops 就会重新搜索，排序又挑回原来那份。
 - **翻车会自动重挂，不用你重排**：skill_fight / skill_sweep 每关都备了
   2~3 份作业，某关打不过会换下一份，**从卡住的那关往后重挂**（前面的关不再打）。
-  重挂前程序会自己点一下结算页把界面带回关卡列表（用户 2026-11-19 实测：
-  失败后必须点一下才回得到关卡界面，**不需要重新唤醒/登录**）。
+  失败只认 MAA 的回调（任务失败 / 结算不是三星），程序不自己猜；确认翻车后
+  先点一下屏幕（MAA ClickCorner），等界面回到活动关卡界面再排新作业
+  （用户 2026-11-22 实测：失败后点任意位置都会立刻回到关卡界面，
+  **不需要重新唤醒/登录**，也不需要重走导航）。
   日志里会出现「换作业重挂：X #a → #b」「翻车：X —— 原因」。
+- **S 关（散点关卡）自动走另一条路**（2026-11-23）：OS 的 S 关浮在雪山地图上
+  （积雪清理系统），MAA 的关卡识别在关卡列表里 OCR，认不出这种界面。skill_fight
+  认到 `XX-S-1` 这种形状且活动有标定，就会自己点格子 → 点「开始行动」/「开始
+  突袭」→ 进编队页，再用单作业模式一关一关打。**你不用提醒用户「MAA 认不出
+  S 关」，也不用让他手动点**；他排 `stages=['OS-S-1@normal', …]` 就照常打。
+  S 关**同样有普通和突袭两档**，用户要突袭就传 `raid` 或逐关 `@raid`。
+  这条路单作业模式**不判三星**（MaaCore 打完只发任务完成），日志会写「打完了
+  （单作业模式不判三星）」，所以别说「几关三星通过」。
+
+- **难度只能照用户原话，不许替他升级、也不许替他下结论**（2026-11-23 用户
+  投诉「出幻觉了还不听命令了」）：用户说「帮我挂 OS-S 关 1 到 5 普通」，那一轮
+  助手干了两件错事——① 对话里编了一句「OS 是复刻活动，S 关只有普通难度，
+  没有突袭」（S 关普通/突袭都有）；② 排单时没传 `raid`，程序当时默认
+  auto→突袭，于是 5 关全按突袭排，第二关还因为突袭作业缺干员卡了 20 分钟。
+  - 用户说「普通」→ **必须显式传 `raid: 'normal'`**；说「突袭」→ `'raid'`；
+    说「都打」→ `'both'`。只说了关卡没提难度才省略（默认只打普通）。
+  - **不许**在回复里断言「某关有没有突袭」「复刻活动所以没有突袭」这类话。
+    难度以实际排单为准，日志里有一行「难度：普通 OS-S-1、OS-S-2 …」，照着
+    念。要确认就先调 find_ops / list_activities 看数据，别推理。
+  - 排单前把「**哪几关、什么难度、哪个号**」跟用户的话对一遍；对不上就别开跑。
+
 - **逐关成败不要报数**（2026-11-22 用户口径）：MAA 在抄作业时**不回报每关
   成功/失败**（asst.log 里没有任何 StageDrops 回调），程序也就不知道「成了
   几关」。只能说「跑到了哪几关 + 任务链正常结束还是卡在哪关 + 原因」，

@@ -1327,12 +1327,12 @@ function chipTitle(o) {
   if (o.group) return '组合：满足任一即可';
   const e = ['精零', '精一', '精二'][o.elite] || '';
   const m = (o.mastery || []).map((x, i) => x ? `专${'一二三'[i] || ''}${x}` : '').filter(Boolean).join(' ');
-  // 练度要求（v1 老作业没写的会补默认值，带 implied 标记）
+  // 练度要求（v1 老作业没写的仍按星级补默认值，但不再标「默认」——
+  // 用户 2026-11-22 说这属于噪音）
   const req = o.req || {};
   const need = [];
   if (req.elite != null) need.push('精' + req.elite);
   if (req.level != null) need.push(req.level + '级');
-  if (req.implied) need.push('默认');
   const needTxt = need.length ? ` · 要求 ${need.join(' ')}` : '';
   if (o.sub) return `由${o.sub.name}${o.sub.skill || ''}替换出战${needTxt}`;
   if (!o.owned) return '未拥有' + needTxt;
@@ -1743,7 +1743,6 @@ async function showOpDetail(op, variant) {
           if (req.level != null) bits.push(req.level + ' 级');
           if (req.skill_level != null) bits.push(req.skill_level >= 8 ? ('专' + (req.skill_level - 7) + ' 技能' + (req.skill || 1)) : ('技能 ' + req.skill_level));
           if (req.module) bits.push('模组 ' + req.module);
-          if (req.implied) bits.push('老作业未标注，按星级默认');
           // 名字上色：借的那个人紫、缺练度的橙，跟顶部提示一对；
           // 替换条目（#92）绿字 + 「由黍1替换」标注
           const isBorrow = borrowOne && o.name === borrowOne;
@@ -2723,6 +2722,7 @@ function openSettings() {
         <span class="${/bilibili/i.test(a.channelName || '') ? 'acct-ch bili' : 'set-muted'}">${
           esc(a.channelName || '官服')}</span>
         ${a.maaProfile ? `<span class="set-chip">配置文件 ${esc(a.maaProfile)}</span>` : ''}
+        ${a.maaAdbAddress ? `<span class="set-chip">模拟器 ${esc(a.maaAdbAddress)}</span>` : ''}
       </div>
       <label class="field"><span>这个账号的 MAA 路径（留空 = 用上面的默认目录）</span>
         <div class="path-row">
@@ -2741,6 +2741,11 @@ function openSettings() {
           <input type="text" data-f="accountName" value="${esc(a.maaAccountName || '')}"
                  placeholder="后 4 位如 5505，或 157****3635"
                  spellcheck="false" autocomplete="off"></label>
+        <label class="field"><span title="多开时必选：钉住以后这个号只连这一台，档案地址过期也不会自己换">模拟器（多开必选）</span>
+          <div class="path-row">
+            <select data-f="adbAddress" data-addr="${esc(a.maaAdbAddress || '')}"></select>
+            <button class="btn-plain mini" data-act="devices" title="重新读一遍 adb devices">刷新</button>
+          </div></label>
       </div>`}
       <div class="set-maarow-foot">
         <span class="onb-hint" data-state></span>
@@ -2859,11 +2864,12 @@ function openSettings() {
           <div class="set-pane" data-pane="schedule">
             <div class="set-head">
               <h3>定时任务</h3>
-              <p>到点自动启动一个程序：<b>exe、bat、cmd 批处理</b>都行，参数照程序自己
-                的说明填。常见用法是定时跑挂机脚本、到点打开模拟器或别的工具；多条任务
-                还能<b>链式启动</b>——上一个程序退出后接着跑下一个。定时只在程序运行时
-                生效，要开机自启请把本程序放进系统启动项；「通知」是在程序里弹提示，
-                程序关着就收不到。</p>
+              <p>到点自动启动一个程序：<b>exe、bat、cmd 批处理</b>都行。程序可以从<b>预设</b>
+                里挑（本程序自己、MAA 官方客户端，以及原神 / 绝区零 / 鸣潮 / 终末地 /
+                重返未来这些工具的模板），预设会帮你把路径找好，找不到再点「浏览」；
+                参数照程序自己的说明填。多条任务还能<b>链式启动</b>——上一个程序退出后
+                接着跑下一个。定时只在程序运行时生效，要开机自启请把本程序放进系统启动项；
+                「通知」是在程序里弹提示，程序关着就收不到。</p>
             </div>
             <div class="sched-wrap">
               <div class="sched-head">
@@ -3404,6 +3410,16 @@ function openSettings() {
         const state = $('[data-state]', card);
         const isEnd = card.dataset.game === 'endfield';
         if (btn.dataset.act === 'pick') { await pickFolder(input); return; }
+        if (btn.dataset.act === 'devices') {
+          btn.disabled = true;
+          try {
+            const d = await paintAddrSelect(card);
+            const n = ((d && d.devices) || []).filter(x => x.state === 'device').length;
+            state.className = 'onb-hint';
+            state.textContent = n ? `读到 ${n} 台在线模拟器` : '现在没有在线模拟器';
+          } finally { btn.disabled = false; }
+          return;
+        }
         if (btn.dataset.act === 'probe') {
           const dir = input.value.trim()
             || ((isEnd ? S.settings.maaEndDir : S.settings.maaDir) || '');
@@ -3444,6 +3460,8 @@ function openSettings() {
           try {
             const patch = { dir: input.value.trim(),
                             accountName: nameInput.value.trim() };
+            const addrSel = $('[data-f="adbAddress"]', card);
+            if (addrSel) patch.adbAddress = addrSel.value;
             const sel = $('[data-f="profile"]', card);
             if (sel) {
               patch.profile = sel.value;
@@ -3457,6 +3475,7 @@ function openSettings() {
               row.maaProfile = (r.maa || {}).profile || '';
               row.maaAccountName = (r.maa || {}).accountName || '';
               row.maaAccountNameFrom = (r.maa || {}).accountNameFrom || '';
+              row.maaAdbAddress = (r.maa || {}).adbAddress || '';
             }
             state.className = 'onb-hint ok';
             state.textContent = '✓ 已保存';
@@ -3499,8 +3518,41 @@ function openSettings() {
          绑了档案的账号，切号名直接从档案里填上（只改输入框，点保存才落盘）；
          没绑的只在档案恰好有账号名时提示一句——**不替用户猜**：两个游戏账号
          对 MAA 里五份档案，猜错就是切号死循环 4 分钟。 */
+      /* 这个号能选哪些模拟器：在线设备 + 本机有哪些实例（没开的也列）。
+         多开时地址必须明示（后端 skills.device_of 的规则：钉死的地址不在线
+         就按它的实例号启动那一台，绝不换台），所以这里把能选的一次列全——
+         第二台没开的时候也得能选中它，不然用户根本没法把号钉到 5556。 */
+      async function paintAddrSelect(card) {
+        const sel = $('[data-f="adbAddress"]', card);
+        if (!sel) return null;
+        const cur = sel.value || sel.dataset.addr || '';
+        let d = { devices: [], instances: [] };
+        try { d = await api('/api/account/devices?file=' + encodeURIComponent(card.dataset.file)); }
+        catch (e2) { d = { devices: [], instances: [] }; }
+        const rows = d.devices || [];
+        const insts = d.instances || [];
+        const one = (v, label) =>
+          `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(label)}</option>`;
+        const online = new Set(rows.map(x => x.address));
+        let html = one('', '（不指定，按 MAA 档案）');
+        html += rows.map(x => one(x.address,
+          x.address + (x.state === 'device' ? ' · 在线' : ' · ' + x.state))).join('');
+        html += insts.filter(x => !online.has(x.address)).map(x =>
+          one(x.address, x.address + (x.running
+            ? ' · 已启动，adb 还没通'
+            : ' · 未启动（跑任务时自动开）'))).join('');
+        if (cur && !rows.some(x => x.address === cur)
+            && !insts.some(x => x.address === cur)) {
+          html += one(cur, cur + '（不在线）');
+        }
+        sel.innerHTML = html;
+        return d;
+      }
+
       async function autoFillMaa() {
         for (const card of $$('.set-maarow', el)) {
+          // 模拟器下拉与档案无关，两个游戏的卡片都要填
+          await paintAddrSelect(card);
           if (card.dataset.game === 'endfield') continue;   // MAAEND 档案格式不同
           if (card.dataset.pfTried) continue;
           card.dataset.pfTried = '1';
@@ -3525,11 +3577,26 @@ function openSettings() {
       }
 
       /* ---------------- 定时任务 ----------------
-         参照三月七助手那套：时间触发 / 链式启动、冲突策略、链式失败策略。
-         数据在后端 config/schedule.json，这里只负责展示与增删改；真正拉起
-         程序的线程在后端，所以关掉设置页也照跑。 */
+         时间触发 / 链式启动、冲突策略、链式失败策略。数据在后端
+         config/schedule.json，这里只负责展示与增删改；真正拉起程序的线程在
+         后端，所以关掉设置页也照跑。程序可以从预设里挑，预设表由后端给
+         （内置几条常见游戏工具，config/schedule-presets.json 还能自己加）。 */
       const WD = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
       const schedOf = () => S.schedule || { tasks: [], conflict: 'stop', onChainFail: 'continue' };
+      const schedPresetName = pid => {
+        const row = (S.schedPresets || []).find(p => p.id === pid);
+        return (row && row.name) || (pid === 'custom' || !pid ? '自定义程序' : pid);
+      };
+      const schedPresetsLoad = async () => {
+        if (S.schedPresets) return S.schedPresets;
+        try {
+          const d = await api('/api/schedule/presets');
+          S.schedPresets = (d && d.presets) || [];
+        } catch (e2) {
+          S.schedPresets = [{ id: 'custom', name: '自定义程序' }];
+        }
+        return S.schedPresets;
+      };
       const baseName = p => {
         const t = String(p || '').replace(/[\\/]+$/, '');
         return t.split(/[\\/]/).pop() || t;
@@ -3565,8 +3632,11 @@ function openSettings() {
             <span class="sched-name" title="${esc(t.name)}">${t.mode === 'chain' ? '→ ' : ''}${
               esc(t.name)}${live ? '<em class="sched-live">运行中</em>' : ''}</span>
             <span class="sched-plan">${plan}</span>
-            <span class="sched-prog" title="${esc(t.program || '')}">${
-              t.program ? esc(baseName(t.program)) : '<i class="sched-warn">未设置</i>'}</span>
+            <span class="sched-prog" title="${esc(t.program || schedPresetName(t.preset))}">${
+              t.program ? esc(baseName(t.program))
+                : (t.preset && t.preset !== 'custom'
+                  ? esc(schedPresetName(t.preset))
+                  : '<i class="sched-warn">未设置</i>')}</span>
             <span class="sched-args" title="${esc(t.args || '')}">${esc(t.args || '—')}</span>
             <span class="sched-nt">${t.notify ? '是' : '否'}</span>
           </div>`;
@@ -3606,6 +3676,9 @@ function openSettings() {
           const d = await api('/api/schedule/status');
           S.schedule = d;
           _schedSeq = d.seq || _schedSeq;   // 设置里看过的，全局轮询不再弹一遍
+          if (!S.schedPresets) {
+            try { await schedPresetsLoad(); } catch (e3) { /* 预设拿不到就显示 id */ }
+          }
           paintSched();
         } catch (e2) {
           if (quiet) return;
@@ -3629,13 +3702,14 @@ function openSettings() {
         return schedSel;
       };
 
-      function openSchedTask(task, idx) {
+      async function openSchedTask(task, idx) {
         const isNew = !task;
         const t = Object.assign({
           name: '', enabled: true, mode: 'time', time: '08:00',
-          weekdays: [1, 2, 3, 4, 5, 6, 7], program: '', args: '', cwd: '',
+          weekdays: [1, 2, 3, 4, 5, 6, 7], preset: 'custom', program: '', args: '', cwd: '',
           timeout: 0, notify: true,
         }, task || {});
+        const presets = await schedPresetsLoad();
         const picked = new Set((t.weekdays || []).map(Number));
         const m = modal(`
           <h3>${isNew ? '添加定时任务' : '编辑定时任务'}</h3>
@@ -3658,13 +3732,19 @@ function openSettings() {
                 <button type="button" class="wd-btn${picked.has(i + 1) ? ' on' : ''}"
                         data-wd="${i + 1}">${n}</button>`).join('')}</div></div>
           </div>
+          <label class="field"><span>程序预设</span>
+            <select id="st-preset">${presets.map(p =>
+              `<option value="${esc(p.id)}"${p.id === t.preset ? ' selected' : ''}>${
+                esc(p.name)}</option>`).join('')}</select></label>
+          <div class="onb-hint" id="st-preset-hint"></div>
           <label class="field"><span>程序（exe / bat / cmd）</span>
             <div class="path-row">
-              <input type="text" id="st-program" value="${esc(t.program)}" placeholder="D:\path\autostart-138.exe">
+              <input type="text" id="st-program" value="${esc(t.program)}"
+                     placeholder="D:\Tools\YourTool\YourTool.exe">
               <button class="btn-plain mini" id="st-pick">浏览</button>
             </div></label>
           <label class="field"><span>参数</span>
-            <input type="text" id="st-args" value="${esc(t.args)}" placeholder="--autostart --instance 138"></label>
+            <input type="text" id="st-args" value="${esc(t.args)}" placeholder="没有就留空"></label>
           <label class="field"><span>起始目录（留空 = 程序所在目录）</span>
             <div class="path-row">
               <input type="text" id="st-cwd" value="${esc(t.cwd)}">
@@ -3686,6 +3766,48 @@ function openSettings() {
             const state = $('#st-state', box);
             const modeSel = $('#st-mode', box);
             const timeBox = $('#st-time-box', box);
+            const presetSel = $('#st-preset', box);
+            const pHint = $('#st-preset-hint', box);
+            const progEl = $('#st-program', box);
+            const argsEl = $('#st-args', box);
+            const cwdEl = $('#st-cwd', box);
+            /* 预设只负责「猜」：把猜到的路径填进空栏位；用户自己填过或改过的
+               值一律不动（记下上次自动填的内容，只有还是它才覆盖） */
+            const auto = { program: '', args: '', cwd: '' };
+            const applyPreset = async pid => {
+              const row = presets.find(p => p.id === pid) || {};
+              auto.program = auto.args = auto.cwd = '';
+              if (!pid || pid === 'custom') {
+                pHint.className = 'onb-hint';
+                pHint.textContent = row.note || '';
+                return;
+              }
+              pHint.className = 'onb-hint';
+              pHint.textContent = '正在找…';
+              let d = {};
+              try {
+                d = await api('/api/schedule/detect?id=' + encodeURIComponent(pid));
+              } catch (e2) {
+                d = {};
+              }
+              const put = (el2, key, val) => {
+                const cur = el2.value.trim();
+                if (!cur || cur === auto[key]) el2.value = val || '';
+                auto[key] = val || '';
+              };
+              put(progEl, 'program', d.program);
+              put(argsEl, 'args', d.args);
+              put(cwdEl, 'cwd', d.cwd);
+              const note = row.note ? row.note + '。' : '';
+              pHint.className = 'onb-hint' + (d.program ? '' : ' bad');
+              pHint.title = d.program || '';
+              pHint.textContent = d.program
+                ? `${note}已找到：${baseName(d.program)}`
+                : `${note}本机没找到${(row.exes || []).length
+                  ? '（' + row.exes.join(' / ') + '）' : ''}，点「浏览」选一下`;
+            };
+            presetSel.addEventListener('change', () => applyPreset(presetSel.value));
+            applyPreset(presetSel.value);   // 打开就按当前预设看一眼能不能找到
             const syncMode = () => { timeBox.style.display = modeSel.value === 'chain' ? 'none' : ''; };
             modeSel.addEventListener('change', syncMode);
             syncMode();
@@ -3696,15 +3818,15 @@ function openSettings() {
               if (picked.has(n)) picked.delete(n); else picked.add(n);
               b.classList.toggle('on', picked.has(n));
             });
-            $('#st-pick', box).addEventListener('click', () => pickFile($('#st-program', box)));
+            $('#st-pick', box).addEventListener('click', () => pickFile(progEl));
             $('#st-pick-dir', box).addEventListener('click', () => pickFolder($('#st-cwd', box)));
             $('#st-save', box).addEventListener('click', async () => {
               const name = $('#st-name', box).value.trim();
               const mode = modeSel.value === 'chain' ? 'chain' : 'time';
               const time = $('#st-time', box).value.trim();
-              const program = $('#st-program', box).value.trim();
-              const args = $('#st-args', box).value.trim();
-              const cwd = $('#st-cwd', box).value.trim();
+              const program = progEl.value.trim();
+              const args = argsEl.value.trim();
+              const cwd = cwdEl.value.trim();
               const timeout = Math.max(0, parseInt($('#st-timeout', box).value, 10) || 0);
               if (!name) { state.className = 'onb-hint bad'; state.textContent = '先起个名字'; return; }
               if (!program) { state.className = 'onb-hint bad'; state.textContent = '先选要运行的程序'; return; }
@@ -3716,7 +3838,8 @@ function openSettings() {
               }
               const item = {
                 id: t.id || '', enabled: $('#st-enabled', box).checked, name, mode, time,
-                weekdays: [...picked].sort((a, b) => a - b), program, args, cwd, timeout,
+                weekdays: [...picked].sort((a, b) => a - b), preset: presetSel.value,
+                program, args, cwd, timeout,
                 notify: $('#st-notify', box).checked,
               };
               const tasks = (schedOf().tasks || []).slice();
@@ -5388,18 +5511,32 @@ const CHAT = {
 
 /* 助手引导卡片：示例问句必须和「现在真能做的事」对得上——早先那几条
    （「我还差哪些关没打」「推荐养哪些干员」）助手根本没有对应数据源，点了
-   只会兜圈子。下面每一条都对着一个已实现的 skill，点下去就能真跑。 */
+   只会兜圈子。下面每一条都对着一个已实现的 skill，点下去就能真跑。
+
+   2026-11-23 用户要求换成**当期 OS（雪山降临 1101）的常用导航**：这张卡是
+   用户第一眼看到的东西，写老活动（将进酒 / TL）等于教他绕远路。OS 有效期
+   到 12/02，换活动时把前缀和活动名一起换掉即可；「你可以帮我干什么？」
+   放第一条，新用户先看能力清单再动手。
+
+   OS 现在值得打的就这几件（用户 2026-11-23 口径）：普通 OS1-10、EX1-8、
+   EX-8 补一次单关突袭、S1-5 普通。**S 关突袭没有奖励，别往引导里放**。 */
 const CHAT_STARTERS = [
-  ['帮我把最新活动 S 关卡挂完',
-   '帮我把最新活动的 S 关卡挂完'],
-  ['帮我把将进酒活动普通关卡挂完',
-   '帮我把将进酒活动的普通关卡挂完'],
+  ['你可以帮我干什么？',
+   '你可以帮我干什么？'],
+  ['导航到雪山降临（OS）关卡，我自己接着打',
+   '帮我导航到雪山降临（OS）活动的关卡界面，别开打'],
+  ['OS-1 到 OS-10 挂普通',
+   '帮我按顺序挂雪山降临 OS-1 到 OS-10，普通难度'],
+  ['OS-EX-1 到 8 挂普通',
+   '帮我挂雪山降临 OS-EX-1 到 OS-EX-8，普通难度'],
+  ['OS-EX-8 只补一次突袭',
+   '帮我单独挂 OS-EX-8 的突袭难度'],
+  ['OS-S-1 到 5 挂普通',
+   '帮我挂雪山降临 OS-S-1 到 OS-S-5，普通难度'],
+  ['活动商店清一遍（别买龙门币、固源岩）',
+   '清一下雪山降临的商店，黑名单里加龙门币、固源岩、技巧概要、赤金'],
   ['所有账号森空岛签到',
    '帮我把所有账号的森空岛签到都签了'],
-  ['活动商店清一遍（别买龙门币、固源岩）',
-   '清一下最新活动的商店，黑名单里加龙门币、固源岩、技巧概要、赤金'],
-  ['把泥岩精二，三技能专三',
-   '把泥岩精二，三技能专三，材料不够就停下来告诉我'],
   ['现在跑到哪了？卡住了吗？',
    '现在跑到哪了？卡住了吗？'],
 ];
@@ -5411,7 +5548,7 @@ function chatEmptyHtml() {
         自动战斗、切号这类操作跑起来时，请瞄一眼右边的「任务进度」；
         跑歪了把日志发出来，我们照着改。</span>
     </div>
-    <p>现在能做的事（点一条试试）：</p>`
+    <p>现在的活动是雪山降临 1101（OS），下面几条点一下就能跑；不知道能干嘛就先点第一条：</p>`
     + CHAT_STARTERS.map(([label, ask]) =>
       `<button class="chat-chip" data-ask="${esc(ask)}">${esc(label)}</button>`).join('');
 }
@@ -5788,9 +5925,41 @@ function chatSideSwitch(file) {
   }).catch(() => { });
 }
 
+/* 往右栏塞一句「操作记录」（停止这类没有 taskId 的动作）
+   右栏是数据驱动的（按任务存行、按账号过滤），所以造一个临时任务挂上去，
+   而不是直接往 DOM 里 append——那样切一次账号就没了。 */
+function sideSay(text, cls, file) {
+  const tid = 'say-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const own = file ? [file] : [];
+  CHAT.side.tasks.set(tid, { tid, name: '操作', file: file || S.current || '',
+                             owners: own, lines: [], startedAt: Date.now() });
+  sideAddLines(tid, [text], cls || '', own);
+}
+
+/* 只停「当前账号」正在跑的活（右栏标题旁的「停止」）
+   用户 2026-11-23 报：「停止的话不能指定停止，会一起停其他任务」——以前只有
+   聊天里那个全停（agent 的 stop_run 一次砍掉两路），他让停 b 服，官服那边正在
+   打的关也一起断了。这里只把**这一个号**的文件名传给后端，别的号照跑。 */
+async function stopSideAccount() {
+  const f = CHAT.side.cur || S.current || '';
+  if (!f) return;
+  const btn = $('#chat-side-stop');
+  const name = ((S.accounts || []).find(a => a.file === f) || {}).nickName || f;
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  try {
+    const d = await api('/api/run/stop', { file: f });
+    sideSay((d && d.stopped)
+      ? `⏹ 已停 ${name} 这一路（引擎 ${d.engines || 0} / 子进程 ${d.processes || 0}），别的账号没动`
+      : `${name} 现在没有在跑的任务`, (d && d.stopped) ? 'err' : '', f);
+  } catch (e) {
+    sideSay(`⏹ 停止失败：${e.message || e}`, 'err', f);
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
+  }
+}
+
 /* 清空只清「当前账号」的日志，别的号的不动 */
-function clearSideLog() {
-  const cur = CHAT.side.cur || '';
+function clearSideLog() {  const cur = CHAT.side.cur || '';
   CHAT.side.tasks.forEach(t => {
     const own = (t.owners || []).filter(Boolean);
     if (own.length && cur && !own.includes(cur)) return;  // 别动别的账号的任务
@@ -6003,6 +6172,8 @@ function bindChat() {
   if (st) st.addEventListener('click', chatSkillTest);
   const logClear = $('#chat-log-clear');
   if (logClear) logClear.addEventListener('click', clearSideLog);
+  const logStop = $('#chat-side-stop');
+  if (logStop) logStop.addEventListener('click', stopSideAccount);
   $('#chat-send').addEventListener('click', () => sendChat(input.value));
   input.addEventListener('input', () => {
     input.style.height = 'auto';

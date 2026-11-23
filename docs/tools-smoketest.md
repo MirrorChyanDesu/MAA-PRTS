@@ -14,7 +14,7 @@ B 组把 `core.settings` 的数据路径指到临时目录，C 组整个项目�
 | 组 | 内容 |
 |---|---|
 | A | 全仓库 `.bat`（不止根目录三个）是 UTF-8 无 BOM + CRLF（错编码会让 `call :标签` 错位）；全部 `.py` 可编译 |
-| B | DPAPI 加解密往返、密文篡改必报错；token 密文随账号文件 `skd` 段（跨文件去重、备注保留、不进 API 视图、坏条目逐个跳过点名警告）；旧 `tokens.txt` 三种写法自动迁移；旧布局 `config/skland` 压平迁移（同名跳过、搬空才删、幂等）；MAA 干员识别 JSON（新 JObject / 旧裸数组）解析成练度结构；悖论清单与解锁推算（B10）；从 MAA 直接建号/无 token（B15）；账号手动排序 accountOrder（B16）；作业筛选（v1 默认练度、MAA 导入只比等级、剧情关不进搜索）；主线难度变体（简单/标准/磨难/险地、`#s` 独立成行、下一关推进）；关卡流程顺序（10-14 章系列视图带简单行、TR 与主线 S 关按 `unlockCondition` 插到前置关后面、`TR-S-1` 链式锚点、搜章节号返回整章含 S/TR、`TR_AFTER`/`SUB_AFTER` 改完清缓存即生效）；作业黑名单（`maa://` 代码归一化 + 出口过滤，B23）；推荐排序分档（可直接抄 9 分以上才压过借人作业）与作业详情缺练度/缺人（B28）；抽卡统计（星级归一 0 基/1 基兼容、保底按池计数、同名池合并、缓存视图、终末地快照、跨游戏 uid 隔离，B24）；森空岛签到（方舟 uid+gameId 与终末地 `sk-game-role` 两套口径、今天已签就不发 POST、403 记成已签到、缺 token/roleId 跳过、坏 token 只登录一次、同角色去重，B25）；资源包幂等（`version` 取游戏版本、指纹只看内容）与换包校验（sha256 / 条数不许变少）；程序自更新（`2.10 > 2.9`、预发布小于同号正式、脏 tag 不触发；安装包 sha256/体积/缺 exe 全拒、zip-slip 拦截；安装脚本只碰 `MAA-PRTS.exe` 与 `_internal`，绝不出现 `config/`、`debug/`、`resources/`）；日志观测（B30：增量读只算新行、文件被轮转能重读、`act55side_s03` 这类事件能还原成「跑到第几关/节点/重试几次」，200 秒没动静判停滞并给 hint、链跑完判 done、认不出的行一律跳过不抛）；多账号编排（B31：`1815505` → `181****5505`、档案名撞了加序号、一账号一档案且 `AccountName` 写进 StartUpTask、模板档案不被改动、`set_tasklist` 索引重排）；助手与 CLI（B32：工具表与实现一一对应、未知工具/坏参数兜成 error、autoApply 关时写操作只返 need_confirm、`apiKey` 绝不回显、CLI 输出形状与退出码 0/1/2/3，缺参数回 2 且带 hint）；活动关导航（B34：代号→区域行号 `TL-S-1`→第 3 区、`TL-EX-1`→第 2 区、`TL-5`→第 1 区，主线关 `1-7`/`S4-1`/`R8-2` 与作业内部 id 一律返回不导航；`probe()` 造图钉阈值——底部全暗判活动地图、半白判主界面、大半白+中部亮判主题页、中部成片纯白判活动商店；主线关调 `goto_stage_list` 必须零点击，绝不能对主线关乱点活动入口）；设置页接口（B38：token 三态读写、掩码只留尾 4 位、切号名归一与空串放行、bootstrap 带 logs）；培养干员（B39：专精绝对等级的多种写法互通、已达标项剔除、材料不足暂停并把剩余计划落盘续跑、MAA 日志桥去噪、战斗过程有进度日志、`SubTaskStart` 按真实 asst.log 的 first[0] 对账到中文阶段）；多 MAA 多模拟器编排（B52：账号自己那份 MAA 目录/档案优先、默认账号=左侧选中、按「MAA 目录 + adb 地址」分组、同组串行跨组并行、`run_steps` 步骤解析、`claim` 免确认且不在写处理器里、`skill_claim`/`run_steps` 都进白名单）；多开三处硬伤（B53：分区直点不走老路径、profile/adbAddress 真的传进 MaaCore、点名设备不许自动换台、任务日志落盘、组线程异常留痕）；导航从任意页起步（B54：活动提示条定点比对、不在主界面不许点坐标、已在地图不绕路、probe_bytes 与 probe 同源、粗扫留前 3 名后整屏匹配不退化）；右栏日志按账号分栏（B55：`_public` 白名单不带文件句柄、任务 `owners` 精确过滤、`tasks._decorate` 给多开子进程每行补 `[昵称]`、`group_tag` 单号组取昵称、worker 命令与 main 入口分支都在） |
+| B | DPAPI 加解密往返、密文篡改必报错；token 密文随账号文件 `skd` 段（跨文件去重、备注保留、不进 API 视图、坏条目逐个跳过点名警告）；旧 `tokens.txt` 三种写法自动迁移；旧布局 `config/skland` 压平迁移（同名跳过、搬空才删、幂等）；MAA 干员识别 JSON（新 JObject / 旧裸数组）解析成练度结构；悖论清单与解锁推算（B10）；从 MAA 直接建号/无 token（B15）；账号手动排序 accountOrder（B16）；作业筛选（v1 默认练度、MAA 导入只比等级、剧情关不进搜索）；主线难度变体（简单/标准/磨难/险地、`#s` 独立成行、下一关推进）；关卡流程顺序（10-14 章系列视图带简单行、TR 与主线 S 关按 `unlockCondition` 插到前置关后面、`TR-S-1` 链式锚点、搜章节号返回整章含 S/TR、`TR_AFTER`/`SUB_AFTER` 改完清缓存即生效）；作业黑名单（`maa://` 代码归一化 + 出口过滤，B23）；推荐排序分档（可直接抄 9 分以上才压过借人作业）与作业详情缺练度/缺人（B28）；抽卡统计（星级归一 0 基/1 基兼容、保底按池计数、同名池合并、缓存视图、终末地快照、跨游戏 uid 隔离，B24）；森空岛签到（方舟 uid+gameId 与终末地 `sk-game-role` 两套口径、今天已签就不发 POST、403 记成已签到、缺 token/roleId 跳过、坏 token 只登录一次、同角色去重，B25）；资源包幂等（`version` 取游戏版本、指纹只看内容）与换包校验（sha256 / 条数不许变少）；程序自更新（`2.10 > 2.9`、预发布小于同号正式、脏 tag 不触发；安装包 sha256/体积/缺 exe 全拒、zip-slip 拦截；安装脚本只碰 `MAA-PRTS.exe` 与 `_internal`，绝不出现 `config/`、`debug/`、`resources/`）；日志观测（B30：增量读只算新行、文件被轮转能重读、`act55side_s03` 这类事件能还原成「跑到第几关/节点/重试几次」，200 秒没动静判停滞并给 hint、链跑完判 done、认不出的行一律跳过不抛）；多账号编排（B31：`1815505` → `181****5505`、档案名撞了加序号、一账号一档案且 `AccountName` 写进 StartUpTask、模板档案不被改动、`set_tasklist` 索引重排）；助手与 CLI（B32：工具表与实现一一对应、未知工具/坏参数兜成 error、autoApply 关时写操作只返 need_confirm、`apiKey` 绝不回显、CLI 输出形状与退出码 0/1/2/3，缺参数回 2 且带 hint）；活动关导航（B34：代号→区域行号 `TL-S-1`→第 3 区、`TL-EX-1`→第 2 区、`TL-5`→第 1 区，主线关 `1-7`/`S4-1`/`R8-2` 与作业内部 id 一律返回不导航；`probe()` 造图钉阈值——底部全暗判活动地图、半白判主界面、大半白+中部亮判主题页、中部成片纯白判活动商店；主线关调 `goto_stage_list` 必须零点击，绝不能对主线关乱点活动入口）；设置页接口（B38：token 三态读写、掩码只留尾 4 位、切号名归一与空串放行、bootstrap 带 logs）；培养干员（B39：专精绝对等级的多种写法互通、已达标项剔除、材料不足暂停并把剩余计划落盘续跑、MAA 日志桥去噪、战斗过程有进度日志、`SubTaskStart` 按真实 asst.log 的 first[0] 对账到中文阶段）；多 MAA 多模拟器编排（B52：账号自己那份 MAA 目录/档案优先、默认账号=左侧选中、按「MAA 目录 + adb 地址」分组、同组串行跨组并行、`run_steps` 步骤解析、`claim` 免确认且不在写处理器里、`skill_claim`/`run_steps` 都进白名单）；多开三处硬伤（B53：分区直点不走老路径、profile/adbAddress 真的传进 MaaCore、点名设备不许自动换台、任务日志落盘、组线程异常留痕）；导航从任意页起步（B54：活动提示条定点比对、不在主界面不许点坐标、已在地图不绕路、probe_bytes 与 probe 同源、粗扫留前 3 名后整屏匹配不退化）；右栏日志按账号分栏（B55：`_public` 白名单不带文件句柄、任务 `owners` 精确过滤、`tasks._decorate` 给多开子进程每行补 `[昵称]`、`group_tag` 单号组取昵称、worker 命令与 main 入口分支都在）；页面识别与日志样式（B56：主页=齿轮+邮件双图标、基建确认框双圆钮定位（一整块红色必须判否）、翻车只认 MaaCore 回调 + 重挂前「点一下再判活动关卡界面」、to_home 不在主页盲按、多账号 fight 默认走导航、`@skill` 注册表派生、MAA 风格「选择干员/当前步骤/每关完成」+ 子任务回调码钉在 20000 段/老 70000 段也认/子任务失败翻人话/练度修正不再进 notes、翻车重挂只换翻车那关且没候选时同一份再试、跨分区分段导航、散点关卡（S 关）认格子→点进编队→单作业模式一关一趟） |
 | C | 临时副本里 `--no-window` 拉起服务，探活 `/api/ping`、`/api/bootstrap`、`/api/gamedata`；bootstrap 报告的账号数据路径在 `config/` 本层且 `config/skland` 不再被创建；日志落在 `debug/app.log`；结束后副本根目录除 `config/`、`debug/` 外零新增 |
 
 ### B36 打关预检（2026-11-18）
@@ -128,7 +128,9 @@ mock 掉，验证闸门口径——
 MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度，不需要
 前面垫一条普通；上一版排「普通 → 突袭」两条就是白烧一次理智。
 
-- 默认 `raid='auto'`：有突袭作业的关**只排突袭**一条
+- 默认 `raid='auto'`：**只排普通**（2026-11-23 改；原先只排突袭，导致用户
+  说「挂 1 到 5 普通」被排成突袭）
+- `raid='raid'`：显式只排突袭
 - `raid='both'`：`普通 → 突袭` 两条，顺序不能反
 - `raid=False` / `'normal'`：只排普通
 - 逐关覆盖：`wants={'SV-EX-2': 'both'}` → EX-1 只突袭、EX-2 两条
@@ -153,7 +155,9 @@ MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度，
   绝不出现已成功的 `SV-EX-1`；返回值 `mark` 非 None
 - `_sweep_segments`：`['SV-1','SV-2','SV-EX-1','SV-S-1']` → 段名
   `普通关 / EX 关·普通 / EX 关·突袭 / S 关`，variant `normal/normal/raid/normal`；
-  `raid='normal'` 塌成三段；`tiers=['ex']` 只出 EX 两段；剧情关（ST）不进计划
+  `raid='normal'` 塌成三段；`tiers=['ex']` 只出 EX 两段；剧情关（ST）不进计划；
+  **`raid='raid'` 时 S 段仍是 normal**（S 突袭没奖励），要突袭得显式
+  `s_raid=True` 才会变 `raid`
 
 ### B44 当期活动导航（2026-11-19）
 
@@ -168,9 +172,10 @@ MaaCore 拿到 `is_raid=true` 会自己点 `ChangeToRaidDifficulty` 切难度，
   `base / ex / s`，每个都有兜底 `tap` 和 `roi`，EX 与 S 的 ROI 不能重叠
   （否则同一个按钮两段互相抢）
 - 路由：`goto_stage_list('TL-EX-1')` 先走 `eventnav.run`，不再去点老的活动大图
-- 重挂前点结算页：`_leave_result` 第一下必须点在 `_RESULT_TAP`（MAA 的
-  ClickCorner 中心），`probe == 'map'` 就停在关卡列表不再导航；不在关卡列表
-  时退回 `_navigate` 重新到位
+- 重挂前回活动关卡界面：`_leave_result` 第一下必须点在 `_RESULT_TAP`
+  （MAA ClickCorner，在地图上点了也不误触），**第一帧不许用 probe 判**；
+  点完 `probe == 'map'` 就放行且不再导航；点满 3 次仍不是地图时退回
+  `to_home` + `_navigate` 重新到位
 - 名单核对：`_tidy_stage_list(['SV-EX-1','SV-EX-2','SV-EX-7'], 用户点名
   ['SV-EX-1','SV-EX-2'])` → 剔掉 EX-7 并写日志；用户点名却没排进去的关也点名
 
@@ -327,6 +332,216 @@ B53 把「点哪」钉住了，这条钉的是「**从哪一页开始**」和「
   `backend/main.py` 里也有对应分支——少一个，多开就会静默退回单进程
 - `group_tag()` 一组一个号时取昵称、多号组返回空（每行本来就有各自前缀）
 
+
+### B56 页面识别 + 基建确认框 + 多账号默认导航 + 日志样式（2026-11-22 晚）
+
+- **主页判据**：合成 1920×1080 图，贴「设置齿轮 + 邮件」两个模板才算主页；
+  只贴齿轮（设置页那种情况）必须判否——只要一个就会把设置页认成主页
+- **基建确认框**：把 `confirm_cancel` / `confirm_ok` 两个模板按相对坐标贴回
+  一张 1920×1080 的图上 → `confirm_leave_bytes()` 返回「✓」的中心（±3px）；
+  只贴一个圆钮、主页、以及**一整块红色**（关卡列表误判过的老坑）都必须判否；
+  再验兜底 `_bar_bytes()` 的色彩签名（左半暗 + 右半红）能定位、主页不触发
+- **to_home 流程**：给两帧（设置页 → 主页），按一次返回就停，不许在主页上
+  再按（会弹「退出游戏」）；给两帧（确认框 → 主页），必须点在「✓」上且
+  `backs == 0`（这个弹窗按返回 / ESC 都退不出去）
+- **多账号默认导航**：`_nav_first(steps, many=True)` 给 fight 补
+  `wakeup + navigate`；`assumeStageList` / `noSwitch` 两种例外不补；单账号不动
+- **注册表**：`@skill` 登记的都在 `SKILLS` / `_NEEDS_GAME`，`signin` 不在
+  环境闸里，中文别名（扫图）能解析成正式名
+- **回调码**：`MSG_SUBTASK_START/EXTRA/ERROR` 必须等于 `20001/20003/20000`
+  （MaaCore 5.x/6.x 的 `AsstMsg`；写 70001 就是「一场仗打完日志一个字都没有」
+  那个坑）；`_translate` 对新旧两段都出 node/extra 事件；
+  `sub_error` + `Copilot@WaitUntilEndOfAction` → 「结算不是三星」那句人话；
+  装置占位那条 ERR 要翻成「不影响打」
+- **练度修正静默**：`_fix_oper` 补完 `requirements.elite` 后 notes 里不许出现
+  「精英要求」（用户 2026-11-22 说这是噪音），但技能/星级不合法照旧要记
+- **日志样式**：`BattleFormation` → `[芬, 斑点, 黑角]`；
+  `BattleFormationSelected` → `选择干员: 芬`；`CopilotAction` →
+  `当前步骤: 切换倍速 / 部署 黑角 / 开始挂机`；换作业时先 `✓ OS-1 完成`
+  再更新 `state['stage']`，并往 `results` 写一条 `ok=True`（重挂要靠它判过没过）
+- **翻车重挂只动翻车那关**：三关（OS-6 翻车、OS-7/OS-8 没打）→ 重排时 OS-6
+  换成候选 #401，OS-7 / OS-8 **保持原来那份**；没有候选池时同一份再试一次
+  （日志「没有别的作业，同一份 #301 再试一次」，`same_retry` 里留痕）；
+  失败原因是「理智不够」时直接不重挂
+- **翻车回关卡界面（`_leave_result`）**：先验「失败只认 MAA 回调」——
+  `chain_failed` 事件进来后 `results` 里必须出现一条 `ok=False`，且
+  `WaitUntilEndOfAction` 能翻译成「结算不是三星」；再验界面流程——给一张
+  深色地图帧（真 `probe_bytes` 判 `map`），点一次 `_RESULT_TAP` 就放行并打
+  「已回到活动关卡界面」；把 `probe_bytes` 桩成 `home` 时要连点 3 次，
+  再回落到 `to_home` + `_navigate`
+- **结算页自识别必须已经删掉**：`pages.is_result_bytes` / `pages.result_cover`
+  / `navtpl/pages/result_title.png` 都不该存在（2026-11-22 用户要求：失败
+  以 MAA 通知为准，别自己识别）
+
+### B57 跨分区分段导航（2026-11-22 晚）
+
+`segments_of` 纯逻辑，不用 MaaCore：
+
+- `OS-1/OS-2/OS-10/OS-EX-1/OS-EX-2` → **2 段**（`OS/base` 3 关、`OS/ex` 2 关），
+  段上带 `from`/`to` 首末关
+- 同分区 3 关 → 1 段（不许每关都导航一次）
+- `OS-EX-1/OS-S-1` → 2 段；`OS-1/OS-EX-1/OS-2` → **3 段且顺序原样**（绝不重排）
+- 主线 `1-7/2-1` → 1 段；`OS-ST-1/OS-1` → 1 段且归 `OS/base`（剧情关口径要
+  和 `eventnav.run` 一致，否则会切出没标定分区节点的段）
+
+`_run_tail` 用假 Engine + 桩掉 `_navigate`/`_leave_result`/`_wait_run`：
+
+- 跨 2 段：`append` 两次（3 关 + 2 关），**段间 `_leave_result('OS-10')`
+  一次**、`_navigate('OS-EX-1')` 一次；`can_reuse_nav=True` 时首段不导航；
+  日志有「跨 2 个分区」「切到新分区完成」
+- 段间导航失败**不许 raise**：照样 `append` 两段、返回 True、日志留「警告」
+- 抄作业前面排了别的任务（Recruit）→ `can_reuse_nav` 失效，**首段也要导航**
+  （断言 `naved == ['OS-1', 'OS-EX-1']`，append 顺序 Recruit→Copilot→Copilot）
+- 单分区普通情况：只 `append` 一次，零导航、零点结算页
+
+### B58 散点关卡（S 关，2026-11-23）
+
+用户原话：「MAA 无法识别 S 关卡」。OS 的 S 关浮在雪山地图上（积雪清理系统），
+MaaCore 的 `ClickStageName` 只在关卡列表里 OCR，认不出。这条路自己点到编队页，
+再一关排一个单作业模式的 Copilot 任务。
+
+纯逻辑 + 假 Touch/Engine：
+
+- **形状解析**：`OS-S-3` → 3；`OS-EX-1` / `OS-1` / `1-7` 一律 0（否则挂 EX 会
+  点成 S-1）；`has()` 能吃完整代号（以前只认前缀，分派永远不成立）
+- **模板齐全**：5 个格子 + 开始行动 / 突袭模式 / 开始突袭 / 快捷编队
+- **认格子**：把真模板贴回 1920 画布的对应位置 → 5 个全部认出；空图 → 一个都
+  没有；**S2 的模板贴到 S5 的位置必须不算**（ROI 把位置也锁死）
+- **详情面板 / 编队页判据**：「开始行动」在 → `has_detail`；「快捷编队」在 →
+  `in_formation`
+- **单作业参数**：`_single_params` 里**不许有 `copilot_list`**（有它就走
+  MultiCopilot 的 ClickStageName 导航），必须带 `filename`
+- **循环**（`run_scatter` + 假 Engine）：S1 普通 → S1 突袭 → S2 普通 三趟，
+  `open_stage` 依次收到 `(1,False)/(1,True)/(2,False)`，`stage_trail` 三条；
+  界面上没有的格子（未解锁）跳过不排作业；点开了但没进编队（理智不够）记进
+  `stages_failed` 并接着跑下一关
+
+### B59 定时任务预设（2026-11-23）
+
+定时任务从「只能填路径」扩成「预设里挑」，预设只负责猜程序在哪。用例钉四件
+事，不碰真实安装位置（临时目录造假 exe）：
+
+- **预设表**：`custom` 打头、`self` 第二，`maa` 与六个其它游戏预设都在；
+  `preset_id('MAA')` 大小写不敏感，乱填的 id 回落 `custom`
+- **不猜的地方不猜**：`custom` 没填程序必须报错，不许偷偷换成别的 exe
+- **MAA 预设**：把 `maaDir` 指到临时目录里的假 `MAA.exe` → `detect('maa')`
+  命中的就是它；任务里 `program` 空着，`_argv` 跑时按预设补上同一个路径
+- **扫盘**：给定目录里造 `BetterGI/bin/BetterGI.exe` → 按文件名找到；换名字
+  找不到；没给 exe 名就一次都不扫
+- **本体**：`fill('self')` 给的是本进程 python（源码模式带 `main.py` 参数）；
+  用户手填的 `program`/`args` 不许被 `resolve()` 覆盖
+- **自己的预设**：`config/schedule-presets.json` 能新增、能同 id 覆盖内置
+  （覆盖时不写 `exes` 就为空，不把内置的 exe 名带回来）
+- **保存清洗**：认识的 `preset` 留着，乱写回落 `custom`，老配置没这字段也对
+- **脱敏守卫**：遍历 `backend/` `frontend/` `docs/` `tools/`，三方项目名、真实
+  账号昵称、本人机器路径一个都不许出现（关键词在用例里拆成两半写，否则本文件
+  自己就先违规）
+
+### B60 实例绑定与渠道（2026-11-23）
+
+用户报「指定 5554 却影响 5556」和「启动不看 b 服还是官服」，一个用例钉住两条
+链路，全程不动真模拟器（`_devices` / `read_config` 换成假数据）：
+
+- **连接参数 vs 客户端类型**：假档案返回 `Config: LDPlayer` + `clientType:
+  Bilibili` → `_conn_for` 出来的 `config` 必须是 `LDPlayer`（那是 AsstConnect
+  认的连接配置名）、`client` 才是 `Bilibili`；档案没写连接配置时兜底 `General`
+- **地址校验**：`emulator-5556` / `127.0.0.1:16384` 收，`5556` 当场报错并提示
+  正确写法
+- **绑定落盘**：`/api/account/maa` 写 `adbAddress` → `acctbind.addr_of` /
+  `skills._addr_of` 都读到；本次点名（`_ADDR.map`）优先于绑定；`list_accounts`
+  带出 `maaAdbAddress`
+- **绝不换台**：钉的那台不在线 → `device_of` 原样返回钉的地址（不换成在线的
+  那台，交给 `envcheck` 按实例号去启动它，见 B62）；解绑后按档案走
+- **档案过期**：档案地址不在线时，两台在线 → 拦下要用户指定；只剩一台 → 顶上；
+  一台都没开 → 返回空交给 `envcheck` 去启动
+- **设备下拉**：`/api/account/devices` 返回在线列表（地址 + 状态）、本机实例
+  （`instances`，含没开的）和当前绑定
+
+### B61 客户端类型进任务参数 / 停止能按账号点名（2026-11-23）
+
+同一条跑机链上两个洞，一个用例一起钉住：
+
+- **渠道判定一个入口**：`resolve_client` 认 `Bilibili` / `bilibili服` / `官服`
+  / 乱写（→ `Official`）/ 空；只给 `accountFile` 时也能从账号的 `channelName`
+  回查出 `Bilibili`——上游漏传 `clientType` 也不会再按官服跑
+- **落进任务参数**：b 服账号的 `core_tasks` 里 `StartUp.client_type` 必须是
+  `Bilibili`（asst.log 里那个值才决定 `am start` 哪个包），官服账号是
+  `Official`；`_brief` 说的是人话「b服」
+- **停止按账号**：`owner_match` 认带/不带 `.json` 的文件名、不认空归属；
+  `stop_live([这个号])` 只停它一个，全停才把剩下的停掉，已停过的不重复计数
+- **名字解析**：`match_accounts` 完全相等优先，子串对上多个 → 报错（停错号
+  代价太大）
+
+### B62 多开启动：按地址反查实例号（2026-11-23）
+
+用户报「只能帮我启动 5554 的模拟器，启动不了 5556 的」。假 `ldconsole`（把
+`envcheck._run` 换掉，`list2` 回两个实例、`get-serialno` 回
+`emulator-5554/5556/5558`）钉住四件事：
+
+- **地址 → 序号**：`emulator-5556` → 实例 1；`127.0.0.1:5557`（adb 口）也是
+  实例 1；本机没有的 `emulator-9999` 和「明确是别的模拟器」都返回 `None`
+- **序号压过档案**：假档案 `InstanceIndex: 0`，`read_config(address=
+  'emulator-5556')` 必须给出 `index=1 / indexFrom='地址'`
+- **启动那一台**：`ensure(address='emulator-5556')` 时只有 5554 在线 →
+  `launch` 拿到的序号是 **1**（不是档案里的 0），日志说「实例 1」，并且
+  `wait_ready` 的 `wants` 里带着 `emulator-5556`
+- **三种边界**：目标已在线 → 放行且**零日志**；关了自动启动 → 只提示不动手；
+  反查不到是哪台实例 → 不猜也不启动，回「没在线」让用户自己开
+- **下拉里能选到没开的实例**：`/api/account/devices` 的 `instances` 同时给出
+  5554（开着）和 5556（`running=false`）——设置页要能选到关着的第二台
+- **界面接口**：`/api/run/stop {file}` 的 `accounts` 只含这个号；`{all:true}`
+  才是全停
+- **多开子进程**：`multiproc.stop_groups` 按这一组的 `files` 匹配，命中才
+  `kill`，并把 key 记进 `_STOPPED`（`run_group` 据此返回 `stopped=True`，
+  不记「子进程异常」）
+
+### B63 一路一个进程：多开第二个号不把前面那路跑挂（2026-11-23）
+
+用户报「我多开另一个号，他把我前面的停了」。asst.log 里没有 `TaskChainError`，
+只有 `Stop | block` + `~Assistant`：同一进程里开第二个 MaaCore，第一个正在跑的
+链被进程级全局资源重置打断，上层只看到 `TaskChainStopped`。用例钉住：
+
+- **名额只有一个**：`maacore.claim_inproc()` 第二次返回 `False`，`release` 之后
+  又能抢到（不释放就是「以后的跑机永远走子进程」）
+- **`live_others`**：本进程活着的实例计数，`exclude=` 不算自己（`Engine.open`
+  的闸门按它判）
+- **`run_skill` 让位**：主线程先占住名额 → 跑 `wakeup` 时必须走
+  `multiproc.run_group(kind='one')`，`_skill_body` 一次都不能在本进程被调用，
+  结果从子进程的 `results` 取回
+- **单组批量让位**：同样占住名额 → `run_batch` 走 `_run_group_proc`；没人占时
+  仍在本进程跑（别为单开白起一个进程）
+- **`run_plan` 单台同理**：占住名额 → 走 `multiproc.run_group(kind='plan')`
+- **停止不再默认全停**：`/api/run/stop` 既没 `file` 也没 `all` → 回 `error`
+  且 `stopped=0`
+
+### B64 退出确认点 ✕：不再按 ESC 把游戏关掉（2026-11-23）
+
+用户报「S 关入口没认出来 → 一路按 ESC → 主页也没认出来 → 停在『是否确认退出
+游戏？』→ 继续按 ESC，游戏直接退出」。两种确认弹窗的按钮条一模一样（左 ✕ 右 ✓），
+以前统一当基建框点了右边 ✓ = 替用户退出。用例用 PIL 合成帧（真模板原位贴，
+底色亮/暗两版）钉住：
+
+- **亮底 + 按钮条 = 退出确认**：`exit_confirm_bytes` 返回左半 ✕ 的坐标；
+  `confirm_leave_bytes` 也认得（两者都命中，谁先谁后由调用方保证——`to_home`
+  里退出确认排在前面）
+- **暗底 + 按钮条 = 基建确认**：`exit_confirm_bytes` 必须返回 `None`，
+  `confirm_leave_bytes` 返回右边 ✓（别把「离开基建」也取消了）
+- **没有按钮条的亮帧两个都不认**（别在普通页面上乱点）
+- **`to_home` 一次返回/ESC 都不许按**：喂「亮底按钮条 → 空白帧」，`to_home`
+  返回 `True`、`keys == []`、只 tap 一次且 x≈0.3464w
+
+### B65 难度口径：要突袭就真排突袭（2026-11-23）
+
+用户报「我让他打 OS-EX-8 突袭，结果两个账号导入的都是普通 EX-8」。根因是提示词
+写着「EX 关默认只打突袭」、代码默认已是普通（`auto→normal`），助手照描述办不传
+`raid`。用例钉住三处：
+
+- `_variant_arg`：`raid/突袭/only → raid`，`普通 → normal`，空 → 不筛
+- `_prepare_ops` 的第三个返回值 `raidMissing`：要突袭却只拿到普通 → 列出那几关；
+  本来要普通、或真排到突袭 → 必须为空
+- `add_stages` 真的按 `raid` 筛行：突袭行没有可用作业时**报错 + raidMissing、
+  一份都不写**（绝不拿普通顶上）；两行都有作业时只写突袭那条，
+  `difficulties` 回 `{关卡: '突袭'}`
 
 ## 什么时候跑
 

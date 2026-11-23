@@ -215,14 +215,14 @@ WR=画中人        ZT=崔林特尔梅之金
 
 ```jsonc
 {
-  "maaDir": "D:\\2.game\\MAA-ALL\\MAA-ARK\\MAA-v6.20.1-win-x64",
+  "maaDir": "D:\\MAA\\MAA-v5.0.0-win-x64",
   "maaEndDir": "",
-  "maaDirs": ["D:\\2.game\\MAA-ALL\\MAA-ARK\\MAA-v6.20.1-win-x64"],
+  "maaDirs": ["D:\\MAA\\MAA-v5.0.0-win-x64"],
   "autoStartMaa": true,
   "autoUpdatePack": true,
   "autoCheckAppUpdate": true,
   "acceptPrerelease": false,
-  "lastAccount": "小卡拉帕鲁灰#6408 官服.json"
+  "lastAccount": "示例昵称#6408 官服.json"
 }
 ```
 
@@ -262,8 +262,9 @@ WR=画中人        ZT=崔林特尔梅之金
       "mode": "time",        // time=按时间，chain=接在上一条后面
       "time": "08:00",
       "weekdays": [1, 2, 3, 4, 5, 6, 7],   // 1=周一 … 7=周日
-      "program": "D:\\tools\\autostart-138.exe",
-      "args": "--autostart --instance 138",
+      "preset": "custom",    // custom / self / maa / 其它游戏预设，只用来「猜」路径
+      "program": "D:\\Tools\\YourTool\\YourTool.exe",
+      "args": "",            // 空 = 用预设给的默认参数
       "cwd": "",             // 空 = 程序所在目录
       "timeout": 0,          // 秒，0=不限
       "notify": true
@@ -272,8 +273,27 @@ WR=画中人        ZT=崔林特尔梅之金
 }
 ```
 
+`preset` 只是给界面「猜」用的：`program` 空着也能存，跑的时候按预设再找一次
+（`self` = 本程序、`maa` = 设置里的 MAA 目录、其它 = 按 exe 名扫盘）。填了值
+一切以文件里的为准。
+
 删掉这个文件等于清空全部定时任务；程序运行中读的是内存缓存，改完要重启或
 在界面上再保存一次才生效。
+
+## schedule-presets.json（自定义定时预设，可选）
+
+内置的预设（`self` / `maa` / 原神 / 绝区零 / 鸣潮 / 终末地 / 重返未来 / MFA）
+写在 `scheduler.PRESETS`，这个文件只用来加自己的，**不用改代码**：
+
+```jsonc
+[
+  {"id": "mygame", "name": "我的游戏", "exes": ["my.exe"], "args": "--auto"},
+  {"id": "maa", "name": "MAA（自定义路径版本）", "exes": ["D:\\MAA2\\MAA.exe"]}
+]
+```
+
+同 `id` 覆盖内置那条（覆盖时只写想改的字段，没写的按空处理）；文件写坏了
+按内置表跑，不影响定时任务本身。
 
 ## 账号文件（<昵称> <服务器>.json）
 
@@ -286,6 +306,7 @@ schemaVersion 2 快照（`backend/core/updater.py` 的 `build_snapshot`）加一
   "account": { "uid": "…", "nickName": "…", "channelName": "官服", /* … */ },
   "maa":  { "dir": "D:\\…",            // 该账号绑定的 MAA 目录（空=用全局默认）
             "profile": "moren",         // 该账号用的 MAA 配置档案名（切号名从它读）
+            "adbAddress": "emulator-5556", // 钉在这台模拟器（空=用档案里的 Address）
             "accountName": "181****5505", // 切号名（MAA StartUp 的 AccountName）
             "accountNameFrom": "profile" }, // profile=跟着档案走 / manual=用户手填
   "skd":  { "alias": "大号",                               // 备注（添加时填的）
@@ -305,6 +326,11 @@ schemaVersion 2 快照（`backend/core/updater.py` 的 `build_snapshot`）加一
 `TaskQueue[0]`（StartUp）读 `AccountName` 当切号名，**不写回** MAA 的
 `gui.new.json`。`accountNameFrom=manual` 表示用户手填过，这时以账号里的
 `accountName` 为准，档案里的旧值不会盖回来。
+
+`maa.adbAddress` 是「这个号用哪台模拟器」的唯一落点（2026-11-23 加）：设置 →
+MAA 路径 → 模拟器下拉、助手的 `bind_emulator` 工具都写这一个字段。填了就是硬
+要求——那台不在线直接报错，**不会**换成第一台在线的（以前会同一条路径上两处
+兜底，把任务悄悄挪到隔壁那台）。留空才按 `profile` 档案里的 `Address` 走。
 
 ### 终末地账号
 

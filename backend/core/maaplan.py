@@ -52,10 +52,11 @@ from . import acctname, maa, maalog, multiproc, settings, tasks
 PROFILE_PREFIX = 'PRTS-'
 _SAFE = re.compile(r'[\\/:*?"<>|]')
 
-# 结算页「点一下继续」的位置（1280 口径）：MAA 自己的 ClickCorner 是
-# ``specificRect [1000, 20, 270, 50]``，定义里注明「点屏幕右边不会点到掉落
-# 物品，也不会关掉关卡选择」，取中心点用。翻车重挂前必须先点掉结算页，
-# 否则新作业集排下去 Copilot 在结算页上认不出关卡名（2026-11-19 用户实测）。
+# 结算页「点一下继续」的位置（1280 口径）：MAA 自己的 ClickCorner，
+# ``specificRect [1000, 20, 270, 50]`` 的中心。任务定义写明「点屏幕右边不会
+# 点到掉落物品，也不会关掉关卡选择」，所以结算页上能推进、已经在地图上点了
+# 也不误触（用户 2026-11-22 实测「失败后点屏幕任何位置都能立即返回关卡界面」，
+# 取这个「不会误触」的点更稳）。
 _RESULT_TAP = (1135, 45)
 
 #: 多开时几条线程都会往 report 里加行，加锁免得丢（也顺手把日志顺序稳住）
@@ -514,6 +515,58 @@ def client_type_of(channel):
     return 'Official'
 
 
+#: MaaCore 认的客户端类型（就是 ``resource/config.json`` 里 ``packageName``
+#: 的那几个 key）。跑机日志、任务参数里出现别的值时一定是上游传错了。
+CLIENT_IDS = frozenset(('Official', 'Bilibili', 'YoStarEN', 'YoStarJP',
+                        'YoStarKR', 'txwy'))
+
+
+def resolve_client(spec):
+    """``spec`` → 这一趟该按哪个客户端跑（唯一入口，别在各处再猜一次）
+
+    2026-11-23 用户报障：「还是把我 b 服账号认成官服的，毫不犹豫启动了官服，
+    在一群数字里找我 b 服账号」。asst.log 实证：
+
+        append_task StartUp {"client_type": "Official", ...}
+        am start -n com.hypergryph.arknights/...      ← 官服包
+
+    根因不是判定逻辑写错，而是**呼叫方漏传**：``skill_fight`` 建 spec 时只从
+    :func:`skills._profile_kw` 里取了 ``profile``，把同一份字典里的
+    ``clientType`` 丢了，``core_tasks`` 拿不到就只能按 ``Official`` 兜底。
+    所以客户端类型必须在这一处收口，并且允许从账号文件回查：
+
+    1. ``spec['clientType']``：显式给的（``Bilibili`` 或 ``bilibili服`` 都吃）
+    2. ``spec['channel']``：渠道名
+    3. ``spec['accountFile']``：账号文件里的 ``account.channelName``
+    4. 都没有 → ``Official``
+
+    第 3 条是兜底：以后谁再加一条跑机入口忘了带 clientType，也不会再拿官服
+    包去开 b 服账号。
+    """
+    raw = str(spec.get('clientType') or '').strip()
+    if raw:
+        if raw in CLIENT_IDS:
+            return raw
+        mapped = client_type_of(raw)
+        if mapped in CLIENT_IDS:
+            return mapped
+    if str(spec.get('channel') or '').strip():
+        return client_type_of(spec.get('channel'))
+    f = str(spec.get('accountFile') or spec.get('account') or '').strip()
+    if f:
+        try:
+            from . import accounts
+            snap = accounts.get_account(f) or {}
+            a = snap.get('account')
+            ch = (a.get('channelName') if isinstance(a, dict) else '') \
+                or snap.get('channelName') or ''
+            if ch:
+                return client_type_of(ch)
+        except Exception:
+            pass
+    return 'Official'
+
+
 def _copilot_dir(maa_dir):
     return os.path.join(maa_dir, 'config', 'copilot')
 
@@ -618,7 +671,7 @@ def core_tasks(spec, maa_dir=None):
     acc = acctname.normalize(spec.get('accountName') or '')
     switch = spec.get('switchAccount')
     switch = bool(acc) if switch is None else bool(switch)
-    client = spec.get('clientType') or client_type_of(spec.get('channel'))
+    client = resolve_client(spec)
     form = (spec.get('copilot') or {})
     per_round = spec.get('stagesPerRound')
 
@@ -689,9 +742,17 @@ def core_tasks(spec, maa_dir=None):
 
 
 def _connection(maa_dir, profile=None):
-    """从 MAA 配置里抄连接参数（ADB 路径 / 地址 / 连接方式）
+    """从 MAA 配置里抄连接参数（ADB 路径 / 地址 / 模拟器类型）
 
     用户已经在 MAA 里调通过一次连接的，直接复用，不用再问一遍。
+
+    **``config`` 是模拟器类型，不是客户端类型**（2026-11-23 查清的）：MAA
+    5.x/6.x 把 ``Gui.ConnectSettings.Config`` 换成了 ``LDPlayer`` /
+    ``MuMuEmulator12`` / ``General`` 这些「你用什么模拟器」，用来给自动检测
+    挑实例。以前这里把它原样喂给 ``AsstConnect`` 的第四个参数，而那个参数
+    是**客户端类型**（Official / Bilibili）——MaaCore 不认识 ``LDPlayer``，
+    按官服兜底，于是 b 服账号永远按官服包启动，表现就是「不看 b 服还是官服」。
+    客户端类型现在由账号渠道决定，见 :func:`_conn_for`。
     """
     cfg = maa._load_cfg(maa_dir)
     configs = cfg.get('Configurations') or {}
@@ -701,10 +762,128 @@ def _connection(maa_dir, profile=None):
     return {
         'adb_path': cs.get('AdbPath') or 'adb',
         'address': cs.get('Address') or '127.0.0.1:5555',
-        'config': cs.get('Config') or 'General',
+        'emu_kind': cs.get('Config') or '',      # LDPlayer / MuMuEmulator12 …
+        'config': cs.get('Config') or '',        # 老字段名，别直接喂给 AsstConnect
         'touch': cs.get('TouchMode') or 'MiniTouch',
         'maa_dir': maa_dir,          # 导航失败时往它的 debug/ 存现场截图
     }
+
+
+#: MaaCore 认的客户端类型。账号渠道才是权威来源（官服 / b 服是两个包）
+CLIENT_CN = {
+    'Official': '官服', 'Bilibili': 'b服', 'txwy': '台服',
+    'YoStarEN': '国际服', 'YoStarJP': '日服', 'YoStarKR': '韩服',
+}
+
+
+def _conn_for(spec):
+    """跑机用的连接参数 = MAA 档案抄来的 + 账号点名的三件事
+
+    三件事各有各的坑，缺一个就会「连到隔壁那台」或者「按官服启动」：
+
+    - ``address``：用户/账号绑定的模拟器地址 > MAA 档案里的地址
+    - ``config``：**连接配置名**（``General`` / ``LDPlayer`` / ``MuMuEmulator12``），
+      就是 ``AsstConnect`` 第四个参数。这里 2026-11-23 曾经写错成客户端类型，
+      asst.log 里每次连接都留一行
+        ConnectionInfo ... "why":"ConfigNotFound"
+        ERR config  Official not found
+      MAA 找不到这个连接配置，退回 ``General`` 才连上（能用，但每次都要先
+      报一次错，且丢了模拟器专属的 adb 调优）。连接配置名只能来自档案的
+      ``ConnectSettings.Config``。
+    - ``client``：客户端类型（``Official`` / ``Bilibili``…）。**只进任务参数**
+      （``StartUp.client_type``），不进 ``AsstConnect``——两个参数长得像，
+      但一个认模拟器、一个认客户端，混了就是「b 服账号开官服包」。
+    - ``touch``：档案里的触摸模式，没写就 MiniTouch
+    """
+    d = spec.get('maaDir') or ''
+    conn = _connection(d, spec.get('profile'))
+    addr = str(spec.get('adbAddress') or '').strip()
+    if addr:
+        conn = dict(conn, address=addr)
+    client = resolve_client(spec)
+    conn['config'] = str(conn.get('emu_kind') or '').strip() or 'General'
+    conn['client'] = client
+    return conn
+
+
+def _client_cn(conn):
+    """日志里说人话：``b服`` / ``官服``，别只丢一个 Bilibili"""
+    c = str((conn or {}).get('client') or 'Official')
+    return CLIENT_CN.get(c, c)
+
+
+# ---------------------------------------------------------------- 分段导航
+# MaaCore 的多关 Copilot 是**一条任务链里连着跑**的，关卡之间它只会
+# ``ClickStageName`` 在**当前这一页**上 OCR 找关卡名。它不会去点活动地图上的
+# 分区节点（圣巡之旅 / 变革之路 / 喀兰之心），也不会返回上一层换页。所以打完
+# OS-10 之后界面还停在基础区列表，OS-EX-1 根本不在这一页上——它会一直找，
+# 整轮卡死在那儿（2026-11-22 用户实测：「挂完 OS-10 后，没有切换我们的导航到
+# EX 的关卡界面，就直接挂 OS-EX-1 了，导致 MAA 一直找不到」）。
+#
+# 解法：把作业按「活动 + 分区」切成若干段，段与段之间停一下 MAA，点掉结算页、
+# 重新导航到下一段的分区，再把那一段排进去。多花 10~15 秒，换「作业永远排在
+# 它该在的那一页上」。
+def _zone_of(stage_code):
+    """关卡代号 → 分区类型（``base`` / ``ex`` / ``s`` / ``mo``）
+
+    **口径必须和 ``eventnav.run`` 选分区节点时完全一致**：那边也是
+    ``zone_kind`` 算完再套一份白名单，``st``（剧情关）/``f``（额外关）都归
+    基础区——它们在游戏里本来就待在基础区列表里。这里如果另分一档出来，就会
+    把作业切成「没标定过分区节点」的段，导航必然失败。
+    """
+    try:
+        from . import stagenav
+        k = stagenav.zone_kind(stage_code) or 'base'
+    except Exception:
+        k = 'base'
+    return k if k in ('base', 'ex', 's', 'mo') else 'base'
+
+
+def _seg_key(stage_code):
+    """一关属于哪一段：``活动前缀/分区``，例如 ``OS/ex``、``/base``（主线）"""
+    try:
+        from . import eventnav
+        pre = eventnav.prefix_of(stage_code) or ''
+    except Exception:
+        pre = ''
+    return '%s/%s' % (pre, _zone_of(stage_code))
+
+
+def segments_of(rows):
+    """作业列表 → 按「活动 + 分区」切好的段
+
+    每段是 ``{'key', 'rows', 'from', 'to'}``；``rows`` 原样保留（喂给
+    ``_copilot_params`` 的就是它）。
+
+    **只合并连续的同类，绝不重排**：用户要是把顺序排成 OS-1 → OS-EX-1 →
+    OS-2，那就老实切三段来回跑。偷偷重排等于替他改打关顺序，出问题全是
+    「为什么先打了后面那关」这种没法解释的疑问。
+    """
+    segs = []
+    for r in (rows or []):
+        code = str((r or {}).get('stage_name') or '').strip()
+        if not code:
+            continue
+        key = _seg_key(code)
+        if segs and segs[-1]['key'] == key:
+            segs[-1]['rows'].append(r)
+            continue
+        segs.append({'key': key, 'rows': [r]})
+    for s in segs:
+        s['from'] = str(s['rows'][0].get('stage_name') or '')
+        s['to'] = str(s['rows'][-1].get('stage_name') or '')
+    return segs
+
+
+def _seg_label(seg):
+    """日志里怎么写这一段：``OS 基础区 10 关（OS-1~OS-10）``"""
+    pre, _, kind = (seg.get('key') or '/base').partition('/')
+    name = {'base': '基础区', 'ex': 'EX 区', 's': 'S 区',
+            'mo': 'MO 区'}.get(kind, kind.upper() or '基础区')
+    a, b = seg.get('from') or '?', seg.get('to') or '?'
+    span = a if a == b else '%s~%s' % (a, b)
+    head = ('%s %s' % (pre, name)) if pre else name
+    return '%s %d 关（%s）' % (head, len(seg.get('rows') or []), span)
 
 
 def _navigate(conn, stage, log, client=None, strict=False):
@@ -767,11 +946,8 @@ def run_core(spec, tid=None, timeout=None):
         if not maa.close(d):
             raise RuntimeError('MAA 关不掉，请手动退出后重试')
 
-    conn = _connection(d, spec.get('profile'))
-    # 多开：用户/批量任务点名的模拟器地址优先（账号档案里可能写着同一台）
-    if spec.get('adbAddress'):
-        conn = dict(conn, address=spec['adbAddress'])
-    log('连接 %s（%s）…' % (conn['address'], conn['config']))
+    conn = _conn_for(spec)
+    log('连接 %s（%s）…' % (conn['address'], _client_cn(conn)))
     # 抄作业时 MAA 每换一份作业就发一条 CopilotListLoadTaskFileSuccess，
     # 文件名是我们自己按代号存的（BB-S-3_10531.json）。记下来就能知道
     # 「跑到第几关、卡在哪一关」——预检说打不了的和实际卡住的才能对上。
@@ -797,7 +973,7 @@ def run_core(spec, tid=None, timeout=None):
     #   done/summary 干员培养的成果（skill_train 用来算还剩哪些没做）
     state = {'stage': '', 'trail': [], 'by_file': by_file, 'cid_of': cid_of,
              'tried': tried, 'results': [], 'cleared': {}, 'cur_cid': 0,
-             'actions': {}, 'deployed': [], 'nodes': {},
+             'actions': {}, 'deployed': {}, 'nodes': {},
              'last_log': time.time(), 'pause': '', 'pause_detail': '',
              'done': {}, 'summary': {}, 'stop': None,
              'plans': spec.get('plans') or []}
@@ -806,7 +982,8 @@ def run_core(spec, tid=None, timeout=None):
         state['last_log'] = time.time()
         log(msg)
 
-    eng = maacore.Engine(d, on_event=lambda ev: _on_core_event(ev, evlog, tid, state))
+    eng = maacore.Engine(d, on_event=lambda ev: _on_core_event(ev, evlog, tid, state),
+                          owner=spec.get('accountFile') or '')
     state['stop'] = eng.stop
     # MAA 自己写的 asst.log 里有些话不走回调（认不出关卡名、干员不存在、参数
     # 不合法…）。起一个轻量线程跟着读，翻成人话补进同一条任务日志——用户
@@ -877,6 +1054,12 @@ def run_core(spec, tid=None, timeout=None):
                 'use_sanity_potion': bool(form.get('sanityPotion', True)),
                 'formation_index': 1}))
 
+        # 整轮的时间预算（分段抄作业、换作业重挂都用它算「还剩多少时间」）
+        total = timeout or (60 * 60 * 8)
+        t_start = time.time()
+        budget = t_start + total
+        finished = True
+
         # 队列头是 StartUp 就先只跑它，剩下的一律等登录完成再排——**绝不能
         # 让导航和唤醒并发**：唤醒点 START / 登录 / 关公告的那几十秒里界面
         # 根本不在主界面，导航按下去全落在启动页甚至安卓桌面上（2026-11-17
@@ -885,14 +1068,21 @@ def run_core(spec, tid=None, timeout=None):
         started_login = bool(seq) and seq[0][0] == 'StartUp'
         head, tail = (seq[:1], seq[1:]) if started_login else (seq, [])
 
-        for typ, params in head:
-            eng.append(typ, params)
-            log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
-        log('开始执行（%s）' % _label_of(head[0][0]))
-        if not eng.start():
-            raise RuntimeError('AsstStart 返回失败')
-
-        if started_login:
+        if spec.get('noNav'):
+            # 直跑模式（调用方已经把界面停在想要的位置）：不唤醒、不导航。
+            # 但**跨分区还是要分段**——MaaCore 不会点活动地图的分区节点，一把
+            # 排到 EX 就是「一直找不到 OS-EX-1」（2026-11-22 用户实测）。
+            # can_reuse_nav=True = 首段沿用调用方已经做好的那次导航。
+            log('开始执行（%s）' % _label_of(seq[0][0]))
+            finished = _run_tail(eng, seq, spec, state, log, conn, d, budget,
+                                 can_reuse_nav=True)
+        elif started_login:
+            for typ, params in head:
+                eng.append(typ, params)
+                log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
+            log('开始执行（%s）' % _label_of(head[0][0]))
+            if not eng.start():
+                raise RuntimeError('AsstStart 返回失败')
             # ---- 第一段：登录 -------------------------------------------------
             # 等「开始唤醒」这条链跑完（不是等全部，后面还没排）。
             # 登录失败就别往下走了：MaaCore 会一直重试切号/点开始，白烧时间。
@@ -932,37 +1122,50 @@ def run_core(spec, tid=None, timeout=None):
                     log('导航没成功，交给 MAA 自己试（当期活动它认得）')
 
             # ---- 第三段：排作业，开打 -----------------------------------------
-            for typ, params in tail:
+            # 抄作业可能跨分区（基础区 → EX 区），_run_tail 会在段与段之间
+            # 停一下、导航过去再排（见文件顶部「分段导航」）。
+            finished = _run_tail(
+                eng, tail, spec, state, log, conn, d, budget,
+                can_reuse_nav=bool(first) and not spec.get('noNav'))
+        else:
+            # 防御分支：seq 里没有 StartUp（core_tasks 会强制补，正常走不到）。
+            # 整队原样排，先导航再跑——游戏没开时导航失败要立刻暴露。
+            for typ, params in head:
                 eng.append(typ, params)
                 log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
-            if tail and not eng.start():
+            log('开始执行（%s）' % _label_of(head[0][0]))
+            if not eng.start():
                 raise RuntimeError('AsstStart 返回失败')
-        elif first and not spec.get('noNav'):
-            # 没有 StartUp 的任务链（core_tasks 会强制补，正常走不到）：
-            # 先导航再跑，结果必须检查——游戏没开时导航失败要立刻暴露。
-            # noNav 直跑模式例外：不导航，Copilot 从当前位置自己接手。
-            nav_ok, nav_why = _navigate(
-                conn, first, log, client=spec.get('clientType'),
-                strict=bool(spec.get('profile') or spec.get('adbAddress')))
-            if not nav_ok:
-                from . import stagenav, eventnav
-                if (stagenav.tpl_path_of(first) or stagenav.event_of(first)[0]
-                        or eventnav.has(first)):
-                    raise RuntimeError('导航没到位（%s），不再把作业交给 MAA'
-                                       % nav_why)
-
-        total = timeout or (60 * 60 * 8)
-        budget = time.time() + total
-        finished = _wait_run(eng, total, log, state)
+            if first:
+                nav_ok, nav_why = _navigate(
+                    conn, first, log, client=spec.get('clientType'),
+                    strict=bool(spec.get('profile') or spec.get('adbAddress')))
+                if not nav_ok:
+                    from . import stagenav, eventnav
+                    if (stagenav.tpl_path_of(first) or stagenav.event_of(first)[0]
+                            or eventnav.has(first)):
+                        raise RuntimeError('导航没到位（%s），不再把作业交给 MAA'
+                                           % nav_why)
+            finished = _wait_run(eng, max(1.0, budget - time.time()), log, state)
         # ---- 换作业重挂：翻车的那几关再试一次（已成功的关不重打）----------
         # 用户 2026-11-19 需求 3：作业集里这一关的作业不行就换一份别的，
         # 自动接着挂，并且日志里说清楚换了哪份。
         swapped, chains_mark = [], None
-        if state.get('results') and spec.get('retry'):
+        failed = any(not r.get('ok') for r in (state.get('results') or []))
+        if failed and spec.get('copilotList'):
+            # 用户 2026-11-22「我刚刚确实是 2 星，但是 agent 并没有帮我换作业
+            # 重新挂」：旧条件要求 spec['retry'] 非空，而每关只有一份候选时
+            # _prepare_ops 根本不给 retry，于是翻车后什么都不做。现在只要翻
+            # 过车就交给 _retry_failed——里面没得换会同一份再试一次。
             swapped, chains_mark = _retry_failed(eng, spec, state, log, d, budget,
                                                  conn=conn)
         if not finished and not state.get('pause'):
-            log('等了 %d 分钟还没跑完，先停下' % (total // 60))
+            # 报**实际等了多久**，别拿时间预算当耗时：以前这里打 ``total // 60``，
+            # 明明只跑了两分钟也会写「等了 60 分钟」/「等了 6 分钟」，用户看日志
+            # 只会以为程序算错了时间（2026-11-23）。
+            log('跑了 %d 分 %d 秒还没结束，先停下'
+                % (int(time.time() - t_start) // 60,
+                   int(time.time() - t_start) % 60))
             eng.stop()
         if state.get('pause'):
             log('已暂停：%s' % state['pause'])
@@ -999,16 +1202,24 @@ def run_core(spec, tid=None, timeout=None):
         _, still = _tally(state.get('results') or [])
         failed_stage = state['stage'] if bad else ''
         failed_why = next((c.get('why') for c in bad if c.get('why')), '') if bad else ''
+        # 用户点「停止挂机」时 wait 也返回 False，但这不是超时：以前 timed_out
+        # 一律为 True，上层就报「跑满 120 分钟还没结束」（2026-11-23 用户手动
+        # 暂停，日志跟事实完全对不上）。注意只认 ``stopped_by_user``：上面
+        # 超时收尾自己也会调 ``eng.stop()``，那不是「你按了停止」。
+        user_stop = bool(getattr(eng, 'stopped_by_user', False)) and not finished
+        if user_stop:
+            log('已停止（你按了停止），不再往下排')
         return {'ok': (finished and not bad) or bool(state.get('pause')),
                 'tasks': len(seq),
                 'chains': eng.chains,
-                'timed_out': not finished,
+                'timed_out': (not finished) and not user_stop,
                 'failed_stage': failed_stage,
                 'failed_why': failed_why,
                 'stage_trail': state['trail'],
                 'stages_failed': still,
                 'swaps': swapped,
-                'paused': state.get('pause') or '',
+                'paused': (state.get('pause')
+                           or ('手动停止' if user_stop else '')),
                 'pauseDetail': state.get('pause_detail') or '',
                 'trained': state.get('done') or {},
                 'trainSummary': state.get('summary') or {},
@@ -1019,6 +1230,245 @@ def run_core(spec, tid=None, timeout=None):
         if tap_thread.is_alive():
             tap_thread.join(timeout=2)
         eng.close()
+
+
+def _single_params(row, spec):
+    """单作业模式的 Copilot 参数：只给 ``filename``，**不给** ``copilot_list``
+
+    MaaCore 里那句是 ``CopilotTask set_params failed, stage_name or filename
+    not found``——filename 单独就能成立。给了 copilot_list 它就走 MultiCopilot，
+    每关都要 ``ClickStageName`` 在关卡列表里 OCR 找名字；而散点关卡（OS-S-*）
+    根本不在那种列表里，认不出来（用户 2026-11-23：「MAA 无法识别 S 关卡」）。
+    只给 filename 它就不导航，界面在哪从哪开始——正好我们从编队页交给它。
+    """
+    p = _copilot_params([row], spec)
+    p.pop('copilot_list', None)
+    p['filename'] = row.get('filename')
+    return p
+
+
+def run_scatter(spec, tid=None, timeout=None):
+    """散点式关卡（S 关这类）：一关一关点进去，用**单作业模式**打
+
+    和 :func:`run_core` 唯一的区别：作业不是「整队排给 MAA 让它自己找关」，而是
+    我们自己点到干员编队页、一关排一个 Copilot 任务。原因见 :mod:`scatter`：
+    OS 的 S 关浮在雪山地图上（积雪清理系统），MaaCore 的 ``ClickStageName``
+    在关卡列表里 OCR，这种界面一个都认不出。
+
+    返回结构刻意和 ``run_core`` 对齐（``ok`` / ``stage_trail`` /
+    ``stages_failed`` / ``error``），调用方的收尾逻辑不用改。
+
+    ``spec`` 除了 run_core 那些，还要 ``copilotList``：**每一条就是一趟**
+    （普通/突袭各一条），``is_raid`` 决定点「开始行动」还是「开始突袭」。
+    """
+    from . import maacore, scatter, eventnav, stagenav
+
+    log = tasks.log_factory(tid) if tid else (lambda *_: None)
+    d = spec.get('maaDir') or settings.load().get('maaDir') or ''
+    if not d:
+        raise ValueError('还没设置 MAA 目录')
+
+    rows = [r for r in (spec.get('copilotList') or []) if r.get('filename')]
+    if not rows:
+        raise ValueError('散点关卡要作业文件（copilotList 是空的）')
+    first = str(rows[0].get('stage_name') or '')
+    pre = eventnav.prefix_of(first)
+    lay = scatter.layout_of(pre)
+    if not lay:
+        raise ValueError('「%s」没有散点关卡的标定（navtpl/scatter）' % (pre or first))
+    log('%s：%s，一关一个作业（单作业模式）'
+        % (lay.get('label') or pre, '、'.join(
+            '%s%s' % (r.get('stage_name'), '突袭' if r.get('is_raid') else '')
+            for r in rows)))
+
+    mine = maa.running_in(d)
+    if mine:
+        log('先关掉正在运行的 MAA 窗口（避免和直连抢模拟器）…')
+        if not maa.close(d):
+            raise RuntimeError('MAA 关不掉，请手动退出后重试')
+
+    conn = _conn_for(spec)
+    log('连接 %s（%s）…' % (conn['address'], _client_cn(conn)))
+
+    total = timeout or (2 * 60 * 60)
+    deadline = time.time() + total
+    state = {'trail': [], 'results': [], 'nodes': {}, 'stage': '',
+             'by_file': {}, 'cid_of': {}, 'cur_cid': 0}
+    trail, failed = [], []
+    touched = 0
+
+    touch = stagenav.Touch(conn['adb_path'], conn['address'], log,
+                           package=stagenav.game_package(spec.get('clientType')),
+                           # 地址是钉死的（账号绑定 / 档案指定）就不许 adb 自检
+                           # 自己换一台——换了就是动了另一个号/另一台模拟器
+                           strict=bool(spec.get('profile')
+                                       or spec.get('adbAddress')))
+    alive, detail = touch.ready()
+    if not alive:
+        log('连不上模拟器：%s' % detail)
+        return {'ok': False, 'error': detail, 'stage_trail': [], 'stages_failed': [],
+                'chains': [], 'timed_out': False, 'failed_stage': '',
+                'failed_why': '', 'swaps': [], 'paused': '', 'pauseDetail': '',
+                'trained': {}, 'trainSummary': {}, 'stageReport': 'trail'}
+
+    # 先到 S 关界面：复用活动导航（点「喀兰之心」那个分区节点），它认得出
+    # 主页 / 终端页 / 活动地图，比我们自己拼一条路稳。
+    # 已经在 S 关界面就别再导航一次：那页右下角也摆着三个分区节点，
+    # eventnav 的「已经在活动地图上」会成立，接着去点「喀兰之心」，画面不变
+    # 就判失败——多绕一圈还报个假错误。
+    data = touch.shot()
+    if scatter.is_here(data, pre):
+        log('已经在 S 关界面，跳过导航')
+    else:
+        nav_ok, nav_why = eventnav.run(touch, first, log)
+        if not nav_ok:
+            log('导航没到 S 关界面：%s' % nav_why)
+            return {'ok': False, 'error': nav_why, 'stage_trail': [],
+                    'stages_failed': [], 'chains': [], 'timed_out': False,
+                    'failed_stage': '', 'failed_why': '', 'swaps': [],
+                    'paused': '', 'pauseDetail': '', 'trained': {},
+                    'trainSummary': {}, 'stageReport': 'trail'}
+        time.sleep(1.5)
+    # 详情面板如果是开着的（上一轮点开过），先点掉再认格子
+    scatter.back_to_cells(touch, pre, log)
+    data = touch.shot()
+    if not scatter.is_here(data, pre):
+        log('到了「%s」但没认出任何关卡按钮（模板过期？）' % (lay.get('label') or pre))
+        return {'ok': False, 'error': 'S 关按钮一个都没认出来',
+                'stage_trail': [], 'stages_failed': [], 'chains': [],
+                'timed_out': False, 'failed_stage': '', 'failed_why': '',
+                'swaps': [], 'paused': '', 'pauseDetail': '', 'trained': {},
+                'trainSummary': {}, 'stageReport': 'trail'}
+    cells = scatter.cells_of(data, pre)
+    log('认到 %d 个关卡按钮：%s'
+        % (len(cells), '、'.join('%s-S-%d' % (pre, i) for i in sorted(cells))))
+
+    eng = maacore.Engine(d, on_event=lambda ev: _on_core_event(ev, log, tid, state),
+                          owner=spec.get('accountFile') or '')
+    eng.open()
+    try:
+        if not eng.connect(conn['adb_path'], conn['address'],
+                           conn.get('config') or 'General',
+                           conn.get('touch') or 'MiniTouch'):
+            log('MaaCore 连不上模拟器')
+            return {'ok': False, 'error': 'MaaCore 连不上模拟器',
+                    'stage_trail': [], 'stages_failed': [], 'chains': [],
+                    'timed_out': False, 'failed_stage': '', 'failed_why': '',
+                    'swaps': [], 'paused': '', 'pauseDetail': '', 'trained': {},
+                    'trainSummary': {}, 'stageReport': 'trail'}
+        for i, row in enumerate(rows, 1):
+            if time.time() > deadline:
+                log('跑满 %d 分钟，剩下的关不打了' % int(total // 60))
+                break
+            if state.get('pause'):
+                log('已暂停（%s）' % state['pause'])
+                break
+            code = str(row.get('stage_name') or '')
+            idx = scatter.cell_index(code)
+            raid = bool(row.get('is_raid'))
+            label = '%s%s' % (code, ' 突袭' if raid else ' 普通')
+            log('---- [%d/%d] %s ----' % (i, len(rows), label))
+            if not idx or idx not in (lay.get('cells') or {}):
+                log('跳过 %s：标定里没有这个编号' % code)
+                continue
+            # 格子只在进界面时认一次：详情面板一展开，整屏会蒙一层暗色，
+            # 所有模板的分数一起升高（实测 S2/S4 从 0 分涨到 11 分），这时
+            # 重新识别会把「有」看成「没有」。坐标是钉死的，认一次就够。
+            if idx not in cells:
+                log('跳过 %s：进界面时没看到这个按钮（没解锁）' % code)
+                continue
+            ok_open, why = scatter.open_stage(touch, pre, idx, raid, log,
+                                           pos=cells.get(idx))
+            if not ok_open:
+                log('跳过 %s：%s' % (code, why))
+                failed.append({'stage': code, 'why': why})
+                continue
+            touched += 1
+            state['stage'] = code
+            state['nodes'] = {}
+            mark = len(eng.chains)
+            try:
+                eng.append('Copilot', _single_params(row, spec))
+            except Exception as e:                  # noqa: BLE001 参数不对就别硬跑
+                log('MAA 不接受这份作业：%s' % e)
+                failed.append({'stage': code, 'why': str(e)})
+                scatter.back_to_cells(touch, pre, log)
+                continue
+            if not eng.start():
+                log('AsstStart 返回失败')
+                failed.append({'stage': code, 'why': 'AsstStart 返回失败'})
+                scatter.back_to_cells(touch, pre, log)
+                continue
+            left = max(120.0, deadline - time.time())
+            budget = min(1200.0, left)
+            t0 = time.time()
+            done = eng.wait(timeout=budget)
+            spent = time.time() - t0
+            if not done and getattr(eng, 'stopped', False):
+                # 用户自己点了「停止挂机」（stop_all_live → AsstStop）：这不是
+                # 超时也不是失败。2026-11-23 用户手动暂停，日志却写「这一关
+                # 超时（1200 秒）」，他当场就问「前后矛盾」。
+                log('已停止（你按了停止），剩下的关不打了')
+                state['user_stop'] = True
+                break
+            bad = [c for c in eng.chains[mark:] if not c.get('ok')]
+            if bad:
+                # 失败优先看链本身。MaaCore 在编队缺干员这类硬错误上不发
+                # TaskChainError，只发 SubTaskError + TaskChainStopped，
+                # maacore 那边已经把 why 补进 chains 了（2026-11-23）。
+                why = bad[0].get('why') or ''
+                opers = (state.get('last_sub_opers') or []) if state else []
+                cn = maacore.why_cn(why) or 'MAA 报任务链失败'
+                tail = '（缺：%s）' % '、'.join(opers) if opers else ''
+                log('%s 失败：%s%s' % (label, cn, tail))
+                failed.append({'stage': code, 'why': (cn + tail)})
+                # 缺干员是作业本身不匹配，重试同一份没用，直接跳过这关
+                if why:
+                    log('（%s 是作业和账号不匹配，这一关跳过，接着打下一关）'
+                        % cn)
+            elif not done:
+                # wait 返回 False 有三种：真跑满 budget、MAA 自己停了、
+                # 根本没跑起来。以前一律报「超时 1200 秒」，实测只等了 8 秒
+                # 就回来了，日志骗人 20 分钟（2026-11-23 用户报障）。
+                if spent >= budget - 5:
+                    log('这一关跑了 %d 秒还没结束，先停下' % int(spent))
+                    failed.append({'stage': code, 'why': '跑满 %d 秒' % int(spent)})
+                    eng.stop()
+                    break
+                else:
+                    sub = (state.get('last_sub_error') or '') if state else ''
+                    log('这一关 %.0f 秒就被中止了（MAA 没报完任务链就停了%s）'
+                        % (spent, ('，卡在 %s' % sub.split('@')[-1]) if sub else ''))
+                    failed.append({'stage': code, 'why': '任务被中止'})
+                eng.stop()
+            else:
+                log('%s 打完了（单作业模式不判三星，界面停在结算页）' % label)
+                trail.append(code + ('(突袭)' if raid else ''))
+                state.setdefault('results', []).append(
+                    {'stage': code, 'ok': True, 'why': '', 'at': time.time(),
+                     'cid': _cid_of(row.get('filename'))})
+            if not scatter.back_to_cells(touch, pre, log):
+                log('打完没能回到 S 关界面，剩下的关不打了')
+                break
+    finally:
+        eng.close()
+
+    return {'ok': not failed,
+            'tasks': touched,
+            'chains': [],
+            'timed_out': time.time() > deadline,
+            'failed_stage': failed[0]['stage'] if failed else '',
+            'failed_why': failed[0]['why'] if failed else '',
+            'stage_trail': trail,
+            'stages_failed': failed,
+            'swaps': [],
+            'paused': (state.get('pause')
+                       or ('手动停止' if state.get('user_stop') else '')),
+            'pauseDetail': state.get('pause_detail') or '',
+            'trained': {}, 'trainSummary': {},
+            'stageReport': 'trail',
+            'error': ('; '.join('%s：%s' % (x['stage'], x['why']) for x in failed)
+                      if failed else '')}
 
 
 def run_custom(spec, tid=None, timeout=None):
@@ -1055,11 +1505,8 @@ def run_custom(spec, tid=None, timeout=None):
         if not maa.close(d):
             raise RuntimeError('MAA 关不掉，请手动退出后重试')
 
-    conn = _connection(d, spec.get('profile'))
-    # 多开：用户/批量任务点名的模拟器地址优先（账号档案里可能写着同一台）
-    if spec.get('adbAddress'):
-        conn = dict(conn, address=spec['adbAddress'])
-    log('连接 %s（%s）…' % (conn['address'], conn['config']))
+    conn = _conn_for(spec)
+    log('连接 %s（%s）…' % (conn['address'], _client_cn(conn)))
 
     state = {'last': time.time(), 'node': '', 'node_log': 0.0, 'warned': 0,
              'stuck': ''}
@@ -1068,7 +1515,8 @@ def run_custom(spec, tid=None, timeout=None):
         state['last'] = time.time()
         log(msg)
 
-    eng = maacore.Engine(d, on_event=lambda ev: _on_custom_event(ev, evlog, state))
+    eng = maacore.Engine(d, on_event=lambda ev: _on_custom_event(ev, evlog, state),
+                          owner=spec.get('accountFile') or '')
     try:
         tap = maalog.Tap(d)
     except Exception:
@@ -1191,9 +1639,9 @@ def _custom_tap_line(text):
 
 # MaaCore 的 CopilotAction：抄作业时每做一个动作就报一次
 _ACTION_CN = {
-    'Deploy': '部署', 'Retreat': '撤退', 'UseSkill': '开技能',
-    'SwitchSpeed': '切二倍速', 'SkillDaemon': '技能就绪自动开',
-    'BulletTime': '子弹时间', 'StartAction': '开始行动',
+    'Deploy': '部署', 'Retreat': '撤退', 'UseSkill': '使用技能',
+    'SwitchSpeed': '切换倍速', 'SkillDaemon': '开始挂机',
+    'BulletTime': '子弹时间', 'StartAction': '已开始行动',
 }
 
 # 子任务（pipeline 节点）→ 人话。只挑用户能看懂的，其余一律不写：
@@ -1214,8 +1662,8 @@ _SUBTASK_CN = {
     'ToChapterNew': '进入章节',
     'StageBegin': '进入关卡',
     # 编队 / 开打
-    'BattleStartPre': '准备编队',
-    'BattleStartAll': '开始行动',
+    'BattleStartPre': '开始编队',
+    'BattleStartAll': '已开始行动',
     'BattleQuickFormation': '快速编队',
     'BattleQuickFormationConfirm': '确认编队',
     'BattleQuickFormationSkillPage': '编队·技能页',
@@ -1426,6 +1874,7 @@ def _on_train_detail(data, log, state):
 
 def _on_core_event(ev, log, tid, state=None):
     """把引擎事件转成任务日志（跑机面板实时能看到）"""
+    from . import maacore
     kind = ev.get('kind')
     if kind == 'error':
         log('[错误] %s' % (ev.get('text') or ''))
@@ -1440,30 +1889,81 @@ def _on_core_event(ev, log, tid, state=None):
     elif kind == 'done':
         log('全部任务跑完')
     elif kind == 'node':
-        # 只报「换了一个阶段」，同一阶段反复来不写（SubTaskStart 一秒十几条）
+        # MAA 的日志面板就是一行一个阶段（开始编队 / 已开始行动 / 战斗中…），
+        # 这里照同样的口径输出，不再加「·」前缀。
+        # SubTaskStart 一秒能来十几条，所以同一阶段只报一次；跨关卡时把去重
+        # 记录清掉（state['stage'] 变化），否则第二关的「已开始行动」会被上
+        # 一关的 20 秒窗口吞掉（2026-11-22 用户要求「像 MAA 那样每关都有」）。
         label = _subtask_label(ev.get('sub') or '')
         if not label:
             return
         now = time.time()
         last = (state or {}).get('nodes') or {}
-        if last.get('label') == label and now - last.get('at', 0) < 20:
+        if last.get('label') == label and now - last.get('at', 0) < 8:
             return
         if state is not None:
             state['nodes'] = {'label': label, 'at': now}
-        log('· %s' % label)
+        log(label)
+    elif kind == 'sub_error':
+        # 子任务失败：MaaCore 只说「哪个 pipeline 卡住」，原因要我们自己翻。
+        sub = ev.get('sub') or ''
+        key = sub.rsplit('@', 1)[-1]
+        why = ev.get('why') or ''
+        opers = ev.get('opers') or []
+        if why == 'OperatorMissing' or opers:
+            # 编队缺干员：作业要的干员账号里没有 / 没解锁。以前只说「选择干员
+            # 没成功」，用户根本猜不到是哪个人（2026-11-23 实测：圣聆初雪）。
+            log('缺干员：%s（作业要的干员账号里没有，换一份作业或先练）'
+                % ('、'.join(opers) or '未知'))
+        elif key in ('WaitUntilEndOfAction', 'EndOfAction'):
+            log('作战结束了，但结算不是三星（漏怪 / 作业没打过这关）')
+        else:
+            label = _subtask_label(sub)
+            if label:
+                log('%s 没成功' % label)
+            if why:
+                log('　原因：%s' % maacore.why_cn(why))
+        if state is not None:
+            state['last_sub_error'] = sub
+            state['last_sub_why'] = why
+            state['last_sub_opers'] = opers
     elif kind == 'extra':
         what = ev.get('what')
         data = ev.get('data') or {}
         if what == 'CopilotListLoadTaskFileSuccess':
             code = _stage_of_file(data, state)
             if code:
+                prev = (state or {}).get('stage') or ''
+                # 能在同一批里换到下一个作业，说明**上一关已经打完了**：
+                # MultiCopilot 是顺序执行的，翻车会走 TaskChainError 而不是
+                # 换关。MaaCore 在 Copilot 任务里不发 StageDrops，拿这个推
+                # 是最可靠的「每关成功」信号（2026-11-22 用户要求）。
+                if prev and prev.upper() != code.upper():
+                    log('✓ %s 完成' % prev)
+                    if state is not None:
+                        # 顺便记进 results：重挂（_retry_failed）靠它判断
+                        # 「这关到底过没过」。MaaCore 在 Copilot 里不发
+                        # StageDrops，换关是唯一可靠的「上一关三星通过」
+                        # 信号（2026-11-22 用户报「2 星后不换作业」时补的）。
+                        state.setdefault('results', []).append(
+                            {'stage': prev, 'ok': True, 'why': '',
+                             'at': time.time(),
+                             'cid': state.get('cur_cid') or 0})
                 log('换作业：%s' % code)
                 if state is not None:
                     state['stage'] = code
+                    state['nodes'] = {}      # 新一关，阶段去重重新开始
                     fn = os.path.basename(str(data.get('file_name') or ''))
                     state['cur_cid'] = (state.get('cid_of') or {}).get(fn) or 0
                     if code not in state['trail']:
                         state['trail'].append(code)
+        elif what == 'BattleFormationSelected':
+            # MAA 面板里一行一条「选择干员: 芬」。以前没接这个 what，
+            # 编队阶段只能看到一行笼统的「编队：…」（2026-11-22 用户对比
+            # MAA 日志后指出）。
+            sel = str(data.get('selected') or data.get('group_name') or '')
+            if sel:
+                log('选择干员: %s' % sel)
         elif what == 'CopilotAction':
             act = str(data.get('action') or '')
             target = str(data.get('target') or '')
@@ -1473,11 +1973,22 @@ def _on_core_event(ev, log, tid, state=None):
             if not label:
                 return
             now = time.time()
+            # MAA 面板的统一前缀是「当前步骤: 」。StartAction 例外——
+            # 它单独一行「已开始行动」。
+            if act == 'StartAction':
+                log(label)
+                return
+            step = '当前步骤: %s' % label
+            if target:
+                step += ' %s' % target
             if act == 'Deploy':
-                done = (state or {}).setdefault('deployed', [])
-                if target and target not in done:
-                    done.append(target)
-                    log('部署 %s' % target)
+                # 同一个干员 6 秒内只报一次（撤退再部署是正常的，别永久吞掉）
+                done = (state or {}).setdefault('deployed', {})
+                if target and now - done.get(target, 0) < 6:
+                    return
+                if target:
+                    done[target] = now
+                log(step)
                 return
             if act == 'UseSkill':
                 # 一场仗要开十几次技能，15 秒内只说一次，不然日志全是「开技能」
@@ -1485,17 +1996,18 @@ def _on_core_event(ev, log, tid, state=None):
                     return
                 if state is not None:
                     state['skill_at'] = now
-                log('开技能')
+                log(step)
                 return
             seen = (state or {}).setdefault('actions', {})
             if act in seen:
                 return
             seen[act] = now
-            log(label + ((' %s' % target) if target else ''))
+            log(step)
         elif what == 'BattleFormation':
+            # MAA 是先把干员名单单独打一行：``[芬, 斑点, 黑角, 安赛尔, 克洛丝]``
             names = [str(x) for x in (data.get('formation') or []) if x]
             if names:
-                log('编队：%s' % '、'.join(names[:12]))
+                log('[%s]' % ', '.join(names[:12]))
         elif what == 'StageInfo':
             name = data.get('name') or data.get('stage') or ''
             if name:
@@ -1576,6 +2088,104 @@ def _wait_run(eng, total, log, state):
                 state['last_log'] = time.time()
 
 
+def _run_tail(eng, tail, spec, state, log, conn, d, deadline, can_reuse_nav=False):
+    """排 tail 并开打；抄作业跨分区时中间停下来导航，返回「最后是否跑完」
+
+    普通任务（Fight / Recruit / Infrast…）各是一条独立链，原样排进队列。
+    抄作业不一样：**一条链里连着跑多关**，中途出不了手。所以这里把它前后的
+    任务分开，Copilot 自己按分区一段一段 ``append + start``，段与段之间停
+    MAA、点掉结算页、导航到下一段的分区（见文件顶部「分段导航」的说明）。
+
+    ``can_reuse_nav``：首关是不是**刚刚**导航过。只有「调用方已经导航且中间
+    没跑别的任务」时才为 True——这时第一段不用再导航，省 15 秒；其余情况
+    （前面排了收菜/招募之类）界面早就不在关卡列表上了，必须重新导航。
+    """
+    idx = next((i for i, (t, _) in enumerate(tail) if t == 'Copilot'), -1)
+    if idx < 0:
+        # 没有抄作业：整队原样排，行为和以前完全一样
+        for typ, params in tail:
+            eng.append(typ, params)
+            log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
+        if tail and not eng.start():
+            raise RuntimeError('AsstStart 返回失败')
+        return _wait_run(eng, max(1.0, deadline - time.time()), log, state)
+
+    before, (_, cop_params), after = tail[:idx], tail[idx], tail[idx + 1:]
+
+    if before:
+        for typ, params in before:
+            eng.append(typ, params)
+            log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
+        if not eng.start():
+            raise RuntimeError('AsstStart 返回失败')
+        if not _wait_run(eng, max(1.0, deadline - time.time()), log, state):
+            log('抄作业前面的任务没跑完，先停下')
+            return False
+        can_reuse_nav = False       # 前面的任务跑完，界面早就不在关卡列表了
+
+    segs = segments_of(spec.get('copilotList') or [])
+    if not segs:
+        # 作业列表是空的（core_tasks 已经把空 Copilot 跳过了，正常走不到）
+        eng.append('Copilot', cop_params)
+        log('排队：%s %s' % (_label_of('Copilot'), _brief('Copilot', cop_params)))
+        if not eng.start():
+            raise RuntimeError('AsstStart 返回失败')
+        return _wait_run(eng, max(1.0, deadline - time.time()), log, state)
+
+    if len(segs) > 1:
+        log('作业跨 %d 个分区，分段跑：%s'
+            % (len(segs), ' → '.join(_seg_label(s) for s in segs)))
+
+    finished = True
+    for i, seg in enumerate(segs):
+        left = deadline - time.time()
+        if left <= 60:
+            log('没时间跑剩下的 %d 段了（总时长到上限），停下' % (len(segs) - i))
+            finished = False
+            break
+        if state.get('pause'):
+            log('已暂停（%s），后面的段不跑了' % state['pause'])
+            break
+        if i:
+            # 上一段最后一关打完停在结算页：先点一下回到活动关卡界面，再去
+            # 新分区。顺序不能反——结算页上 MAA 的 ClickStageName OCR 不到
+            # 关卡名，排上去就是白跑（用户 2026-11-22 的硬条件）。
+            if not _leave_result(conn, spec, segs[i - 1]['to'], log):
+                log('没能离开结算页，剩下的 %d 段先不跑了' % (len(segs) - i))
+                finished = False
+                break
+            nav_ok, nav_why = _navigate(conn, seg['from'], log,
+                                       client=spec.get('clientType'))
+            log('切到新分区%s：%s' % ('完成' if nav_ok else '失败', nav_why))
+            if not nav_ok:
+                # 前面几关已经打完了，这里 raise 会把整轮记成失败。照样排下去
+                # 让 MAA 自己试一把（它有时能从列表滑过去），日志留痕就够。
+                log('警告：没导航到「%s」，这一段的作业可能全找不到关卡'
+                    % seg['from'])
+        elif not can_reuse_nav:
+            nav_ok, nav_why = _navigate(conn, seg['from'], log,
+                                       client=spec.get('clientType'))
+            log('导航%s：%s' % ('完成' if nav_ok else '失败', nav_why))
+
+        log('第 %d/%d 段：%s' % (i + 1, len(segs), _seg_label(seg)))
+        eng.append('Copilot', _copilot_params(seg['rows'], spec))
+        if not eng.start():
+            raise RuntimeError('AsstStart 返回失败')
+        if not _wait_run(eng, max(1.0, deadline - time.time()), log, state):
+            log('第 %d 段没跑完就停了，后面的段不跑了' % (i + 1))
+            finished = False
+            break
+
+    if after and finished and not state.get('pause'):
+        for typ, params in after:
+            eng.append(typ, params)
+            log('排队：%s %s' % (_label_of(typ), _brief(typ, params)))
+        if not eng.start():
+            raise RuntimeError('AsstStart 返回失败')
+        finished = _wait_run(eng, max(1.0, deadline - time.time()), log, state)
+    return finished
+
+
 def _nav_of(data):
     """换作业日志该显示哪个名字
 
@@ -1649,11 +2259,20 @@ def _mark_fail(ev, log, state):
     state['fail_stage'] = cur
     state['fail_at'] = time.time()
     why = str(ev.get('why') or '').strip()
-    try:
-        from . import stageplan
-        why = stageplan.explain_failure(why) or why
-    except Exception:
-        pass
+    if why:
+        try:
+            from . import stageplan
+            why = stageplan.explain_failure(why) or why
+        except Exception:
+            pass
+    else:
+        # MaaCore 的 TaskChainError 只带 taskchain/taskid，**没有原因字段**
+        # （2026-11-22 实测：details 是空的）。只能拿刚才那条 SubTaskError 推：
+        # Copilot@WaitUntilEndOfAction = 结算页认了 20 次没认出三星。不说这句
+        # 的话日志只有「MAA 没给原因」，用户根本不知道干嘛要换作业重挂。
+        sub = str(state.get('last_sub_error') or '')
+        if sub.rsplit('@', 1)[-1] in ('WaitUntilEndOfAction', 'EndOfAction'):
+            why = '结算不是三星（漏怪 / 作业没打过这关）'
     state.setdefault('results', []).append(
         {'stage': cur, 'ok': False, 'why': why, 'at': time.time(),
          'cid': state.get('cur_cid') or 0})
@@ -1678,50 +2297,61 @@ def _tally(results):
 
 
 def _leave_result(conn, spec, stage, log):
-    """翻车后把界面从「失败结算页」点回关卡列表；点不动就重新导航
+    """翻车后把界面退回**活动关卡界面**
 
-    用户 2026-11-19 的实测口径：一次战斗失败后要随便点一下界面回到关卡界面，
-    在那个界面重排作业集就能换作业开打，**不需要重新唤醒/登录**。
+    「这一局翻车了」这件事**只认 MaaCore 的回调**（``TaskChainError``，或
+    ``WaitUntilEndOfAction`` 子任务失败 = 结算不是三星），不靠自己截图猜
+    ——用户 2026-11-22 的原话：「失败识别应该以 maa 的失败通知为准，而不是
+    自己识别有没有失败」。
 
-    点哪儿不是随便挑的：用的是 MAA 自己 ``ClickCorner`` 那块
-    ``[1000, 20, 270, 50]``（1280 口径，中心 (1135,45)）——任务定义里写得很
-    清楚「点击屏幕右边，不会点到掉落物品，且不会关掉关卡选择的一块区域」，
-    所以结算页上能推进、在关卡列表上点了也无害，重复点几次都安全。
+    翻车之后界面一定停在「行动结束」结算页。用户同一天的实测口径：**点屏幕
+    任意位置都会立刻回到活动关卡界面**，在那个界面重排作业集就能换作业开打，
+    不需要重新唤醒/登录，也不需要写导航。所以这里**不认结算页**（星星和
+    「行动结束」标题都是自识别，1 星 / 直接失败 / 活动间 UI 差异都可能失效），
+    只做三步：
 
-    点完看一眼是不是回到关卡列表（``stagenav.probe == 'map'``）；不是就按
-    正常导航流程重新到位（首页 → 终端页 → 活动地图 → 分区）。这一段只保证
-    「界面能接受新的作业集」，失败也不抛错——真开不了打，下一轮还有日志。
+    1. 点一下 MAA 自己的 ClickCorner（``_RESULT_TAP``）——任务定义里写明
+       「点屏幕右边不会点到掉落物品，也不会关掉关卡选择」，所以结算页上能
+       推进，万一已经在地图上了也不会误触。
+    2. 再判 ``stagenav.probe_bytes`` 是不是活动关卡地图（底部 tab 暗）。
+       **第一帧不判**：结算页底部也是暗的，probe 会把它当成地图，于是「还没
+       点就放行」，作业排在结算页上白跑一整轮——这正是用户说的「在失败界面
+       重新挂作业是不会成功的」。点过一次之后结算页必然消失，probe 才有意义。
+    3. 点三次还不在关卡界面（落到主页 / 基建 / 剧情）→ ``to_home`` + 完整
+       导航兜底。这一段只保证「界面能接受新的作业集」，失败也不抛错——真开
+       不了打，下一轮还有日志。
     """
     try:
-        from . import stagenav
+        from . import pages, stagenav
     except Exception:
         return False
     if not conn:
         return False
     try:
         touch = stagenav.Touch(conn['adb_path'], conn['address'], log,
-                               package=stagenav.game_package(spec.get('clientType')))
+                               package=stagenav.game_package(spec.get('clientType')),
+                               strict=bool(spec.get('profile')
+                                           or spec.get('adbAddress')))
         alive, detail = touch.ready()
         if not alive:
             log('点结算页失败：adb 不可用（%s）' % detail)
             return False
-        prev = touch.shot()
-        if not prev:
-            log('点结算页失败：截不到图')
-            return False
-        for i in range(4):
-            touch.tap(*_RESULT_TAP)
-            time.sleep(1.5)
+        tapped = 0
+        for _i in range(3):
             cur = touch.shot()
-            if cur and not stagenav._moved(prev, cur, thr=2.5):
-                break                   # 画面不动了：结算页已经点完
-            prev = cur
-        state_now = stagenav.probe(touch)
-        if state_now == 'map':
-            log('结算页已点回到关卡列表')
-            return True
-        log('点完不在关卡列表（判定：%s），重新导航一次再重挂'
-            % (state_now or '未知'))
+            if cur and tapped and stagenav.probe_bytes(cur) == 'map':
+                log('已回到活动关卡界面，在这里重排作业')
+                return True
+            touch.tap(*_RESULT_TAP)
+            tapped += 1
+            time.sleep(1.4)
+        cur = touch.shot()
+        where = stagenav.probe_bytes(cur) if cur else '截不到图'
+        log('点了 %d 次还不在活动关卡界面（现在是「%s」），回主页重新导航'
+            % (tapped, where or '未知'))
+        # 兜底：先回主页（认得基建确认框/剧情页，不会盲按返回），再走一遍
+        # 完整导航。多花十几秒，换「一定在关卡菜单上」。
+        pages.to_home(touch, log)
         ok, why = _navigate(conn, stage, log, client=spec.get('clientType'))
         log('重挂前重新导航%s：%s' % ('完成' if ok else '失败', why))
         return ok
@@ -1729,19 +2359,28 @@ def _leave_result(conn, spec, stage, log):
         log('点结算页出错：%s: %s' % (type(e).__name__, e))
         return False
 
-
 def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
-    """一轮打完，把翻车的关**换一份作业**重挂（同段内，不重新导航）
+    """翻车后换作业重挂：**只改翻车那一关，其余关原样**
 
-    用户 2026-11-19 的需求 3：「某关战斗失败了，修改作业集中该关卡的作业，
-    换其他作业自动挂这关（重新搞作业集应该排查已经成功的关卡，不用重复挂到
-    之前打完的关卡了）」。
+    用户 2026-11-19 需求 3 的原话是「某关战斗失败了，修改作业集中该关卡的作业，
+    换其他作业自动挂这关」；2026-11-22 又补了实测口径：「我刚刚确实是 2 星，但是
+    agent 并没有帮我换作业重新挂……翻车后 agent 应该知道我翻车了，然后回到对应的
+    关卡界面，更换作业集（只改那关，其他不变，帮我重新挂），然后任务继续」。
 
-    所以每轮只重排「没成功」的关，每关取候选池里**下一份没试过**的作业；
-    某关的候选都试过了就跳过它（再用同一份只会同样翻车）。
+    所以这里做四件事：
 
-    同一个 Engine 内直接 append 新的 Copilot 任务：MaaCore 的队列支持追加，
-    不必重新 open/connect/导航——省掉每轮十几秒，界面也留在原地。
+    1. **只动翻车那一关**：从候选池取该关「下一份没试过」的作业；翻车关之后
+       **还没打**的关沿用原来那份（旧实现会顺手把它们也换成下一份，白冒风险）。
+    2. **没别的作业就同一份再试一次**：漏怪是偶发的，2 星重打一次经常就三星。
+       以前「候选都试过」直接收工，把后面几关一起丢下——用户看到的「翻车后
+       什么都不做」有一半是这个。同一份只补试一次（记在 ``same_retry``），
+       不会死循环。
+    3. **回到活动关卡界面**：翻车时游戏停在「行动结束」结算页，先点一下把界面
+       带回活动关卡地图（``_leave_result``）。不点的话 MaaCore 的 ClickStageName
+       在结算页上 OCR 不到关卡名，整轮重挂白跑。
+    4. **重挂后按最新结果继续**：每轮结束重看 ``state['results']``，哪关还失败才
+       继续重挂；都过了立刻收手，不会把打过的关再打一遍（旧实现每轮都从同一个
+       起点重排，第二轮会白烧一遍理智）。
 
     返回 ``(swapped, mark)``；``mark`` 是重试前 ``eng.chains`` 的长度（可能是 0），
     收尾判失败要从它往后看，否则第一轮的失败会把重试成功的结果盖掉。真的没
@@ -1749,90 +2388,155 @@ def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
     """
     retry = spec.get('retry') or {}
     pool = retry.get('pool') or {}
-    rounds = int(retry.get('maxRounds') or 1)
+    # 没有 retry（每关都只有一份作业、或上层没给候选池）也要走一轮：用户报的
+    # 就是「2 星之后什么都不做」。maxRounds 缺省 2 = 首轮 + 一次同份重挂。
+    rounds = int(retry.get('maxRounds') or 2)
+    if state.get('pause'):
+        log('已暂停（%s），不重挂' % state['pause'])
+        return [], None
+    # 重挂也没用的原因（理智不够 / 关卡没解锁 / 作业与关卡对不上），别烧时间
+    why_all = ' '.join(str(r.get('why') or '')
+                       for r in (state.get('results') or []) if not r.get('ok'))
+    for k in ('理智不够', '关卡还没解锁', 'MAA 不认这个关卡'):
+        if k in why_all:
+            log('翻车原因不值得重挂（%s），跳过' % k)
+            return [], None
     order = []
     for r in (spec.get('copilotList') or []):
         code = str(r.get('stage_name') or '').strip()
         if code:
             order.append({'stage': code,
-                          'variant': 'raid' if r.get('is_raid') else 'normal'})
-    if rounds <= 1 or not order or not pool:
+                          'variant': 'raid' if r.get('is_raid') else 'normal',
+                          'cid': _cid_of(r.get('filename'))})
+    if not order:
         return [], None
 
     mark = len(eng.chains)
-    # 已经试过的作业（首轮那份算一份）：换过的不再换回来，否则两轮就在
-    # #102 → #202 → #102 之间打转，白烧理智
-    attempted = {}
+    # 首轮已经在用哪份作业：换过的不再换回来，否则 #102 → #202 → #102 打转
+    tried = {}
     for k, v in (state.get('tried') or {}).items():
-        attempted[k] = {v}
+        tried[k] = {v}
+    same = set(state.get('same_retry') or [])      # 已用「同一份」补试过的关
+    skip = set(state.get('skip_retry') or [])      # 候选都试过、放弃的关
     swapped = []
-    # 从**失败的那一关**往下重排。以前拿 `cleared`（靠 StageDrops 判定）排除
-    # 已成功的关，但 MaaCore 在 Copilot 里根本不发这个回调，cleared 永远是
-    # 空的——那样会把前面打完的关全重打一遍，白烧理智。现在按「卡在哪一关」
-    # 定位一次：跑到 X 才失败，说明 X 之前的关都已经过去了，只重挂 X 及其
-    # 后面。**idx 在进循环前算好**：每轮重排后 state['stage'] 会被清空，第二轮
-    # 再算就会回到第 0 关，把前面的关又打一遍（这次踩过）。
-    cur = str(state.get('stage') or '').strip().upper()
-    start_idx = 0
-    if cur:
-        start_idx = next((i for i, o in enumerate(order)
-                          if o['stage'].upper() == cur), 0)
-    for rnd in range(2, rounds + 1):
+    for rnd in range(2, rounds + 2):
         left = deadline - time.time()
         if left <= 30:
             log('没时间再重挂了（总时长到上限），停下')
             break
-        pend = order[start_idx:]
-        if not pend:
+        bad = [b for b in _tally(state.get('results') or [])[1]
+               if str(b.get('stage') or '').strip().upper() not in skip]
+        if not bad:
+            break                     # 上一轮重挂成功（或没有失败关）
+        bad_up = {str(b.get('stage') or '').strip().upper() for b in bad}
+        idx_bad = [i for i, o in enumerate(order) if o['stage'].upper() in bad_up]
+        if not idx_bad:
             break
+        start_idx = min(idx_bad)
+        log('翻车了：%s，先回关卡界面再换个作业重挂'
+            % '、'.join(order[i]['stage'] for i in idx_bad))
         new_ops, picked = [], []
-        for o in pend:
+        for i, o in enumerate(order):
+            if i < start_idx:
+                continue              # 前面已经打完的关不再重打
             key = '%s@%s' % (o['stage'].upper(), o['variant'])
-            cids = [x for x in (pool.get(key) or []) if x]
-            used = attempted.setdefault(key, set())
-            nxt = next((c for c in cids if c not in used), None)
-            if nxt is None:
-                continue
-            new_ops.append({'copilotId': nxt, 'stageCode': o['stage'],
+            # 「当前在用的是哪份」= state['tried']（每换一次就更新）。order 里的
+            # cid 只是首轮那份，拿它当「同一份」会退回更早的作业（实测：第二轮
+            # 换回 #102 而不是刚在用的 #202，等于又换了一次却记成「同一份」）。
+            cid = (state.get('tried') or {}).get(key) or o['cid']
+            if i in idx_bad:
+                cids = [x for x in (pool.get(key) or []) if x]
+                used = tried.setdefault(key, {cid})
+                nxt = next((c for c in cids if c not in used), None)
+                if nxt is None:
+                    if key in same or not cid:
+                        skip.add(o['stage'].upper())
+                        log('跳过 %s：候选作业都试过了，再挂也是同样结果'
+                            % o['stage'])
+                        continue
+                    nxt = cid          # 没有别的作业了：同一份再试一次
+                    same.add(key)
+                    state['same_retry'] = sorted(same)
+                    log('翻车重挂：%s 没有别的作业，同一份 #%s 再试一次'
+                        % (o['stage'], nxt))
+                else:
+                    used.add(nxt)
+                    state.setdefault('tried', {})[key] = nxt
+                    log('换作业重挂：%s %s #%s → #%s'
+                        % (o['stage'],
+                           '突袭' if o['variant'] == 'raid' else '普通',
+                           cid or '?', nxt))
+                picked.append({'stage': o['stage'], 'variant': o['variant'],
+                               'from': cid, 'to': nxt})
+                cid = nxt
+            new_ops.append({'copilotId': cid, 'stageCode': o['stage'],
                             'variant': o['variant']})
-            picked.append((key, o['stage'], o['variant'],
-                           (state.get('tried') or {}).get(key) or 0, nxt))
+        if skip:
+            state['skip_retry'] = sorted(skip)
         if not new_ops:
-            log('没有更多能换的作业了（每关的候选都试过）')
+            log('没有能重挂的作业了，停下（翻车：%s）'
+                % '、'.join(order[i]['stage'] for i in idx_bad))
+            break
+        # 翻车之后游戏停在**失败结算页**（「作战失败 / 行动结束」那一层）。
+        # 用户 2026-11-19：「随便点一下回关卡界面，在那个界面重新运行作业集
+        # 就能换作业，不需要重新唤醒登录」；2026-11-22 又补了硬条件：「在失败
+        # 界面重新挂作业是不会成功的，需要在关卡菜单界面重挂」。
+        # 所以**先离开结算页、再下载/排作业**——顺序反了的话，界面还停在
+        # 结算页时 MaaCore 的 ClickStageName OCR 不到关卡名，整轮白跑。
+        # _leave_result 点一下屏幕，再用 probe 确认回到了活动关卡界面；实在
+        # 回不去就回主页重走一遍导航，仍然不行才放弃这一轮。
+        if not _leave_result(conn, spec, order[start_idx]['stage'], log):
+            log('没能回到活动关卡界面，这轮不重挂了（在结算页上排作业一定白跑）')
             break
         rows = prepare_copilot(new_ops, d, account=spec.get('accountFile'),
                                log=lambda m: log('  ' + m))
-        for key, code, var, prev, nxt in picked:
-            used = attempted.setdefault(key, set())
-            used.add(nxt)
-            state.setdefault('tried', {})[key] = nxt
-            swapped.append({'stage': code, 'variant': var,
-                            'from': prev, 'to': nxt})
-            log('换作业重挂：%s %s #%s → #%s'
-                % (code, '突袭' if var == 'raid' else '普通', prev or '?', nxt))
+        swapped.extend(picked)
         state['stage'] = ''
         state['cur_cid'] = 0
         state['by_file'] = {os.path.basename(r.get('filename') or ''):
                             r.get('stage_name') for r in rows if r.get('filename')}
         state['cid_of'] = {os.path.basename(r.get('filename') or ''):
                            _cid_of(r.get('filename')) for r in rows if r.get('filename')}
-        # 翻车之后游戏停在**失败结算页**（「作战失败 / 行动结束」那一层），
-        # 这时把新的作业集排下去，MAA 的 ClickStageName 在结算页上 OCR 不到
-        # 关卡名，整轮重挂就白跑——用户 2026-11-19 实测口径：「战斗失败需要
-        # 随便点击一下界面回到关卡界面，在那个界面重新运行修改后的作业集就
-        # 可以换作业运行，不需要重新唤醒登录」。所以先点一下（MAA 自己的
-        # ClickCorner 区域，点这里不会点到掉落物、也不会关掉关卡选择）再排。
-        _leave_result(conn, spec, pend[0]['stage'], log)
-        eng.append('Copilot', _copilot_params(rows, spec))
-        done_n = len(order) - len(pend)
+        segs = segments_of(rows)
+        if not segs:                    # 正常走不到（new_ops 非空就该有行）
+            log('重挂的作业一份都没落盘，停下')
+            break
+        if len(segs) > 1:
+            log('重挂的关也跨 %d 个分区（%s），同样分段跑'
+                % (len(segs), ' → '.join(_seg_label(s) for s in segs)))
         log('第 %d 轮：从「%s」起重挂 %d 关%s'
-            % (rnd, pend[0]['stage'], len(new_ops),
-               '（前面 %d 关不再重打）' % done_n if done_n else ''))
-        if not eng.start():
-            raise RuntimeError('重挂时 AsstStart 返回失败')
-        if not _wait_run(eng, max(60.0, left), log, state):
-            log('第 %d 轮超时，先停下' % rnd)
-            eng.stop()
+            % (rnd, order[start_idx]['stage'], len(new_ops),
+               '（前面 %d 关不再重打）' % start_idx if start_idx else ''))
+        timed_out = False
+        for si, seg in enumerate(segs):
+            if si:
+                # 上一段打完停在结算页：先点一下回关卡界面，再导航到新分区
+                # （和首轮分段同一个道理，见 _run_tail）
+                if not _leave_result(conn, spec, segs[si - 1]['to'], log):
+                    log('重挂时没能离开结算页，剩下的段不跑了')
+                    break
+                nav_ok, nav_why = _navigate(conn, seg['from'], log,
+                                           client=spec.get('clientType'))
+                log('重挂切到新分区%s：%s'
+                    % ('完成' if nav_ok else '失败', nav_why))
+                if state.get('pause'):
+                    log('已暂停（%s），后面的段不跑了' % state['pause'])
+                    break
+            eng.append('Copilot', _copilot_params(seg['rows'], spec))
+            if not eng.start():
+                raise RuntimeError('重挂时 AsstStart 返回失败')
+            if not _wait_run(eng, max(60.0, deadline - time.time()), log, state):
+                log('第 %d 轮第 %d 段超时，先停下' % (rnd, si + 1))
+                eng.stop()
+                timed_out = True
+                break
+        if timed_out:
+            break
+        # 这一轮的链一条都没报错 = 重挂成功。最后那一关没有「下一关」可以换，
+        # 所以 states['results'] 里那条旧的失败记录不会被 ok 覆盖——不看链的话
+        # 会接着再排一轮（把刚打完的关又打一遍）。
+        if not [c for c in eng.chains[mark:] if not c.get('ok')]:
+            log('第 %d 轮重挂没再报失败，继续往下走' % rnd)
             break
     return swapped, mark
 
@@ -1911,7 +2615,9 @@ def _run_group(g, spec_base, tid, log):
             'maaDir': d,                    # 这个号的 MAA（run_core 按它连 adb）
             'accountName': r.get('accountName') or '',
             'switchAccount': True,
-            'clientType': client_type_of(r.get('channel')),
+            # 没拿到渠道就留空，别写死 Official —— resolve_client 会拿
+            # accountFile 回查账号的 channelName（b 服账号被按官服启动就死在这）
+            'clientType': client_type_of(r.get('channel')) if r.get('channel') else '',
             'copilotList': cp,
             # 重挂（_retry_failed）换作业时按同一账号练度做替换（#92）
             'accountFile': r.get('file') or '',
@@ -1960,11 +2666,19 @@ def run_plan(rows, spec_base, tid=None):
     def run_one_proc(idx, g):
         """多开：这台模拟器交给独立进程（同进程两个 MaaCore 会抢命名管道，
         见 multiproc 的模块注释——这是「说好并行、另一台不动」的真因）"""
-        _res, got = multiproc.run_group(
+        _res, got, stopped = multiproc.run_group(
             'plan', tid, idx, {'group': g, 'spec': spec_base}, log,
             who=g.get('address') or '默认模拟器')
         with _GROUPS_LOCK:
             report.extend(got or [])
+        if stopped:
+            # 用户点名停了这一台：不算失败，只是「没跑完」
+            with _GROUPS_LOCK:
+                for r in (g.get('rows') or []):
+                    report.append({'file': r.get('file'), 'name': r.get('name'),
+                                   'ok': False, 'stopped': True,
+                                   'error': '你手动停止了这一组'})
+            return
         if not got:
             with _GROUPS_LOCK:
                 for r in (g.get('rows') or []):
@@ -1973,8 +2687,19 @@ def run_plan(rows, spec_base, tid=None):
                                    'error': '子进程异常（没交回结果）'})
 
     if len(groups) <= 1:
+        from . import maacore
+        # 一组时默认在本进程跑；但本进程已经有一路在跑 MaaCore 就必须换
+        # 独立进程（同进程第二个实例会把前一个的任务链无声打断）
         for _, g in groups:
-            run_one(g)
+            if maacore.claim_inproc():
+                try:
+                    run_one(g)
+                finally:
+                    maacore.release_inproc()
+            else:
+                log('本机已经有一路在跑模拟器，这一台改用独立进程'
+                    '（同一进程里两个 MaaCore 会互相把任务打断）')
+                run_one_proc(1, g)
     else:
         log('（每个模拟器一个独立进程）')
         ths = []
@@ -2005,8 +2730,9 @@ def _label_of(ttype):
 
 def _brief(ttype, params):
     if ttype == 'StartUp':
+        c = params.get('client_type') or 'Official'
         return '（%s%s）' % (
-            '官服' if params.get('client_type') == 'Official' else params.get('client_type'),
+            CLIENT_CN.get(c, c),
             '，切到 ' + params['account_name'] if params.get('account_name') else '')
     if ttype == 'Fight':
         t = params.get('times')
