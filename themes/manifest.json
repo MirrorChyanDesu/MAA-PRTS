@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-25T09:20:00Z",
+  "generatedAt": "2026-11-25T09:40:00Z",
   "themes": [
     {
       "id": "closure",
@@ -7,10 +7,10 @@
       "desc": "深色终端配色 + CRT 扫描线 + 像素字体 + 可露希尔桌宠",
       "version": "1.0.0",
       "file": "themes/closure.zip",
-      "bytes": 821621,
-      "sha256": "f263304a70a4b47c3b7a04f525c97f474e11516fce713f2b82c68e433aa707b2",
-      "preview": "icons/logo-glow.png",
-      "license": "配色/样式取自 dsh-closure-skin（MIT）；字体 Ark Pixel（OFL 1.1）"
+      "bytes": 844560,
+      "sha256": "789cb8d1ed099bcb5c97ff53abbabb75dea4ebd08c3733a60cbbb11241b0b209",
+      "preview": "closure-preview.jpg",
+      "license": "配色/样式取自 dsh-closure-skin（MIT）；字体 Ark Pixel（OFL 1.1）；桌宠动画版权归原作者，仅本机使用"
     }
   ]
 }
