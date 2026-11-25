@@ -625,3 +625,108 @@ Python 跑即可；C 组会真实调用 Windows DPAPI，换电脑/换用户跑 B
 真机复验（5554，2026-11-25）：游戏没跑时 `_ensure_game` 立刻开始唤醒，56 秒后
 客户端回到主界面、返回 True；安静模式下查询日志零条。
 
+
+### B71 结束活动的商店导航（2026-11-25）
+
+用户报「TL 商店导航失效」。活动结束后终端卡片被盖上「作战已结束」灰条、
+地图商店节点多了剩余时间横幅，模板全过期：entry 定点比 46.8 分（阈值 16）→
+判定终端页没这个活动，`_to_map` 直接失败；节点 14.1 分（阈值 12）→ 只走兜底
+坐标盲点。重抠模板之外，钉住「模板和 roi 不能脱钩」：
+
+- `TL` 的 `closed` 为真且 `zones` 为空（关卡导航确实关着）；
+- 模板尺寸 ≈ `roi` × 1.5（差超过 3 像素就当标定漂了）；
+- 按 `roi` 位置贴到合成图上，`_entry_here` 必须认到（≤8 分）且中心对得上；
+  **挪 20 像素必须认不到**（定点比对不接受整屏搜索兜底）；
+- 商店节点贴在自己的 `roi` 里 `_find` 认得到（≤8 分、中心落在 roi 内），
+  贴到别处（差 400 像素）必须认不到。
+
+真机复验（5554，2026-11-25）：`run_tool('shop', prefix='TL')` 12 秒进
+「炮火所掩埋的」商店（关闭时间 2026/11/29 03:59），日志「点活动提示条
+（3.0 分，(1145,540)）」→「图像识别到「炮火所掩埋的」（2.7 分）」。
+
+### B72 多账号每个号先唤醒切号（2026-11-25）
+
+用户第三次报「助手又没有加切号自动唤醒」，所以这条从提示词升级成程序兜底，
+用例把判定逻辑和接线一起钉住：
+
+- `_wakes_itself`：`wakeup` / `sweep` / `weekly` / `train` / `claim`（带
+  `wakeup=true`）/ `fight`（带 `wakeup` 且没有 `noSwitch` / `assumeStageList`）
+  算自己会唤醒；`sweep` 显式 `wakeup=false`、`fight` 不带 wakeup、
+  `tool` / `navigate` / 空步骤都算不会唤醒；
+- `_with_auto_wake`：多账号 + 不唤醒的步骤要在最前面补一步 `wakeup`；连跑两次
+  不能叠两个；单账号 / `switch=False` / 第一步是 `sweep` 都不补；**补的时候不许
+  改动传进来的原列表**（纯函数，调用方还要拿原表算 `nav_added`）；
+- 接线：`run_steps` 工具暴露 `switchAccount`、`_tool_run_steps` 源码里必须有
+  `switch=sw`（防「参数加了但没传下去」）、`SYSTEM` 里有「一次任务涉及两个及
+  以上账号」这句硬规矩；
+- 引导卡片：第一条仍是「你可以帮我干什么？」，并且有「TL 活动商店清空」那条，
+  黑名单正好三样（数据增补条 / 数据增补 / 家具零件），**不能混进龙门币**。
+
+### B73 主题包与开机自启（2026-11-25）
+
+用户这轮的两条需求：「主题要黑色/白色/第三方，第三方放 pack-data 点下载才能用」，
+「开机自启默认不勾选，我极度厌恶没同意就自启的软件」。用例把「默认关」和
+「按需下载」钉死：
+
+- **自启默认值**：`DEFAULTS['launchAtLogin'] is False`（真 `False`，不是 `'false'`）；
+  `'false'` / `'0'` / `'no'` / `0` / `None` / `''` 存进去读回来都必须是 `False`，
+  `'true'` / `True` 才是 `True`。
+- **源码模式不碰注册表**：`supported()` 为假、`exe_path()` 为空；`sync(True)`
+  返回 `skipped` 且 `why` 里有「源码」；`sync(False)` 同样 skipped；`enable()`
+  必须抛 `RuntimeError`。**关键一条**：这些调用前后 `_read()` 的返回值必须
+  一模一样——开发时跑一次就把用户打包版那条自启删掉，是这里最容易犯的错。
+- **主题 id 归一**：`' CLOSURE '` → `closure`，`''`/`None`/`'DARK'` → `dark`。
+- **安装链路（假网络，不真连 GitHub）**：内存里造一个 zip + manifest，`_get`
+  对 zip 返回字节、对 `extra` 里的 webm 一律抛错 → `install()` 必须成功、
+  `extraFailed` 非空、`extra` 为空（降级成纯配色，不报错也不回滚）；
+  `_read_meta` 读回来的 `pet.every` 要对得上。
+- **sha256 不对**：同一份 manifest 改掉 sha 再装必须抛错，而且**原来那份还能用**
+  （`usable()` 仍为真）——下歪了覆盖掉已经能用的主题是最差结果。
+- **内置主题不许装/删**：`dark` / `light` / `a/b` / `../x` / `''` 全部 `ValueError`。
+- **防穿越**：`file_of('demo', '../../settings.json')`、`'..\\..\\settings.json'`、
+  `'/settings.json'`、`''` 全返回 `None`；zip 里塞 `../evil.txt`，
+  `_safe_extract` 必须在解压前抛 `RuntimeError`。
+- **远端读不到不裸奔**：`fetch_manifest` 抛错时 `catalog()` 仍返回内置两套，
+  `remoteError` 带原因，`remote` 空列表（**这个键必须永远存在**，前端和用例都
+  直接取）。
+- **接线**：`/api/themes`、`/api/theme/install`、`/api/theme/remove`、
+  `/api/autostart` 四个路由都在 `ROUTES` 里；`main.py` 有 `/themes/` 前缀分支
+  且走 `themes.file_of`；启动时有 `_auto.sync`；`app.js` 里有色块垫底
+  （`theme-swatch`）、三个按钮的 data 属性、`syncThemePet`、`set-launch-login`，
+  `SET_TABS` 第一项是常规设置；**`THEME_FIXED` 两条都必须带 `installed: true`**
+  （少了卡片会渲染成「下载」，点下去后端回「内置主题不能安装」）；
+  `style.css` 里不许再出现 `rgba(255, 255, 255`，`#0e121a` 只许在 `--panel-3`
+  出现一次（写死就换不了浅色主题）。
+
+真机复验（2026-11-25）：`themes.install('closure')` 走真实镜像，70.4 秒装好
+（0.8 MB 包 + 四个 webm 共 10.5 MB），`extraFailed: []`；`/themes/closure/`
+下 `theme.css`（12 KB）、`preview.jpg`（23 KB）、`pet/idle.webm`（1.39 MB）都是 200；
+`/themes/closure/../../etc/passwd` 是 404。
+
+### B74 主题切换不报错（2026-11-25 用户反馈「点白色主题报错」）
+
+现场是两条独立故障叠在一起，看着像「白色和卫戍协议混了」：
+
+1. **`saveSettings()` 不返回响应**。调用方写的是
+   `const d = await saveSettings(...); S.settings = d.settings`，d 是
+   `undefined` → 每次抛 `Cannot read properties of undefined (reading
+   'settings')`。主题其实已经切换成功并写进 settings.json，但 catch 里
+   `applyTheme(prev)` 又回滚，用户看到的是「点了白色，闪一下还是原色，弹一句报错」。
+2. **卡片依赖全量清单**（要联网拉远端 manifest，超时 6~8 秒）。远端慢的时候
+   设置页只有深色/白色两张卡，已装的「卫戍协议」不出现，状态看着就错乱。
+
+用例钉住：
+
+- `saveSettings` 的函数体里必须有 `return d;`（否则 `d.settings` 必炸）；
+  两个调用点必须是 `(d && d.settings) || S.settings`。
+- `themes.catalog(local_only=True)` **不联网**：把 `fetch_manifest` 换成抛错，
+  仍然返回内置两套 + 已装主题，且 `partial == True`、`remote == []`、
+  `remoteError == ''`。
+- 全量 `catalog()` 断网时 `remoteError` 带原因，但本地主题一个都不能少。
+- `api_themes({'local': '1'})` 走本地快照；不带参数才联网。
+- 前端有 `paintThemeGrid()`、先请求 `/api/themes?local=1`、卡片在
+  「设置里的主题不可用」时高亮深色（`if (S.themes && !themeInfoOf(cur)) cur`），
+  切到未下载主题时明确提示「先点卡片上的『下载』」。
+
+真机复验：深色 → 白色 → 卫戍协议 → 白色 连续切换，无报错；刷新后仍是最后一次
+选的主题；切回白色时 `<link id="theme-pack">` 和桌宠 `<video>` 都正确移除。

@@ -8154,6 +8154,437 @@ def check_game_wake(tmp):
         assert '_wait_game' not in src, fn.__name__
 
 
+def check_closed_shop_nav(tmp):
+    """B71 结束活动的商店导航（TL：卡片带「作战已结束」+ 地图节点带剩余时间）
+
+    用户 2026-11-25 报「TL 商店导航失效」：卡片被加上「作战已结束」灰条后，
+    `_entry_here` 定点比 46.8 分（阈值 16）→ 判定终端页上没有这个活动 →
+    `_to_map` 直接失败；地图上的商店节点也因为多了红色时钟 +「941」横幅，
+    老模板 14.1 分（阈值 12）认不出，只剩兜底坐标盲点。
+
+    钉住三件事（模板和 roi 必须绑死，这是这次坏掉的根）：
+      1. 模板尺寸 ≈ roi × 1.5（换模板忘了改 roi 会立刻被抓到）；
+      2. 按 roi 位置贴上去能认到，**挪 20 像素就认不到**；
+      3. 商店节点模板只在自己的 roi 里生效，贴到别的活动的位置认不出。
+    """
+    import io
+    from PIL import Image
+    from core import eventnav
+
+    ent = eventnav.ENTRIES['TL']
+    assert ent.get('closed') is True and not (ent.get('zones') or {})
+
+    def _canvas():
+        return Image.new('RGB', (1920, 1080), (18, 18, 18))
+
+    def _paste(canvas, tpl_name, roi):
+        t = Image.open(eventnav._tpl_path(tpl_name)).convert('RGB')
+        x, y = int(round(roi[0] * 1.5)), int(round(roi[1] * 1.5))
+        canvas.paste(t, (x, y))
+        return t.size
+
+    # ① 模板尺寸和 roi 对齐（差的像素超过 3 就当标定漂了）
+    entry = ent['entry']
+    card = Image.open(eventnav._tpl_path(entry['tpl']))
+    assert abs(card.width - entry['roi'][2] * 1.5) <= 3, (card.size, entry['roi'])
+    assert abs(card.height - entry['roi'][3] * 1.5) <= 3, (card.size, entry['roi'])
+
+    # ② 终端页：贴上去认到；挪 20 像素认不到（roi 是钉死的，不能靠整屏搜索兜）
+    cv = _canvas()
+    _paste(cv, entry['tpl'], entry['roi'])
+    buf = io.BytesIO()
+    cv.save(buf, 'PNG')
+    data = buf.getvalue()
+    hit, sc, ex, ey = eventnav._entry_here(data, entry)
+    assert hit and sc <= 8, (hit, sc)
+    assert abs(ex - int(round(entry['roi'][0] * 1.5 + card.width / 2))) <= 2, (ex, ey)
+
+    cv2 = _canvas()
+    _paste(cv2, entry['tpl'], [entry['roi'][0] + 20] + entry['roi'][1:])
+    b2 = io.BytesIO()
+    cv2.save(b2, 'PNG')
+    assert eventnav._entry_here(b2.getvalue(), entry)[0] is False
+
+    # ③ 活动地图：商店节点在自己的 roi 里认得出；贴到别处（差 400 像素）认不出
+    shop = ent['tools']['shop']
+    cv3 = _canvas()
+    _paste(cv3, shop['tpl'], shop['roi'])
+    b3 = io.BytesIO()
+    cv3.save(b3, 'PNG')
+    x, y, sc3 = eventnav._find(b3.getvalue(), shop)
+    assert x and sc3 <= 8, (x, y, sc3)
+    sx, sy = x / 1.5, y / 1.5
+    assert (shop['roi'][0] <= sx <= shop['roi'][0] + shop['roi'][2]
+            and shop['roi'][1] <= sy <= shop['roi'][1] + shop['roi'][3]), (sx, sy)
+
+    cv4 = _canvas()
+    _paste(cv4, shop['tpl'], [shop['roi'][0] - 400] + shop['roi'][1:])
+    b4 = io.BytesIO()
+    cv4.save(b4, 'PNG')
+    assert eventnav._find(b4.getvalue(), shop)[0] == 0
+
+
+def check_multi_account_wake(tmp):
+    """B72 多账号每个号先「开始唤醒」切号（2026-11-25 用户口径）
+
+    用户报「agent 又又又没有加切号自动唤醒」：一次任务里两个以上账号时，
+    上一个号留在关卡列表 / 主页 / 基建 / 结算页都正常，界面上的号甚至可能
+    是别人的。所以**一个账号的流程开始必须是自动唤醒切号**。
+
+    钉住四件事：
+      1. ``_wakes_itself``：wakeup / sweep / weekly / train / fight(wakeup=true)
+         算自己会唤醒；fight 的 noSwitch / assumeStageList、sweep 显式
+         ``wakeup=false`` 一票否决；
+      2. ``_with_auto_wake``：多账号 + tool/claim 这种不唤醒的步骤要在最前面
+         补一步 wakeup；单账号不补；``switch=False``（用户说不用切号）不补；
+         第一步是 sweep 不重复补；补的时候不许改动传进来的原列表；
+      3. 接线：run_steps 暴露 switchAccount、``_tool_run_steps`` 真的把它传给
+         run_batch（写成 ``switch=sw``，别接一半又丢掉）、SYSTEM 里有这条硬规矩；
+      4. 引导卡片：第一条还是「你可以帮我干什么？」，并且有 TL 商店清空那条
+         （黑名单正好三样，且不含龙门币——用户点名的那三样）。
+    """
+    from core import skills, agent
+
+    for s in ([('wakeup', {})],
+              [('sweep', {'stage': 'OS'})],
+              [('sweep', {'stage': 'OS', 'wakeup': True})],
+              [('weekly', {'stage': 'MN'})],
+              [('train', {'operators': []})],
+              [('claim', {'prefix': 'OS', 'wakeup': True})],
+              [('fight', {'wakeup': True})]):
+        assert skills._wakes_itself(s) is True, s
+
+    for s in ([('sweep', {'stage': 'OS', 'wakeup': False})],
+              [('weekly', {'wakeup': False})],
+              [('train', {'wakeup': False})],
+              [('fight', {})],
+              [('fight', {'wakeup': True, 'noSwitch': True})],
+              [('fight', {'wakeup': True, 'assumeStageList': True})],
+              [('tool', {'name': 'event_shop', 'prefix': 'TL'})],
+              [('claim', {'prefix': 'OS'})],
+              [('navigate', {'stage': '13-1'})],
+              []):
+        assert skills._wakes_itself(s) is False, s
+
+    base = [('tool', {'name': 'event_shop', 'prefix': 'TL'})]
+    out, added = skills._with_auto_wake(base, True)
+    assert added is True and out[0][0] == 'wakeup' and out[1:] == base, out
+    assert base == [('tool', {'name': 'event_shop', 'prefix': 'TL'})], '改动了原列表'
+    # 再跑一次不能叠两个 wakeup
+    out2, _ = skills._with_auto_wake(out, True)
+    assert [n for n, _ in out2].count('wakeup') == 1, out2
+
+    for many, sw in ((True, False), (False, None), (False, True)):
+        got, added = skills._with_auto_wake(base, many, sw)
+        assert added is False and got == base, (many, sw, got)
+    got, added = skills._with_auto_wake([('sweep', {'stage': 'OS'})], True)
+    assert added is False and [n for n, _ in got] == ['sweep'], got
+
+    # 接线：工具参数 + 真的传下去 + 提示词硬规矩
+    rs = next(t for t in agent.TOOLS if t['function']['name'] == 'run_steps')
+    props = rs['function']['parameters'].get('properties') or {}
+    assert 'switchAccount' in props, 'run_steps 没暴露 switchAccount'
+    src = inspect.getsource(agent._tool_run_steps)
+    assert 'switch=sw' in src, 'switchAccount 没传给 run_batch'
+    assert '一次任务涉及两个及以上账号' in agent.SYSTEM, 'SYSTEM 里没有多账号唤醒硬规矩'
+
+    # 引导卡片
+    js = open(os.path.join(REPO, 'frontend', 'app.js'), encoding='utf-8').read()
+    block = js.split('const CHAT_STARTERS = [', 1)[1].split('];', 1)[0]
+    first = block.split('[', 1)[1].split(']', 1)[0]
+    assert '你可以帮我干什么' in first, first
+    hit = [x for x in block.split('\n')
+           if '帮我将快关闭的 TL 活动商店清空' in x]
+    assert hit, '引导卡片没有「TL 商店清空」那条'
+    for w in ('数据增补条', '数据增补', '家具零件'):
+        assert w in hit[0], (w, hit[0])
+    assert '龙门币' not in hit[0], hit[0]
+
+
+def check_theme_autostart(tmp):
+    """B73 主题包与开机自启（2026-11-25 用户口径）
+
+    两条需求一起钉：设置里「主题」要有黑色/白色/第三方，「开机自启」必须默认关；
+    第三方主题包**从数据分支按需下载**，不让 exe 跟着涨。
+
+    钉住六件事：
+      1. 默认值：``launchAtLogin`` 是 False（真 False，不是字符串），
+         ``theme`` 是 dark——用户原话「极度厌恶没同意就开机自启」；
+      2. 归一化：``'false'`` / ``'0'`` / ``0`` 都不许变成真；主题 id 小写、
+         空值退回 dark；
+      3. 源码模式**一律不碰注册表**（``sync`` 返回 skipped，``enable`` 直接抛，
+         前后 ``_read()`` 必须一模一样）——开发时一跑就把打包版那条删掉是最坑的；
+      4. 安装链路：sha 校验、``extra`` 下不到要降级不报错、装坏了不删旧的、
+         内置主题不许装/删；
+      5. 防穿越：zip 里的 ``..``、``file_of`` 的 ``../`` / 绝对路径全部拒绝；
+      6. 接线：``/api/themes`` 等路由、``/themes/<id>/`` 静态口、内置卡片
+         ``installed: true``（少了会渲染成「下载」）、主题变量不用硬编码色。
+    """
+    import hashlib
+    import zipfile
+
+    from core import api, autostart, settings as st, themes
+
+    cfg = os.path.join(tmp, 'cfg')
+    os.makedirs(cfg, exist_ok=True)
+    keep = (st.CONFIG_DIR, st.SETTINGS_PATH, st._cache, themes.THEMES_DIR)
+    st.CONFIG_DIR = cfg
+    st.SETTINGS_PATH = os.path.join(cfg, 'settings.json')
+    st._cache = None
+    themes.THEMES_DIR = os.path.join(cfg, 'themes')
+    try:
+        # ---------- 1/2. 默认值与归一化 ----------
+        assert st.DEFAULTS['launchAtLogin'] is False, '默认就跑成了开机自启'
+        assert st.DEFAULTS['theme'] == 'dark', st.DEFAULTS['theme']
+        assert st.load()['launchAtLogin'] is False
+        for falsy in ('false', '0', 'no', 0, None, ''):
+            assert st.save({'launchAtLogin': falsy})['launchAtLogin'] is False, falsy
+            assert st.load()['launchAtLogin'] is False, falsy
+        assert st.save({'launchAtLogin': 'true'})['launchAtLogin'] is True
+        assert st.save({'launchAtLogin': True})['launchAtLogin'] is True
+        assert st.save({'launchAtLogin': 0})['launchAtLogin'] is False
+        assert st.save({'theme': ' CLOSURE '})['theme'] == 'closure'
+        assert st.save({'theme': ''})['theme'] == 'dark'
+        assert st.save({'theme': None})['theme'] == 'dark'
+        assert st.save({'theme': 'DARK'})['theme'] == 'dark'
+
+        # ---------- 3. 自启：源码模式不碰注册表 ----------
+        assert autostart.supported() is False, '源码模式不该说支持自启'
+        assert autostart.exe_path() == ''
+        before = autostart._read()
+        r = autostart.sync(True)
+        assert r.get('skipped') is True and '源码' in str(r.get('why')), r
+        assert autostart.sync(False).get('skipped') is True
+        assert autostart._read() == before, '源码模式动了注册表'
+        try:
+            autostart.enable()
+            raise AssertionError('源码模式居然写了自启项')
+        except RuntimeError:
+            pass
+        stt = autostart.status()
+        assert stt['supported'] is False and stt['exe'] == '', stt
+        assert stt['setting'] is False, stt        # 上面刚存过 0
+
+        # ---------- 4. 安装链路（假网络，别真去 GitHub） ----------
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as zf:
+            zf.writestr('theme.json', json.dumps({
+                'id': 'demo', 'name': '演示主题', 'version': '0.1.0',
+                'desc': '测试用', 'css': 'theme.css', 'preview': 'preview.jpg',
+                'pet': {'video': 'pet/idle.webm', 'every': 20,
+                        'actions': {'talk': 'pet/talk.webm'}},
+                'extra': [{'file': 'pet/idle.webm', 'urls': ['https://x/y.webm']}],
+            }, ensure_ascii=False))
+            zf.writestr('theme.css', 'html[data-theme="demo"]{--bg:#000}')
+            zf.writestr('preview.jpg', b'\xff\xd8\xff\xd9')
+        blob = buf.getvalue()
+        man = {'themes': [{
+            'id': 'demo', 'name': '演示主题', 'file': 'themes/demo.zip',
+            'bytes': len(blob), 'sha256': hashlib.sha256(blob).hexdigest(),
+            'preview': 'demo-preview.jpg'}]}
+
+        def fake_get(url, timeout=None):
+            if url.endswith('demo.zip'):
+                return blob
+            raise RuntimeError('素材不可达')     # extra 全失败 → 降级成纯配色
+
+        old = (themes.fetch_manifest, themes._get)
+        themes.fetch_manifest = lambda timeout=8: man
+        themes._get = fake_get
+        try:
+            r = themes.install('demo')
+            assert r['ok'] and r['id'] == 'demo', r
+            assert r['extra'] == [] and r['extraFailed'], r   # 降级，但不报错
+            assert themes.usable('demo') is True
+            meta = themes._read_meta('demo')
+            assert meta['name'] == '演示主题' and meta['pet']['every'] == 20, meta
+            assert themes.file_of('demo', 'theme.css')
+            assert themes.file_of('demo', 'preview.jpg')
+            for bad in ('../../settings.json', '..\\..\\settings.json',
+                        '/settings.json', ''):
+                assert themes.file_of('demo', bad) is None, bad
+
+            d = themes.catalog(timeout=1)
+            ids = [t['id'] for t in d['themes']]
+            assert ids == ['dark', 'light', 'demo'], ids
+            mine = d['themes'][-1]
+            assert mine['css'] == '/themes/demo/theme.css', mine
+            assert mine['preview'] == '/themes/demo/preview.jpg', mine
+            rem = d['remote'][0]
+            # 没下载的主题：缩略图走 gh-proxy（raw 国内连不上，jsDelivr 会 301）
+            assert 'gh-proxy' in rem['preview'], rem['preview']
+
+            # sha 对不上必须拒装，且不能把已经能用的那份删掉
+            themes.fetch_manifest = lambda timeout=8: {
+                'themes': [dict(man['themes'][0], sha256='0' * 64)]}
+            try:
+                themes.install('demo')
+                raise AssertionError('sha 不对居然装上了')
+            except RuntimeError:
+                pass
+            assert themes.usable('demo') is True, '装坏了旧的那份也没了'
+
+            # 内置主题不许装；id 里不许出现路径
+            for tid in ('dark', 'light', 'a/b', '../x', ''):
+                try:
+                    themes.install(tid)
+                    raise AssertionError('应当拒绝：%r' % tid)
+                except ValueError:
+                    pass
+
+            themes.remove('demo')
+            assert themes.usable('demo') is False
+            assert not os.path.isdir(os.path.join(themes.THEMES_DIR, 'demo'))
+
+            # 远端读不到：页面不能裸奔，只给一句 remoteError
+            def boom(timeout=8):
+                raise RuntimeError('断网')
+
+            themes.fetch_manifest = boom
+            d = themes.catalog(timeout=1)
+            assert '断网' in (d.get('remoteError') or ''), d
+            assert [t['id'] for t in d['themes']] == ['dark', 'light'], d
+            assert d['remote'] == [] and d['installed'] == [], d
+        finally:
+            themes.fetch_manifest, themes._get = old
+
+        # zip 里的 .. 必须拦在解压前
+        evil = io.BytesIO()
+        with zipfile.ZipFile(evil, 'w') as zf:
+            zf.writestr('../evil.txt', b'x')
+        try:
+            themes._safe_extract(zipfile.ZipFile(evil), os.path.join(tmp, 'evil'))
+            raise AssertionError('解压没挡住 ..')
+        except RuntimeError:
+            pass
+
+        # ---------- 5. 接线 ----------
+        for path in ('/api/themes', '/api/theme/install',
+                     '/api/theme/remove', '/api/autostart'):
+            assert path in api.ROUTES, path
+
+        main_src = open(os.path.join(REPO, 'backend', 'main.py'),
+                        encoding='utf-8').read()
+        assert "path.startswith('/themes/')" in main_src, '没挂 /themes/ 静态口'
+        assert '_themes.file_of' in main_src, '主题文件没走 file_of 防穿越'
+        assert '_auto.sync' in main_src, '启动时没对账开机自启'
+
+        js = open(os.path.join(REPO, 'frontend', 'app.js'), encoding='utf-8').read()
+        for need in ('theme-swatch', 'data-theme-dl', 'data-theme-use',
+                     'data-theme-del', '/api/autostart', 'syncThemePet',
+                     'set-launch-login', "['general', '常规设置']"):
+            assert need in js, need
+        fixed = js.split('const THEME_FIXED', 1)[1].split('};', 1)[0]
+        assert fixed.count('installed: true') == 2, fixed   # 少一个就变成「下载」
+
+        css = open(os.path.join(REPO, 'frontend', 'themes.css'),
+                   encoding='utf-8').read()
+        assert 'html[data-theme="light"]' in css
+        assert '--tint' in css and '--shade' in css
+
+        style = open(os.path.join(REPO, 'frontend', 'style.css'),
+                     encoding='utf-8').read()
+        assert 'rgba(255, 255, 255' not in style, '又写死了加亮色，浅色主题会变黑板'
+        assert style.count('#0e121a') == 1, '弹窗底色写死了（应只在 --panel-3 出现）'
+    finally:
+        st.CONFIG_DIR, st.SETTINGS_PATH, st._cache, themes.THEMES_DIR = keep
+
+
+def check_theme_switch(tmp):
+    """B74 主题切换不报错 + 已装主题不会「消失」（2026-11-25 用户反馈）
+
+    用户原话：「设置里面白色主题和卫戍协议主题混淆（按使用白色也报错）」。
+    当时现场有两条独立故障，看起来却像一件事：
+
+      1. ``saveSettings()`` 没把服务端响应 return，调用方写的是
+         ``const d = await saveSettings(...); S.settings = d.settings`` →
+         d 是 undefined，每次都抛 ``Cannot read properties of undefined
+         (reading 'settings')``。主题已经乐观切过去了，catch 里又回滚，
+         表现成「点了白色，界面闪一下还是原来的，还弹一句报错」。
+      2. 设置页的卡片依赖 ``/api/themes`` 全量（要联网拉远端清单，超时 6~8 秒）。
+         远端慢的时候第三张卡（卫戍协议）压根画不出来，只剩黑/白两张，
+         状态看着就错乱——所以顺手加了 ``?local=1``：只读本机，毫秒级。
+
+    钉住四件事：
+      - ``saveSettings`` 必须 return 响应，调用方必须有 ``d && d.settings`` 防御；
+      - ``catalog(local_only=True)`` 不联网就算成功，已装主题必须在列表里；
+      - ``/api/themes?local=1`` 走本地快照（``partial == True``、``remote`` 为空），
+        全量接口断网时仍给 ``remoteError`` 但不影响本地主题；
+      - 卡片渲染有「当前主题不可用 → 高亮深色」的兜底，切主题前有可用性检查。
+    """
+    from core import api, settings as st, themes
+
+    cfg = os.path.join(tmp, 'cfg2')
+    os.makedirs(cfg, exist_ok=True)
+    keep = (st.CONFIG_DIR, st.SETTINGS_PATH, st._cache, themes.THEMES_DIR)
+    st.CONFIG_DIR = cfg
+    st.SETTINGS_PATH = os.path.join(cfg, 'settings.json')
+    st._cache = None
+    themes.THEMES_DIR = os.path.join(cfg, 'themes')
+    try:
+        # 空目录：只有内置两套
+        d0 = themes.catalog(local_only=True)
+        assert d0['partial'] is True, d0
+        assert [t['id'] for t in d0['themes']] == ['dark', 'light'], d0['themes']
+        assert d0['remote'] == [] and d0['remoteError'] == '', d0
+
+        # 造一个「已装」主题（只写盘，不联网）
+        tid_dir = os.path.join(themes.THEMES_DIR, 'demo')
+        os.makedirs(tid_dir, exist_ok=True)
+        with io.open(os.path.join(tid_dir, 'theme.json'), 'w',
+                     encoding='utf-8') as f:
+            json.dump({'id': 'demo', 'name': '演示主题', 'css': 'theme.css',
+                       'pet': {'video': 'pet/idle.webm', 'every': 9}},
+                      f, ensure_ascii=False)
+        with io.open(os.path.join(tid_dir, 'theme.css'), 'w',
+                     encoding='utf-8') as f:
+            f.write('html[data-theme="demo"]{--bg:#000}\n')
+
+        def boom(timeout=8):
+            raise RuntimeError('本地快照不该联网')
+
+        old = themes.fetch_manifest
+        themes.fetch_manifest = boom
+        try:
+            d1 = themes.catalog(local_only=True)     # 断网也必须有已装主题
+            assert [t['id'] for t in d1['themes']] == ['dark', 'light', 'demo'], \
+                d1['themes']
+            assert d1['installed'] == ['demo'], d1
+            assert d1['partial'] is True and d1['remote'] == [], d1
+            assert d1['remoteError'] == '', d1
+
+            d2 = themes.catalog(timeout=1)           # 全量：联网失败只记一句
+            assert '不该联网' in (d2.get('remoteError') or ''), d2
+            assert [t['id'] for t in d2['themes']] == ['dark', 'light', 'demo']
+            assert d2['partial'] is False
+
+            a1 = api.api_themes({'local': '1'}, None)
+            assert a1['partial'] is True and a1['remote'] == [], a1
+            assert 'demo' in [t['id'] for t in a1['themes']]
+            a2 = api.api_themes({}, None)
+            assert a2['partial'] is False
+            assert '不该联网' in (a2.get('remoteError') or ''), a2
+        finally:
+            themes.fetch_manifest = old
+
+        # ---------- 前端接线 ----------
+        js = open(os.path.join(REPO, 'frontend', 'app.js'),
+                  encoding='utf-8').read()
+        # saveSettings 必须把响应交回去（否则 d.settings 必炸）
+        assert 'function saveSettings(patch) {' in js
+        body = js.split('function saveSettings(patch) {', 1)[1].split('\n  };', 1)[0]
+        assert 'return d;' in body, 'saveSettings 不返回响应，d.settings 会抛 TypeError'
+        assert js.count('(d && d.settings) || S.settings') == 2, \
+            'theme / maaDir 两处调用没有空值防御'
+        assert '/api/themes?local=1' in js, '没先拉本地主题清单（远端慢时第三方主题会消失）'
+        assert 'function paintThemeGrid' in js
+        assert 'if (S.themes && !themeInfoOf(cur)) cur' in js, \
+            '主题包被删后卡片没有「高亮深色」的兜底'
+        assert "先点卡片上的「下载」" in js, '切到未下载的主题时没有明确提示'
+    finally:
+        st.CONFIG_DIR, st.SETTINGS_PATH, st._cache, themes.THEMES_DIR = keep
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -8259,6 +8690,14 @@ def main():
                 lambda: check_parallel_guard(tmp))
         r.check('B70 游戏没跑就自己唤醒（不干等、轮询不刷屏）',
                 lambda: check_game_wake(tmp))
+        r.check('B71 结束活动的商店导航（TL：卡片灰条/节点剩余时间，模板与 roi 绑死）',
+                lambda: check_closed_shop_nav(tmp))
+        r.check('B72 多账号每个号先唤醒切号（不重复补、不改原步骤、引导卡片接线）',
+                lambda: check_multi_account_wake(tmp))
+        r.check('B73 主题包与开机自启（按需下载/降级/sha/防穿越/默认不勾自启）',
+                lambda: check_theme_autostart(tmp))
+        r.check('B74 主题切换不报错（保存回值/本地快照/已装不消失）',
+                lambda: check_theme_switch(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

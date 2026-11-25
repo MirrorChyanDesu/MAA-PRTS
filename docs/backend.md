@@ -1112,10 +1112,10 @@ skill_claim({'account': ..., 'stage': 'OS', 'wakeup': False})
     'name': '时间啊，向前！',
     'until': '2026-11-28',          # 关卡结束、商店还开着
     'closed': True,                 # 关卡分区和小游戏入口都没了
-    'entry': {'tpl': 'TL_card.png', 'roi': [620, 300, 260, 150],
+    'entry': {'tpl': 'TL_card.png', 'roi': [640, 283, 247, 153],
               'tap': [753, 371], 'wait': 5.0},   # 点 ATTENTION 区那张卡片
     'zones': {},                    # 关卡导航关闭
-    'tools': {'shop': {'tpl': 'TL_shop.png', 'label': '熄火所掩埋的', ...}},
+    'tools': {'shop': {'tpl': 'TL_shop.png', 'label': '炮火所掩埋的', ...}},
 },
 'OS': {
     'name': '雪山降临1101',
@@ -1168,9 +1168,27 @@ skill_claim({'account': ..., 'stage': 'OS', 'wakeup': False})
 1920×1080 截图、按红框原位裁** → 往 `ENTRIES` 加一项 →
 冒烟 B44 / B51 会检查模板在不在、ROI 有没有互相抢。
 
+**活动办完 UI 还会再改一次，模板要跟着重抠**（2026-11-25，TL 商店导航失效）：
+活动结束当天，终端页的卡片被盖上一条「作战已结束」灰条，活动地图的商店节点
+多了红色时钟和「941」剩余时间横幅。老 `TL_card.png` 在定点位置比出 **46.8 分**
+（阈值 16）→ `_to_terminal` 认为「终端页上没有这个活动」，`_to_map` 直接失败，
+用户看到的就是「TL 商店导航失效」；商店节点也掉到 14.1 分（阈值 12），只剩
+兜底坐标盲点。重抠时把握两点：
+
+- **模板整块裁插画**（370×230，连灰条一起认）。灰条本身就是「这个活动结束了」
+  的标记，而且它出现以后插画就不再变；左边图标列里的「3 天」倒计时会天天变，
+  千万别裁进去。
+- **`roi` 必须跟着模板一起改**。这次真正的坑是 `roi` 还停在旧模板的位置
+  （(620,300) 而内容实际在 (960,425)），定点比对只找 ±6 像素，差几十像素必然
+  认不到。冒烟 B71 现在会检查「模板尺寸 ≈ roi×1.5」「挪 20 像素必须认不到」，
+  换模板忘改 roi 会当场被抓。
+
+重抠后真机复验：`run_tool('shop', prefix='TL')` 12 秒到「炮火所掩埋的」，
+entry 3.0 分、节点 2.7 分（游戏里的字是「炮火」，以前按用户截图误记成「熄火」，
+label 已改正）。
+
 **模板必须从真机截图原位裁**（2026-11-22 血的教训）：模板只能用
-`adb exec-out screencap -p` 抓的 **1920×1080** 图，在图上按红框原位裁。
-以前 OS 这套是拿用户的窗口截图（1176×700，还含 28px 标题栏）去掉标题栏再
+`adb exec-out screencap -p` 抓的 **1920×1080** 图，在图上按红框原位裁。以前 OS 这套是拿用户的窗口截图（1176×700，还含 28px 标题栏）去掉标题栏再
 ×1.633 放大出来的——**在真机上一张都认不出**（entry 22 分、base 20 分、
 ex 16 分、s 12.5 分、reward 17.5 分、claim 21~23 分，全都压着阈值 12 过不去），
 表现就是「还是用老导航 / 一个节点都点不到」。窗口截图经过一次缩放再放大，
@@ -1381,6 +1399,28 @@ StartUp 连着三次「回到主界面」都没认出来，最后重试到上限
 轮询统一走 `game_alive(quiet=True)` / `_run(..., quiet=True)`：`pidof` 查不到进程
 本来就返回码 1，那是**正常情况**，每三秒往日志里刷一行「adb 返回 1：」只会看着像
 故障。`quiet` 只影响日志，返回值不变。
+
+## 多账号：每个号的第一件事是「开始唤醒」切号（2026-11-25）
+
+用户第三次报「助手又没加切号自动唤醒」，所以这条不再只靠提示词：
+`run_batch` 在账号数 > 1 时，把 `('wakeup', {})` 插到步骤表**最前面**
+（`skills._with_auto_wake`），每个号开跑前都走一遍（重写前会判断 `_wakes_itself`，
+避免重复唤醒）。
+
+为什么必须程序兜底：多账号是「一个号跑完原地接着跑下一个号」，界面停在哪、现在
+登的是谁，从上一个号身上完全推不出来；而且 `skill_navigate` 的 `_ensure_game`
+**只看进程在不在**，游戏在跑但登的是别人的号时它不会唤醒（这正是「导航没问题、
+切号没做」的现场）。
+
+| 情况 | 补不补 wakeup |
+|---|---|
+| 多账号，第一步是 `tool` / `claim`（不带 wakeup）/ `navigate` / `fight`（不带 wakeup） | 补 |
+| 第一步是 `wakeup` / `sweep` / `weekly` / `train`（默认 `wakeup=true`）/ `fight` 带 `wakeup` / `claim` 带 `wakeup` | 不补（自己会唤醒） |
+| 单账号 | 不补（2026-11-17 用户吐槽过单号被强行唤醒） |
+| 用户说「不用切号」→ `switchAccount=false` | 不补 |
+
+`_with_auto_wake` 是纯函数（返回新的步骤表，不改原列表），所以冒烟可以直接钉。
+日志在任务开头写「多账号：每个号开跑前先「开始唤醒」切号」。
 
 ## 散点关卡（S 关，`scatter.py`，2026-11-23）
 
@@ -2279,3 +2319,108 @@ agent 帮用户写定时，直接调这些就行，不需要另开一套。
 
 线程在 `main()` 里起（`scheduler.start()`：tick + worker 两个守护线程），
 起不来只记一行警告，不影响主流程。
+
+## 开机自启（`autostart.py`，2026-11-25）
+
+需求原话：「加一个开机自动的选项，默认不勾选，用户勾选后才生效，一定不要默认勾选，
+我极度厌恶没有在我同意情况下默认开机自启的软件」。所以这里只有三条铁律：
+
+1. **默认 `False`**，`settings.py` 里那行注释写着「永远不许改成 True」。
+2. **源码模式一律不碰注册表**：`supported()` 要求 `sys.frozen`。开发时启动一次就把
+   打包版那条 `Run` 项删掉的话，用户会以为自启坏了；`sync()` 在源码模式返回
+   `skipped`，界面照实说「当前是源码运行，打包后才行」。
+3. **只在我们自己的值上动手**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+   下名为 `MAA-PRTS` 的一项，读写删都只碰它，不动别人的项。
+
+接口：
+
+| 方法 | 作用 |
+|---|---|
+| `status()` | 只读：`{supported, enabled, command, reason}` |
+| `enable()` / `disable()` | 只有用户点那个开关时才调 |
+| `sync(enabled)` | 启动时对账：设置说开、注册表没有 → 补上；反之 → 删掉 |
+
+`main()` 在 `settings.ensure_dirs()` 之后调一次 `sync()`。之所以每次启动都对账：
+用户可能手动删过注册表项（或用别的清理软件删了），只信 `settings.json` 会出现
+「开关是开的，实际不生效」这种没人能理解的错位。
+
+前端只认 `POST /api/autostart {enabled: true|false}`，失败要把复选框回滚——
+写不进去（组策略/杀软拦截）时不能让界面显示成已开。
+
+## 界面主题与主题包（`themes.py`，2026-11-25）
+
+需求：「默认黑色，新增加白色主题和卫戍协议主题；除了黑白，其他主题资源放在
+pack-data 分支，用户点击下载才能用，防止 exe 体积越来越离谱」。
+
+### 文件放在哪
+
+| 位置 | 内容 |
+|---|---|
+| `frontend/style.css` + `frontend/themes.css` | 内置 dark / light，随 exe 走 |
+| `config/themes/<id>/` | 第三方主题解压到这里（点过「下载」才有） |
+| `pack-data:themes/manifest.json` | 远端目录：id / 名称 / 体积 / sha256 / 缩略图 |
+| `pack-data:themes/<id>.zip` | 主题包：`theme.json` + `theme.css` + 字体/图标 |
+
+启动时**不会**去读远端，只有 `/api/themes` 被调（打开设置页）才拉一次清单，
+8 秒超时、失败只写 `remoteError`，页面照常用黑白两套。
+
+### theme.json 契约
+
+```json
+{
+  "id": "closure", "name": "卫戍协议 · 可露希尔", "version": "1.0.0",
+  "desc": "…", "css": "theme.css", "preview": "preview.jpg",
+  "pet": {"video": "pet/idle.webm", "actions": {"talk": "…"}, "every": 26, "float": true},
+  "extra": [{"file": "pet/idle.webm", "urls": ["https://raw…", "https://gh-proxy…"]}],
+  "license": "…"
+}
+```
+
+### `extra`：**我们不代发的素材**
+
+可露希尔桌宠那四个 888×748 VP9-Alpha webm 来自上游 `dsh-closure-pet`，它的
+NOTICE 明确写了「不在 MIT 授权范围、仅限个人本机娱乐」。所以主题包（zip）里
+**只放我们有权再分发的部分**（配色、像素图标、字体），角色动画写进 `extra`，
+由客户端首次安装时从原作者仓库直连下载：
+
+- 下到了 → 完整主题（含桌宠）；
+- 下不到 → 只记 `extraFailed`，降级成纯配色主题，**不报错、不回滚**。
+  为一个可选动画把刚装好的主题删掉是更差的结果。
+
+`LICENSE` 与 `NOTICE` 也一并写进 `theme.json.license` 和界面提示里，别让它变成
+「我们都在包里」的错觉。
+
+### 安装流程（`install(tid)`）
+
+1. 拉 manifest（`fetch_manifest`，三镜像 raw → gh-proxy → jsDelivr，`?t=` 破缓存）。
+2. 按 `bytes` 与 `sha256` **校验一遍**再解压——镜像吐半截字节的历史上有过。
+3. 解到 `<id>.tmp`（`_safe_extract` 拒绝对路径和 `..`），确认 `theme.json` 和
+   `meta['css']` 存在，再原子改名成正式目录。下歪了绝不覆盖已经能用的那份。
+4. `_download_extra()` 拉 `extra`（已存在的跳过，`.part` 中转再 `os.replace`）。
+
+上限：单包 60 MB、单素材 80 MB。manifest 被写坏时不至于拉爆磁盘。
+
+### 输出与接口
+
+| 接口 | 作用 |
+|---|---|
+| `GET /api/themes` | `{themes(内置+已装), remote(可下载), installed, remoteError}` |
+| `GET /api/themes?local=1` | 只读本机、不联网：`remote` 恒空、`partial: true`。设置页先用它把卡片画出来，再拉全量补「可下载」（2026-11-25：远端慢时第三方主题会像丢了） |
+| `POST /api/theme/install` `{id}` | 装 / 重装，返回 `extra` 与 `extraFailed` |
+| `POST /api/theme/remove` `{id}` | 删掉目录（内置主题拒绝） |
+| `GET /themes/<id>/<rel>` | 主题包里的文件（`file_of()` 防目录穿越） |
+
+`catalog()` 里两个刻意的不对称：
+
+- **已装**主题的 `preview` 是本地路径 `/themes/<id>/preview.jpg`；
+- **未装**主题的 `preview` 指向数据分支（优先 gh-proxy：raw 国内基本连不上，
+  jsDelivr 对分支路径会 301）。拉不到就让前端露出主题色块，别裂图。
+
+`usable(tid)` 是「这个 id 现在能不能用」的唯一判断（内置 → True；第三方 → 有
+`theme.json` 且 `css` 文件存在）。设置里存的 `theme` 指向一个被删掉的包时，
+前端 `applyTheme` 会自动退回 `dark`，不会整页无样式。
+
+### 有一件事故意没做
+
+没有「主题商店」这种联网列表页。manifest 就是全部，一个主题一个 zip，
+`/api/themes` 一次给完。等真有五六个主题再考虑分类/搜索。
