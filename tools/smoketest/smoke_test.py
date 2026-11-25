@@ -2830,7 +2830,13 @@ def check_stagenav(tmp):
     assert stagenav.probe(png(0.50, 0.40)) == 'store', \
         '中部成片纯白（商品卡片）应判成活动商店'
 
-    # 4) 主线关不点：直接返回 False，绝不能对主线关乱点活动入口
+    # 4) 主线关：交给 mainnav（2026-11-24 之前是直接返回 False「不导航」，
+    #    现在真导航了）。**绝不能掉进活动分支去点活动入口**——那才是乱点。
+    from core import mainnav
+    called = []
+    old_run = mainnav.run
+    mainnav.run = lambda t, code, log=None: (called.append(code), (True, 'stub'))[1]
+
     class NullTouch:
         def __init__(self):
             self.hits = []
@@ -2842,10 +2848,13 @@ def check_stagenav(tmp):
         def shot(self):
             return b''
 
-    nt = NullTouch()
-    ok, why = stagenav.goto_stage_list(nt, '1-7')
-    assert ok is False and '不是活动关' in why, (ok, why)
-    assert nt.hits == [], '主线关不该产生任何点击：%s' % (nt.hits,)
+    try:
+        nt = NullTouch()
+        ok, why = stagenav.goto_stage_list(nt, '1-7')
+        assert ok is True and called == ['1-7'], (ok, why, called)
+        assert nt.hits == [], '主线关不该产生任何点击：%s' % (nt.hits,)
+    finally:
+        mainnav.run = old_run
 
 
 # ---------------------------------------------------------------- B35 老故事集导航
@@ -2938,7 +2947,9 @@ def check_story_nav(tmp):
     p = stagenav.points()
     assert 'tabProgress' in p and len(p['tabProgress']) == 2, \
         ('要有一个「默认进度」标签的点击点', p.get('tabProgress'))
-    src = inspect.getsource(stagenav.goto_story_activity)
+    # 2026-11-24：「主界面→曲谱→乐章收录→默认进度」抽成了 to_score_grid，
+    # 活动卡和主线导航共用，所以这条断言要打在它身上。
+    src = inspect.getsource(stagenav.to_score_grid)
     assert "p['tabProgress']" in src, '进网格后必须点一下「默认进度」'
     assert 'in_score_grid' in src, '点完「乐章收录」要确认真的进了网格'
 
@@ -2951,7 +2962,8 @@ def check_story_nav(tmp):
     # 3.7) 回顶要甩够（旧写法从列表底部到不了顶，扫描会从中间开始漏上半张表），
     #      卡片位置缓存读不到时要安静返回 0（不能因为少个 json 就导航不了）。
     assert hasattr(stagenav, '_scroll_top'), '要有「甩到顶」的辅助函数'
-    assert '_scroll_top' in src, '整页扫之前必须先回顶'
+    assert '_scroll_top' in inspect.getsource(stagenav.goto_story_activity), \
+        '整页扫之前必须先回顶'
     assert stagenav._load_card_offset('ZZZ') == 0, '缓存读不到要返回 0'
 
     # 4) 九张老活动的卡片模板都在（少一张就意味着那个活动导航不了）
@@ -4428,7 +4440,7 @@ def check_event_nav(tmp):
     maaplan.time = FakeTime
     talk, naved = [], []
     old_nav = maaplan._navigate
-    maaplan._navigate = lambda conn, st, log, client=None: (
+    maaplan._navigate = lambda conn, st, log, client=None, **kw: (
         naved.append(st) or (True, 'ok'))
     try:
         stagenav.probe_bytes = lambda d: 'map'
@@ -6672,9 +6684,15 @@ def check_pages_skills_logs(tmp):
         im.save(buf, 'PNG')
         return buf.getvalue()
 
-    home = compose([(gear, (20, 4)), (mail, (160, 4))])
-    only_gear = compose([(gear, (20, 4))])
-    only_mail = compose([(mail, (160, 4))])
+    # 贴图坐标跟标定表走（2026-11-24 重标后是 (71,80)/(291,80)）。写死的话
+    # 标定一改这里就假红，反而看不出真正的问题。
+    gx, gy = pages._HOME_ICONS[0][1]
+    mx, my = pages._HOME_ICONS[1][1]
+    gear_at = (gx - 28, gy - 28)
+    mail_at = (mx - 28, my - 28)
+    home = compose([(gear, gear_at), (mail, mail_at)])
+    only_gear = compose([(gear, gear_at)])
+    only_mail = compose([(mail, mail_at)])
     assert pages.is_home_bytes(home), '两个图标都在还不认主页'
     assert not pages.is_home_bytes(only_gear), '只认到齿轮就当主页（设置页会误判）'
     assert not pages.is_home_bytes(only_mail), only_mail
@@ -7050,7 +7068,7 @@ def check_pages_skills_logs(tmp):
         old_home, old_nav = pages.to_home, maaplan._navigate
         pages.to_home = lambda *a, **k: True
         naved3 = []
-        maaplan._navigate = (lambda conn, st, log, client=None:
+        maaplan._navigate = (lambda conn, st, log, client=None, **kw:
                              (naved3.append(st) or (True, 'ok')))
         logs_lr3 = []
         try:
@@ -7118,7 +7136,7 @@ def check_cross_zone_segments(tmp):
     conn = {'adb_path': 'x', 'address': 'y'}
     old = (maaplan._navigate, maaplan._leave_result, maaplan._wait_run)
     naved, left = [], []
-    maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+    maaplan._navigate = lambda c, st, log, client=None, strict=False, **kw: (
         naved.append(st) or (True, 'ok'))
     maaplan._leave_result = lambda c, sp, st, log: (left.append(st) or True)
     maaplan._wait_run = lambda eng, total, log, state: True
@@ -7142,7 +7160,7 @@ def check_cross_zone_segments(tmp):
         # ---- ③ 段间导航失败不许 raise（前面几关已经打完了）----
         naved.clear()
         left.clear()
-        maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+        maaplan._navigate = lambda c, st, log, client=None, strict=False, **kw: (
             naved.append(st) or (False, '模拟失败'))
         eng2 = FakeEng()
         talk2 = []
@@ -7156,7 +7174,7 @@ def check_cross_zone_segments(tmp):
         # ---- ④ 抄作业前面还排了别的任务：首段也必须重新导航 ----
         naved.clear()
         left.clear()
-        maaplan._navigate = lambda c, st, log, client=None, strict=False: (
+        maaplan._navigate = lambda c, st, log, client=None, strict=False, **kw: (
             naved.append(st) or (True, 'ok'))
         eng3 = FakeEng()
         talk3 = []
@@ -7472,6 +7490,670 @@ def check_pause_stops(tmp):
     assert any('这个号剩下的' in str(x) for x in said), said
 
 
+def _grid_frame(cards, width=1920, height=1080):
+    """合成一帧「乐章收录」网格：暗底 + 顶部标题条 + 目标卡片原位贴上去
+
+    用真模板贴，所以定点比对必然是 0 分；行间暗带的位置由 ``cards`` 的 y 决定。
+    顶部那条亮色是模拟「Main Story / 主题曲」标题区——没有它，第 1 章卡上方
+    就是一整片 261px 的暗区，超过行暗带的上限（250）反而检不出来，跟真机不符。
+    """
+    from PIL import Image
+    from core import mainnav
+    im = Image.new('RGB', (width, height), (20, 20, 20))
+    im.paste(Image.new('RGB', (width, 70), (150, 150, 150)), (0, 0))
+    for ep, (x, y) in cards:
+        t = Image.open(mainnav.tpl_of(ep)).convert('RGB')
+        im.paste(t, (x, y))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+def _home_frame(mail_at=None):
+    """合成一帧主页左上角图标（默认按 ``pages._HOME_ICONS`` 的标定贴）"""
+    from PIL import Image
+    from core import pages
+    im = Image.new('RGB', (1920, 1080), (30, 30, 30))
+    for name, (cx, cy) in pages._HOME_ICONS:
+        if mail_at and name == 'home_mail.png':
+            cx, cy = mail_at
+        t = pages._tpl(name)
+        assert t is not None, name
+        t = t.convert('RGB')
+        im.paste(t, (cx - t.width // 2, cy - t.height // 2))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+def check_mainstory_nav(tmp):
+    """B67 主线导航：章号 → 网格格子 → 点卡 → 「前往章节」
+
+    2026-11-24 用户标注的四步（终端 → 曲谱 → 乐章收录 → 默认进度）和活动卡
+    导航共用同一段，之后分岔：主线 18 张卡的位置在网格最顶上、固定 5 列，
+    按章号能算出来，所以不用像活动卡那样整页翻；点开是章节详情页，还得再点
+    一次右下「前往章节」。
+
+    这里钉住四件事：
+      1. 代号解析（``15-3`` / ``0-11`` / 突袭 ``H15-1`` 都算主线，活动代号不算）；
+      2. 18 张整卡模板齐全（缺一张就是「第 N 章导航失败」）；
+      3. 格子定位：行靠「行间暗带」找、卡靠整卡定点比对认，别的章不会被认成它；
+      4. ``goto_stage_list`` 把主线分给 mainnav，活动代号照旧走老路径。
+    """
+    from PIL import Image
+    from core import mainnav, stagenav
+
+    # ① 代号 → 章号
+    assert mainnav.episode_of('15-3') == 15
+    assert mainnav.episode_of('0-11') == 0
+    assert mainnav.episode_of('17-4') == 17
+    assert mainnav.episode_of('H15-1') == 15, '突袭关也属于这一章'
+    for bad in ('GT-1', 'MN-1-7', 'TR-1', 'EP-1', '18-1', '17', ''):
+        assert mainnav.episode_of(bad) is None, bad
+
+    # ② 18 张整卡模板都在、尺寸一致（1920 口径按白边框裁的 265×265）
+    assert len(mainnav.EPISODES) == 18
+    for ep in range(18):
+        p = mainnav.tpl_of(ep)
+        assert p, '第 %02d 章没有卡片模板' % ep
+        assert Image.open(p).size == (265, 265), p
+
+    # ③ 网格定位：第 0 章在第 1 行第 1 列、第 17 章在第 2 行第 3 列
+    frame = _grid_frame([(0, (100, 261)), (5, (1360, 261)), (17, (730, 576))])
+    im = Image.open(io.BytesIO(frame)).convert('L')
+    rows = mainnav._rows_of(im)
+    assert any(abs(r - 261) <= 3 for r in rows), rows
+    assert any(abs(r - 576) <= 3 for r in rows), rows
+    tpl17 = Image.open(mainnav.tpl_of(17)).convert('L')
+    sc, x, y = mainnav._best_in(frame, tpl17)
+    assert sc <= mainnav._MAX_SCORE, sc
+    assert abs(x - 862) <= 2 and abs(y - 708) <= 2, (x, y)
+
+    # ④ 最像的别的章也不许放行（EP00 / EP01 都是「黑暗时代」，实测 22.6 分）
+    tpl01 = Image.open(mainnav.tpl_of(1)).convert('L')
+    sc2, _, _ = mainnav._best_in(frame, tpl01)
+    assert sc2 > mainnav._MAX_SCORE, sc2
+
+    # ⑤ 分派：主线交给 mainnav，活动代号不碰它
+    calls = []
+    old_run = mainnav.run
+    old_story = stagenav.goto_story_activity
+    mainnav.run = lambda t, code, log=None: (calls.append(code), (True, 'stub-main'))[1]
+    stagenav.goto_story_activity = lambda *a, **k: (True, 'stub-activity')
+    try:
+        ft = _FakeTouch([_plain_frame()])
+        ok, why = stagenav.goto_stage_list(ft, '17-3', lambda *_: None)
+        assert calls == ['17-3'], calls
+        assert why == 'stub-main', why
+        ok, why = stagenav.goto_stage_list(ft, 'GT-1', lambda *_: None)
+        assert calls == ['17-3'], '活动代号被主线导航接管了'
+        assert why == 'stub-activity', why
+    finally:
+        mainnav.run = old_run
+        stagenav.goto_story_activity = old_story
+
+    # ⑥ 主页图标标定（2026-11-24 重标）：按标定位置贴得出来就认主页；
+    #    邮件图标挪回旧坐标（2026-11-22 那份错的）就认不出——这条防的是
+    #    「坐标又跟真实 UI 脱节，所有回主页的导航退化成一味按 ESC」。
+    from core import pages
+    assert pages.is_home_bytes(_home_frame()) is True
+    assert pages.is_home_bytes(_home_frame(mail_at=(188, 32))) is False
+
+
+def _diff_frame(mode='', open_bar=False, popup=False,
+                modes=('story', 'normal', 'hard')):
+    """合成一帧「主线关卡列表」：收起态的难度文字 / 展开的 tab 栏 / 确认弹窗
+
+    模板就是从真机 1920×1080 截图上原位裁的，所以贴回原位再认，分数必须是 0。
+    """
+    from PIL import Image
+    from core import mainnav
+    im = Image.new('RGB', (1920, 1080), (18, 22, 26))
+    d = mainnav._tpl_dirs()[0]
+    if popup:
+        im.paste(Image.open(os.path.join(d, 'pop_title.png')).convert('RGB'),
+                 (mainnav._POP_TITLE[0], mainnav._POP_TITLE[1]))
+        for key in ('story', 'normal'):
+            head = mainnav._POP_HEAD.get(key)
+            if head and key in modes:
+                im.paste(Image.open(os.path.join(d, 'pop_%s.png' % key)
+                                    ).convert('RGB'), (head[0], head[1]))
+    elif open_bar:
+        im.paste(Image.open(os.path.join(d, 'tab_info.png')).convert('RGB'),
+                 (mainnav._TAB_INFO[0], mainnav._TAB_INFO[1]))
+    elif mode:
+        im.paste(Image.open(os.path.join(d, 'mode_%s.png' % mode)).convert('RGB'),
+                 (mainnav._MODE_LABEL[0], mainnav._MODE_LABEL[1]))
+    buf = io.BytesIO()
+    im.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+class _ModeTouch(object):
+    """假的「作战环境」界面：点按钮展开 → 点 tab 切档 → 该弹窗的档弹一下
+
+    行为照真机来：收起态点按钮是**展开**，展开态点按钮会选中第一个 tab（所以
+    程序不能再拿按钮当「收起/展开」用）；切换成功后 tab 栏自动收起。
+    """
+
+    def __init__(self, mode='normal', modes=('story', 'normal', 'hard'),
+                 popup_on=(), open_bar=False):
+        self.mode = mode
+        self.modes = tuple(modes)
+        self.popup_on = tuple(popup_on)
+        self.open = bool(open_bar)
+        self.pending = ''
+        self.taps = []
+
+    def shot(self):
+        if self.pending:
+            return _diff_frame(popup=True, modes=self.modes)
+        return _diff_frame(mode='' if self.open else self.mode,
+                           open_bar=self.open, modes=self.modes)
+
+    def tap_px(self, x, y):
+        from core import mainnav
+        self.taps.append((x, y))
+        if self.pending:
+            key = 'story' if x < 960 else 'normal'     # 弹窗：左剧情 右标准
+            if key == self.pending:
+                self.mode = key
+            self.pending = ''
+            self.open = False
+            return True
+        if not self.open:
+            self.open = True
+            return True
+        key = min(('story', 'normal', 'hard'),
+                  key=lambda k: abs(mainnav._MODE_TAB[k] - x))
+        if key not in self.modes:
+            return True
+        if key in self.popup_on:
+            self.pending = key
+            self.open = False
+        else:
+            self.mode = key
+            self.open = False
+        return True
+
+    def size(self):
+        return (1920, 1080)
+
+
+def check_story_difficulty(tmp):
+    """B68 主线作战环境（剧情 / 标准 / 磨难）：认得出、切得对、不误切
+
+    用户 2026-11-24 讲的三档：第 9 章两档（剧情体验 / 标准实战，标准这档有
+    突袭关），第 10~14 章三档（多一档磨难险地），0~8 / 15~17 章没有这条栏。
+
+    钉住五件事：
+      1. 难度写法（剧情 / 标准 / 磨难 / story / hard…）都能翻成内部 key；
+      2. 只有 9（两档）和 10~14（三档）能切，别的章一档都没有；
+      3. 左下角那行字认得出是哪一档，**认成别的档不行**（三张模板互相比）；
+      4. 切档：收起点按钮展开 → 点 tab；已经展开就直接点 tab；
+         第 9 章切剧情会弹「请选择作战环境」，要在弹窗里再点一下；
+      5. 不在 9~14 章的关卡列表上时明确报错，不瞎点。
+    """
+    from PIL import Image
+    from core import mainnav, stagenav
+
+    # ① 写法 → key
+    for raw, key in (('剧情', 'story'), ('剧情体验环境', 'story'),
+                     ('story', 'story'), ('标准', 'normal'), ('普通', 'normal'),
+                     ('normal', 'normal'), ('磨难', 'hard'),
+                     ('磨难险地环境', 'hard'), ('hard', 'hard')):
+        assert mainnav.norm_mode(raw) == key, (raw, mainnav.norm_mode(raw))
+    for bad in ('', ' ', '困难模式', '噩梦', None):
+        assert mainnav.norm_mode(bad) == '', bad
+
+    # ② 哪些章能切
+    assert mainnav.modes_of(9) == ('story', 'normal'), mainnav.modes_of(9)
+    for ep in range(10, 15):
+        assert mainnav.modes_of(ep) == ('story', 'normal', 'hard'), ep
+    for ep in (0, 1, 8, 15, 16, 17):
+        assert mainnav.modes_of(ep) == (), ep
+
+    # ③ 三档模板齐全、尺寸就是那几个盒子的尺寸（换了模板就得同步改几何）
+    d = mainnav._tpl_dirs()[0]
+    for key in ('story', 'normal', 'hard'):
+        p = os.path.join(d, 'mode_%s.png' % key)
+        assert os.path.isfile(p), p
+        w = mainnav._MODE_LABEL[2] - mainnav._MODE_LABEL[0]
+        h = mainnav._MODE_LABEL[3] - mainnav._MODE_LABEL[1]
+        assert Image.open(p).size == (w, h), (p, Image.open(p).size)
+    for name in ('pop_title.png', 'pop_story.png', 'pop_normal.png',
+                 'tab_info.png'):
+        assert os.path.isfile(os.path.join(d, name)), name
+
+    # ④ 认档：贴哪一档就认哪一档，别的档不许认成它
+    for key in ('story', 'normal', 'hard'):
+        frame = _diff_frame(mode=key)
+        got, sc = mainnav.current_mode(frame)
+        assert got == key and sc <= 1.0, (key, got, sc)
+        for other in ('story', 'normal', 'hard'):
+            if other == key:
+                continue
+            got2, _ = mainnav.current_mode(_diff_frame(mode=other))
+            assert got2 == other, (key, other, got2)
+    assert mainnav.current_mode(_diff_frame(mode=''))[0] == '', '空白页被认成某一档'
+    assert mainnav.current_mode(_diff_frame(open_bar=True))[0] == '', \
+        'tab 栏展开时左下角没有那行字，不该认成某一档'
+
+    # ⑤ 展开态 / 弹窗 的判据
+    assert mainnav.bar_open(_diff_frame(open_bar=True)) is True
+    assert mainnav.bar_open(_diff_frame(mode='hard')) is False
+    assert mainnav.is_popup(_diff_frame(popup=True)) is True
+    assert mainnav.is_popup(_diff_frame(mode='normal')) is False
+
+    # ⑥ 切档：把 sleep 停掉（真机上一次约 10 秒，这里只验状态机）
+    class _NoSleep(object):
+        @staticmethod
+        def sleep(_s):
+            return None
+
+    old_mn, old_sn = mainnav.time, stagenav.time
+    mainnav.time = _NoSleep
+    stagenav.time = _NoSleep
+    try:
+        # 6.1 收起点按钮展开 → 点「磨难」tab
+        t = _ModeTouch('normal')
+        ok, why = mainnav.set_mode(t, '磨难')
+        assert ok, why
+        assert t.mode == 'hard', t.mode
+        assert len(t.taps) >= 2, t.taps
+        assert abs(t.taps[-1][0] - mainnav._MODE_TAB['hard']) <= 2, t.taps[-1]
+
+        # 6.2 已经是这一档：一次都不点
+        t = _ModeTouch('hard')
+        ok, why = mainnav.set_mode(t, 'hard')
+        assert ok and not t.taps, (ok, why, t.taps)
+
+        # 6.3 tab 栏已经展开：直接点 tab，别去点按钮（点按钮会选中第一个 tab）
+        t = _ModeTouch('normal', open_bar=True)
+        ok, why = mainnav.set_mode(t, 'hard')
+        assert ok, why
+        assert t.mode == 'hard', t.mode
+        assert abs(t.taps[0][0] - mainnav._MODE_TAB['hard']) <= 2, t.taps
+
+        # 6.4 第 9 章切剧情：点完 tab 会弹「请选择作战环境」，弹窗里再点左边
+        t = _ModeTouch('normal', modes=('story', 'normal'), popup_on=('story',))
+        ok, why = mainnav.set_mode(t, '剧情')
+        assert ok, why
+        assert t.mode == 'story', t.mode
+        assert any(abs(x - mainnav._POP_BTN['story'][0]) <= 2
+                   and abs(y - mainnav._POP_BTN['story'][1]) <= 2
+                   for x, y in t.taps), t.taps
+
+        # 6.5 不在 9~14 章的关卡列表上（认不出那行字）：明确报错，不瞎点
+        t = _ModeTouch('normal')
+        t.shot = lambda: _diff_frame(mode='')
+        ok, why = mainnav.set_mode(t, 'hard')
+        assert not ok and '9~14' in why, (ok, why)
+        assert not t.taps, t.taps
+
+        # 6.6 认不出的难度写法：报错，不动界面
+        t = _ModeTouch('normal')
+        ok, why = mainnav.set_mode(t, '噩梦')
+        assert not ok and '剧情 / 标准 / 磨难' in why, (ok, why)
+        assert not t.taps, t.taps
+    finally:
+        mainnav.time, stagenav.time = old_mn, old_sn
+
+    # ⑦ skill / 工具接线：新 skill 在册、fight 能带难度、提示词写明 9~14 章
+    from core import agent, skills
+    assert 'difficulty' in skills.SKILLS, sorted(skills.SKILLS)
+    assert skills.ALIASES.get('难度') == 'difficulty'
+    assert skills.DIFF_OF_MODE == {'story': 'easy', 'normal': 'normal',
+                                   'hard': 'tough'}
+    fight = [t for t in agent.TOOLS
+             if t['function']['name'] == 'skill_fight'][0]
+    props = fight['function']['parameters']['properties']
+    assert 'difficulty' in props, list(props)
+    assert props['difficulty']['enum'] == ['story', 'normal', 'hard']
+    names = [t['function']['name'] for t in agent.TOOLS]
+    assert 'skill_difficulty' in names, '没把切难度暴露成工具'
+    assert '9~14' in agent.SYSTEM and '作战环境' in agent.SYSTEM
+
+
+class _NavTouch(object):
+    """导航用的假 Touch：adb 通、游戏在跑、什么都能点"""
+
+    def __init__(self, alive=True, up_after=None):
+        self._alive = alive
+        self._up_after = up_after        # None = 永远不起来
+        self.checks = 0
+        self.quiet = []
+
+    def ready(self):
+        return True, '假 adb 正常'
+
+    def game_alive(self, quiet=False):
+        self.checks += 1
+        self.quiet.append(quiet)
+        if self._alive:
+            return True
+        if self._up_after is None:
+            return False
+        return self.checks > self._up_after
+
+
+def check_parallel_guard(tmp):
+    """B69 同一账号串行 + 导航带难度（用户 2026-11-25 报的两个现场）
+
+    现场一：说「导航到 13 章 + 切磨难」，助手把唤醒和切难度拆成两个调用同时
+    发出去。切难度那一路抢不到跑机名额 → 换独立进程 → 一进场查游戏进程，
+    那时 MAA 刚开始登录，``pidof`` 空 → 抛「游戏没在跑」退出，导航一次都没做。
+    同一时段 MAA 的 StartUp 三次「回到主界面」全认错（两路一起点，界面被点乱）。
+
+    现场二：用户再喊一次，助手只调了 skill_navigate（那时它没有 difficulty
+    参数）→ 导航到位了，档没切，用户看到「导航了但没切磨难」。
+
+    钉住五件事：
+      1. ``_wait_idle``：同账号有更早的任务在跑就等；别的账号不等；比自己晚
+         开工的不等（互相等会死锁）；等到了会接着跑；**同一毫秒建的任务**
+         靠创建序号分先后（Windows 时钟粒度 15.6ms，CI 上必现）；
+      2. ``_ensure_game``：游戏没在跑要**自己叫唤醒**（不干等），轮询走安静
+         模式别每三秒刷一行「adb 返回 1：」；唤醒报错但进程起来了照样放行；
+      3. ``skill_navigate`` 带 difficulty：导航完顺带切档，一路到位；
+         0~8 章没有这条栏时忽略而不是报错；写法认不出要报错；
+      4. ``set_mode`` 两次都切不过去时返回说明，不是 NameError。
+      5. 导航入口真的接了自动唤醒（游戏没起时唤醒被调到）。
+    """
+    from core import agent, maacore, mainnav, skills, stagenav, tasks
+
+    # ① _wait_idle：只等「同账号 + 比自己早开工」的那一路
+    f = '测试号#1111 官服.json'
+    logs = []
+    log = logs.append
+    old = tasks.create('唤醒（假）', None, owners=[f])
+    other = tasks.create('别的号（假）', None, owners=['测试号#2222 官服.json'])
+
+    def _wait_log(needle, sec=8.0):
+        """等某行日志出现（CI 的 Windows runner 比本机慢得多，别写死 0.3 秒）"""
+        t0 = time.time()
+        while time.time() - t0 < sec:
+            if any(needle in s for s in logs):
+                return True
+            time.sleep(0.05)
+        return False
+
+    try:
+        # 1.1 同账号更早的任务还在跑：等它跑完才往下走
+        got = {}
+        tid_wait = tasks.create('看戏（假）', None, owners=[f])
+
+        def _wait():
+            got['r'] = skills._wait_idle(tid_wait, [f], log, cap=20, step=0.05)
+
+        th = threading.Thread(target=_wait)
+        th.start()
+        # 2026-11-25 CI 上这里是固定 sleep(0.3) 后断言日志 —— runner 慢的时候
+        # 线程还没跑到第一次检查，日志是空的 → B69 假失败（AssertionError: []）
+        assert _wait_log('等它跑完'), logs
+        tasks.finish(old, result={})
+        th.join(20)
+        tasks.finish(tid_wait, result={})
+        assert got.get('r') is True, got
+        assert _wait_log('前面的任务跑完了'), logs
+
+        # 1.1b 同一毫秒建的两个任务（Windows time.time() 粒度 ~15.6ms）：光比
+        #      startedAt 会判成「不比我早」→ 该等的没等。靠创建序号仍要能分出先后。
+        a = tasks.create('甲（假）', None, owners=[f])
+        b = tasks.create('乙（假）', None, owners=[f])
+        got2 = {}
+        try:
+            with tasks._lock:
+                tasks._tasks[a]['startedAt'] = 1.0
+                tasks._tasks[b]['startedAt'] = 1.0
+            del logs[:]
+            th2 = threading.Thread(target=lambda: got2.update(
+                r=skills._wait_idle(b, [f], log, cap=20, step=0.05)))
+            th2.start()
+            assert _wait_log('等它跑完'), logs
+            tasks.finish(a, result={})
+            th2.join(20)
+            assert got2.get('r') is True, got2
+        finally:
+            tasks.finish(a, result={})
+            tasks.finish(b, result={})
+
+        # 1.2 只有别的账号在跑：不等（多开就该并行）
+        me = tasks.create('导航（假）', None, owners=[f])
+        try:
+            t0 = time.time()
+            assert skills._wait_idle(me, [f], log, cap=20, step=0.05) is True
+            assert time.time() - t0 < 2, '别的账号在跑也等了'
+            # 1.3 只有比自己晚开工的：不等（互相等会死锁）
+            assert skills._wait_idle(
+                tasks.get(me)['id'], [f], log, cap=20, step=0.05) is True
+        finally:
+            tasks.finish(me, result={})
+        # 1.4 没有 owner（全局任务）：直接放行
+        assert skills._wait_idle('nope', [''], log) is True
+    finally:
+        tasks.finish(old, result={})
+        tasks.finish(other, result={})
+
+    # ② _ensure_game：游戏没在跑要**自己唤醒**，不是干等（用户 2026-11-25）
+    class _NoSleep(object):
+        @staticmethod
+        def sleep(_s):
+            return None
+
+        @staticmethod
+        def time():
+            return time.time()
+
+    old_t = skills.time
+    old_wake = skills.skill_wakeup
+    skills.time = _NoSleep
+    woke = []
+    try:
+        # 2.1 游戏已经在跑：直接放行，不叫唤醒
+        skills.skill_wakeup = lambda p, l, tid=None: woke.append('不该叫') or {}
+        assert skills._ensure_game(_NavTouch(alive=True), log) is True
+        assert woke == [], woke
+
+        # 2.2 没在跑：先叫唤醒；唤醒后进程起来了就放行（不干等 90 秒）
+        state = {'up': False}
+
+        class _Late(object):
+            def game_alive(self, quiet=False):
+                assert quiet, '轮询没走安静模式，会一直刷「adb 返回 1：」'
+                return state['up']
+
+        def _wake_then_up(params, log_, tid=None):
+            woke.append(params.get('account'))
+            log_('唤醒（假）：走到 MAA 开始唤醒')
+            state['up'] = True
+            return {'ok': True, 'how': 'maa-startup'}
+
+        skills.skill_wakeup = _wake_then_up
+        del logs[:]
+        assert skills._ensure_game(_Late(), log, None, f) is True
+        assert woke == [f], woke
+        assert any('开始唤醒' in s for s in logs), logs
+
+        # 2.3 唤醒报错但客户端其实起来了：照样放行，别把导航一起拖死
+        state['up'] = False
+
+        def _wake_boom(params, log_, tid=None):
+            state['up'] = True
+            raise RuntimeError('MAA 关不掉')
+
+        skills.skill_wakeup = _wake_boom
+        del logs[:]
+        assert skills._ensure_game(_Late(), log, None, f) is True
+        assert any('自动唤醒没成功' in s for s in logs), logs
+
+        # 2.4 唤醒报错且一直没起来：等满宽限才 False，日志留下原因
+        flags = []
+
+        class _Dead(object):
+            def game_alive(self, quiet=False):
+                flags.append(quiet)
+                return False
+
+        skills.skill_wakeup = _wake_boom
+        del logs[:]
+        assert skills._ensure_game(_Dead(), log, None, f, timeout=0.001) is False
+        assert flags and all(flags), flags
+        assert any('自动唤醒没成功' in s for s in logs), logs
+    finally:
+        skills.time = old_t
+        skills.skill_wakeup = old_wake
+
+    # ③ skill_navigate 带 difficulty：导航完直接切档，不用第二次调用
+    calls = {'nav': [], 'mode': []}
+    keep = (skills.norm_stage, skills._account_file, skills._maa_dir_of,
+            skills._conn_of, skills._client_of, skills._strict_addr,
+            stagenav.Touch, stagenav.goto_stage_list, mainnav.set_mode)
+    skills.norm_stage = lambda raw, log=None: (str(raw), '')
+    skills._account_file = lambda a='': f
+    skills._maa_dir_of = lambda x: 'D:/MAA'
+    skills._conn_of = lambda x, d=None: {'adb_path': 'adb',
+                                         'address': 'emulator-5554'}
+    skills._client_of = lambda x: 'Official'
+    skills._strict_addr = lambda x: False
+    stagenav.Touch = lambda *a, **k: _NavTouch()
+    stagenav.goto_stage_list = lambda t, s, log=None: (calls['nav'].append(s)
+                                                      or (True, '到了'))
+
+    def _fake_set_mode(t, key, log=None):
+        calls['mode'].append(key)
+        return True, '当前作战环境：%s' % mainnav.MODES[key]
+
+    mainnav.set_mode = _fake_set_mode
+    try:
+        # 3.1 第 13 章 + 磨难：一次调用，导航完就切
+        r = skills.skill_navigate({'stage': '13-1', 'difficulty': '磨难'}, log)
+        assert r['ok'] and r['difficulty'] == 'hard', r
+        assert r['mode'] == '磨难险地环境', r
+        assert calls['nav'] == ['13-1'] and calls['mode'] == ['hard'], calls
+
+        # 3.2 只导航不切档：别多此一举
+        calls['nav'][:], calls['mode'][:] = [], []
+        r = skills.skill_navigate({'stage': '13-1'}, log)
+        assert r['ok'] and 'difficulty' not in r, r
+        assert calls['mode'] == [], calls
+
+        # 3.3 第 5 章没有作战环境：忽略 difficulty，别报错也别点
+        calls['nav'][:], calls['mode'][:] = [], []
+        r = skills.skill_navigate({'stage': '5-1', 'difficulty': 'hard'}, log)
+        assert r['ok'] and r.get('modeNote') and 'difficulty' not in r, r
+        assert calls['mode'] == [], calls
+
+        # 3.4 写法认不出：报错，不动界面
+        calls['nav'][:], calls['mode'][:] = [], []
+        try:
+            skills.skill_navigate({'stage': '13-1', 'difficulty': '噩梦'}, log)
+            raise AssertionError('「噩梦」不该被接受')
+        except ValueError as e:
+            assert '剧情 / 标准 / 磨难' in str(e), e
+        assert calls['mode'] == [], calls
+
+        # 3.5 非主线关传 difficulty：报错（活动关没有作战环境）
+        try:
+            skills.skill_navigate({'stage': 'MN-1', 'difficulty': 'hard'}, log)
+            raise AssertionError('活动关不该接受 difficulty')
+        except ValueError as e:
+            assert '不是主线关卡' in str(e), e
+
+        # 3.6 导航到位但切档失败：明确报错，别默默继续
+        mainnav.set_mode = lambda t, k, log=None: (False, '认不出这一章的作战环境')
+        try:
+            skills.skill_navigate({'stage': '13-1', 'difficulty': 'hard'}, log)
+            raise AssertionError('切档失败还返回成功')
+        except RuntimeError as e:
+            assert '作战环境没切成' in str(e), e
+
+        # 3.7 游戏没起：导航入口自己叫唤醒（用户 2026-11-25「adb 正常后就应该
+        #     启动 maa 的自动唤醒了，而不是干等」），不是干等也不是直接报错
+        woke2 = []
+        st = {'up': False}
+
+        class _Dead2(object):
+            def ready(self):
+                return True, '假 adb 正常'
+
+            def game_alive(self, quiet=False):
+                return st['up']
+
+        def _wake2(params, log_, tid=None):
+            woke2.append(params.get('account'))
+            st['up'] = True
+            return {'ok': True, 'how': 'maa-startup'}
+
+        stagenav.Touch = lambda *a, **k: _Dead2()
+        skills.skill_wakeup = _wake2
+        try:
+            calls['nav'][:] = []
+            r = skills.skill_navigate({'stage': '7-1'}, log)
+            assert r['ok'] and calls['nav'] == ['7-1'], (r, calls)
+            assert woke2 == [f], woke2
+        finally:
+            skills.skill_wakeup = old_wake
+    finally:
+        (skills.norm_stage, skills._account_file, skills._maa_dir_of,
+         skills._conn_of, skills._client_of, skills._strict_addr,
+         stagenav.Touch, stagenav.goto_stage_list, mainnav.set_mode) = keep
+
+    # ④ set_mode 两轮都切不过去：返回说明（以前这里用了没定义的 last → NameError）
+    class _NoSleep2(object):
+        @staticmethod
+        def sleep(_s):
+            return None
+
+        @staticmethod
+        def time():
+            return time.time()
+
+    old_mn, old_sn = mainnav.time, stagenav.time
+    mainnav.time = _NoSleep2
+    stagenav.time = _NoSleep2
+    try:
+        t = _ModeTouch('normal', modes=('normal',))   # 只有一档，点「磨难」没反应
+        ok, why = mainnav.set_mode(t, 'hard')
+        assert not ok and '没成功' in why and '磨难' in why, (ok, why)
+    finally:
+        mainnav.time, stagenav.time = old_mn, old_sn
+
+    # ⑤ 提示词 / 工具接线：导航能带难度，提示词写明「一次调用做完、别拆」
+    nav = [x for x in agent.TOOLS
+           if x['function']['name'] == 'skill_navigate'][0]
+    props = nav['function']['parameters']['properties']
+    assert 'difficulty' in props, list(props)
+    assert props['difficulty']['enum'] == ['story', 'normal', 'hard']
+    assert 'skill_navigate(stage="13-1", difficulty="hard")' in agent.SYSTEM
+    assert '同一个账号的 skill 是**串行**' in agent.SYSTEM
+
+
+def check_game_wake(tmp):
+    """B70 查进程别刷屏 + 导航/切档入口接的是「自动唤醒」不是「干等」
+
+    用户 2026-11-25 截图：adb 已就绪后日志只剩一排「adb 返回 1：」和
+    「游戏还没起来，等一会儿（最多 90 秒）…」，MAA 的自动唤醒压根没动。
+    """
+    import inspect
+    from core import skills, stagenav
+
+    logs = []
+    t = stagenav.Touch('definitely-no-such-adb.exe', 'emulator-5554',
+                       logs.append, package='com.hypergryph.arknights')
+    # 1) 轮询用安静模式：进程不在（pidof 返回码 1）属正常情况，不写日志
+    assert t.game_alive(quiet=True) is False
+    assert not logs, logs
+    # 2) 正常模式：真出错要留证据（adb 找不到 / 返回非 0）
+    assert t.game_alive() is False
+    assert any('adb' in s for s in logs), logs
+
+    # 3) 两个入口都走 _ensure_game（自查唤醒），不再各自「等」或直接报错
+    for fn in (skills.skill_navigate, skills.skill_difficulty):
+        src = inspect.getsource(fn)
+        assert '_ensure_game' in src, fn.__name__
+        assert '_wait_game' not in src, fn.__name__
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -7569,6 +8251,14 @@ def main():
                 lambda: check_raid_variant(tmp))
         r.check('B66 暂停真停（按账号记账 / 段循环收手 / 不误伤别的号）',
                 lambda: check_pause_stops(tmp))
+        r.check('B67 主线导航（章号解析/18 张卡模板/格子定位/主页图标标定）',
+                lambda: check_mainstory_nav(tmp))
+        r.check('B68 主线作战环境（剧情/标准/磨难：认得准、切得对、不误切）',
+                lambda: check_story_difficulty(tmp))
+        r.check('B69 同账号串行 + 导航带难度（不抢界面、不切错档、不只导航不切）',
+                lambda: check_parallel_guard(tmp))
+        r.check('B70 游戏没跑就自己唤醒（不干等、轮询不刷屏）',
+                lambda: check_game_wake(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
