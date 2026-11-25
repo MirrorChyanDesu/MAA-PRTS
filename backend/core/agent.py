@@ -421,14 +421,41 @@ TOOLS = [
           'EX / S / MO 关会自动切到活动地图里的对应分区）。'
           'stage 可以传**中文活动名（推荐，如「孤星」「愚人号」）**、关卡号'
           '（MN-1 / TL-5 / XX-EX-1）、活动 id（act25side），也可以直接传'
-          '「最新活动 / 当期活动」。内部会自己换成真实关卡代号。'
+          '「最新活动 / 当期活动」。**主线关也走它**（15-3 / 0-11 / H15-1 都行，'
+          '会走「终端 → 曲谱 → 乐章收录 → 章节卡 → 前往章节」那条路）。'
+          '**主线 9~14 章要切作战环境时把 difficulty 一起传**（磨难/剧情/标准），'
+          '导航到位后顺手切档——不要「先导航、再调 skill_difficulty」两步走，'
+          '助手老是忘第二步，用户看到的就是「导航了但没切磨难」（2026-11-25）。'
+          '内部会自己换成真实关卡代号。'
           '**别自己凭记忆把中文名换算成代号**（孤星是 CW，不是 SV）。'
-          '返回 taskId。',
+          '**游戏没开不用先调 skill_wakeup**：它一进场发现进程不在就自己唤醒'
+          '（有切号名走 MAA 开始唤醒），唤醒完再导航；只有用户要求切号换号时'
+          '才单独唤醒。返回 taskId。',
           {'stage': _STAGE,
            'activity': {'type': 'string',
                         'description': '活动中文名（如「孤星」「愚人号」）；'
                                        '和 stage 二选一，中文名最不容易错'},
+           'difficulty': {'type': 'string', 'enum': ['story', 'normal', 'hard'],
+                          'description': '主线 9~14 章的作战环境：剧情体验(story) '
+                                         '/ 标准实战(normal) / 磨难险地(hard)。'
+                                         '导航到位后自动切；0~8 / 15~17 章没有'
+                                         '这条栏，别传'},
            'account': _ACC}, []),
+    _tool('skill_difficulty',
+          '切主线第 9~14 章的「作战环境」（剧情体验 / 标准实战 / 磨难险地）。'
+          '第 9 章只有剧情 / 标准两档，第 10~14 章三档；0~8 章和 15~17 章没有'
+          '这条栏（那几章只有普通 / 突袭）。给了 stage 就先导航到那一章的关卡'
+          '列表再切；不给就按「界面已经停在目标章节的关卡列表上」处理。'
+          '**「导航过去顺便切档」时别用它**——直接给 skill_navigate 传 difficulty，'
+          '一次调用搞定。它适合「人已经在那一章、只想换档」或者用户明确要单独'
+          '切一次的时候。返回 taskId；同一个号还有任务在跑时会自动排队等它。',
+          {'difficulty': {'type': 'string', 'enum': ['story', 'normal', 'hard'],
+                          'description': '剧情体验环境(story) / 标准实战环境'
+                                         '(normal) / 磨难险地环境(hard)'},
+           'stage': {'type': 'string',
+                     'description': '关卡代号（10-3 / 12-1）：给了就先导航到'
+                                    '那一章的关卡列表再切'},
+           'account': _ACC}, ['difficulty']),
     _tool('skill_skip_story',
           '过剧情关（MN-ST-1 这类 ST 关）：自动点开 ST 关并跳过剧情。'
           '周目流程里每遇到 ST 关就调一次。返回 taskId。',
@@ -440,9 +467,12 @@ TOOLS = [
           '补进计划（如要 BB-S-3 会先打 BB-S-1、BB-S-2），再拿作业要求比对'
           '这号的练度——练度不够/缺干员/没作业的关**不会排队**，结果里的 '
           'precheck 会列出哪几关打不了、为什么。'
-          '**默认不唤醒不导航**——界面在哪就从哪直接开打；'
-          '用户还在主界面 / 游戏没开时要先 skill_navigate 或 skill_wakeup，'
-          '或传 wakeup=true 走全套。**调用前先跟用户确认要打哪些关**。'
+          '**默认补唤醒+导航**（传 wakeup=true）：用户点名了账号、又没说'
+          '「不用切号 / 已经开着这个号」时，必须传 wakeup=true——先唤醒'
+          '（MAA 的开始唤醒，按该账号档案切号）→ 导航到这组关 → 开打。'
+          '只有他明说「直接跑 / 已经在关卡列表 / 别切号」才直跑'
+          '（assumeStageList=true 或 noSwitch=true）。'
+          '**调用前先跟用户确认要打哪些关**。'
           '**难度必须显式说**：不传 raid、也不带 @ 后缀 = **只打普通**（跟着'
           '用户原话走，别自动升级）。要突袭就写 raid="raid" 或 '
           'stages=["SV-EX-1@raid"]；普通还没通关、要一次打通写 @both。'
@@ -466,12 +496,25 @@ TOOLS = [
                                      '用户说突袭就必须写 @raid 或传 raid="raid"'},
            'mode': {'type': 'string', 'enum': ['copy', 'fight']},
            'wakeup': {'type': 'boolean',
-                      'description': 'true=连唤醒+导航一起跑（默认 false 直跑）'},
+                      'description': 'true=先唤醒（按账号档案切号）再导航到这组关，'
+                                     '然后开打。**点名了账号、用户没说「不用切号/'
+                                     '已经在关卡列表」时必须传 true**；只有用户明确'
+                                     '要求直跑才省略'},
            'autoPrereq': {'type': 'boolean',
                           'description': '默认 false=不补前置，点名的关就是全部。'
                                          'true=把前置关也补进计划（补进来的只打普通）'
                                          '。用户说「S-3 点不开/没解锁，把前置一起补」'
                                          '时才传 true，别自己默认补'},
+           'difficulty': {'type': 'string',
+                          'enum': ['story', 'normal', 'hard'],
+                          'description': '主线 9~14 章的作战环境：剧情体验(story) '
+                                         '/ 标准实战(normal) / 磨难险地(hard)。'
+                                         '**这几章必须传**——用户没说就传 normal '
+                                         '并在回复里说明「按标准实战环境打」；'
+                                         '用户说磨难就传 hard。程序会在导航到那'
+                                         '一章的关卡列表后自动切，切不过去会直接'
+                                         '报错（不会闷头打错档）。0~8 章和 15~17 '
+                                         '章没有这条栏，传了不起作用'},
            'raid': {'type': 'string', 'enum': ['normal', 'raid', 'both'],
                     'description': '难度档位，**照用户原话传**：'
                                    '用户说「突袭/突袭模式」→ 必须显式传 raid；'
@@ -619,6 +662,9 @@ TOOLS = [
           '{"skill":"tool","name":"event_shop","prefix":"OS"}。'
           '可用 skill：wakeup navigate fight skip_story sweep tool claim '
           'weekly train signin。**steps 里不用写 account**（程序按账号循环）。'
+          '**两个以上账号时，每个号开跑前程序会自动补一步「开始唤醒」切号**'
+          '（第一步本身带唤醒的 sweep/weekly/train 不重复补），别自己再写 '
+          'wakeup 步骤；用户明说不用切号才传 switchAccount=false。'
           '**调用前先跟用户确认：哪些号、按什么顺序做哪几步**。',
           {'accounts': {'type': 'array', 'items': {'type': 'string'},
                         'description': '账号文件名列表；空数组 = 当前选中的账号'},
@@ -651,7 +697,12 @@ TOOLS = [
                                         '"emulator-5556"}。**只覆盖这一次**；'
                                         '用户说「这个号固定用第二台」时应该先'
                                         '调 bind_emulator 钉进账号，别指望每次'
-                                        '都记得传这个参数'}},
+                                        '都记得传这个参数'},
+           'switchAccount': {
+               'type': 'boolean',
+               'description': '多账号时每个号开跑前要不要「开始唤醒」切号。'
+                              '**默认 true，别传**；只有用户明说「不用切号 / '
+                              '都是同一个号 / 已经切好了」才传 false'}},
           ['steps']),
 ]
 
@@ -1621,6 +1672,12 @@ def _tool_skill_navigate(args, session=None):
             'note': '导航在后台跑，完成或失败都写进任务日志。'}
 
 
+def _tool_skill_difficulty(args, session=None):
+    # 切档是纯点击，不耗理智、不改配置，和导航一样免确认
+    return {'started': True, 'taskId': skills.run_skill('difficulty', args),
+            'note': '切难度在后台跑，日志里有「当前 X → Y」和切完的复验结果。'}
+
+
 def _tool_skill_signin(args, session=None):
     return {'started': True, 'taskId': skills.run_skill('signin', args),
             'note': '签到在后台跑，日志里有每个号的结果。'}
@@ -1798,6 +1855,9 @@ def _tool_run_steps(args, session=None):
 
     accounts = [str(x) for x in (args.get('accounts') or []) if str(x).strip()]
     names = {str(k): v for k, v in (args.get('names') or {}).items()}
+    sw = args.get('switchAccount')
+    if isinstance(sw, str):
+        sw = sw.strip().lower() not in ('0', 'false', 'no', 'off')
     emus_raw = {str(k): str(v or '').strip()
                 for k, v in (args.get('emulators') or {}).items() if str(v or '').strip()}
     d = multiacct._maa_dir({}) or (settings.load().get('maaDir') or '')
@@ -1828,6 +1888,8 @@ def _tool_run_steps(args, session=None):
                       for n, _ in skills._norm_steps(steps))
     lines = ['%d 个账号 / %d 台模拟器' % (len(rows), len(groups)),
              '每步：' + desc]
+    if len(rows) > 1 and sw is not False:
+        lines.append('每个号开跑前先「开始唤醒」切号（用户说不用切号才关）')
     for key, g in groups:
         who = '、'.join(r['name'] for r in g['rows'])
         lines.append('· %s ← %s（%s）'
@@ -1844,12 +1906,12 @@ def _tool_run_steps(args, session=None):
 
     payload = {'accounts': [r['file'] for r in rows], 'steps': steps,
                'names': {r['file']: r['accountName'] for r in rows},
-               'emulators': emus}
+               'emulators': emus, 'switchAccount': sw}
     blocked = _guard(session, 'run_steps', dict(payload, _confirmed=True), summary)
     if blocked:
         return blocked
     tid = skills.run_batch(payload['accounts'], steps, names=payload['names'],
-                           emulators=emus)
+                           emulators=emus, switch=sw)
     out = {'started': True, 'taskId': tid, 'accounts': len(rows),
            'emulators': len(groups),
            'note': '已在后台跑：同一台模拟器的号排队切号，不同模拟器同时开跑。'
@@ -1877,6 +1939,7 @@ _HANDLERS = {
     # skill：轻量的免确认，直接丢后台（失败自然有日志，用户看得到）
     'skill_wakeup': _tool_skill_wakeup,
     'skill_navigate': _tool_skill_navigate,
+    'skill_difficulty': _tool_skill_difficulty,
     'skill_signin': _tool_skill_signin,
     'skill_claim': _tool_skill_claim,
 }
@@ -2097,13 +2160,22 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - skill_wakeup：唤醒游戏到主界面（可按尾号切号）
 - skill_navigate：导航到活动（老活动 / 当期 / EX 都行）。stage 优先传**中文
   活动名**（「孤星」），代号/活动 id 也行——内部统一换，别自己换算。
+  **主线 9~14 章要切作战环境就带 difficulty**（一次调用到位）。
   当期活动（ENTRIES 里有的，如 OS / TL）走的是「终端页 → 活动横幅 → 地图上
   直接点分区节点」，**失败时不会退回老路径**（老 UI 早就点不到了）：报的是
   「当期活动导航没到位：…」。照实告诉用户是入口认不出、要重新标定导航，
   别建议他「用老办法再点一次」
+- skill_difficulty：切主线第 9~14 章的「作战环境」——剧情体验 / 标准实战 /
+  磨难险地（第 9 章只有前两档，10~14 章三档）。带 stage 就先导航过去再切；
+  不带就按「界面已经在那一章的关卡列表上」处理。**「导航 + 切档」别调它**：
+  给 skill_navigate 传 difficulty 一次做完，分两步助手常常漏第二步；
+  挂机时同理写进 skill_fight 的 difficulty
 - skill_skip_story：过剧情关（ST 关自动点开 + 跳剧情）
-- skill_fight：自动战斗（编队 / 借助战 / 吃理智药）。**默认不唤醒不导航**，
-  界面在哪就从哪直接开打；要全套（唤醒+导航）得用户明说或传 wakeup=true。
+- skill_fight：自动战斗（编队 / 借助战 / 吃理智药）。**默认要补唤醒+导航**：
+  用户点名了账号、又没说「不用切号 / 已经开着这个号」，就传 wakeup=true
+  （先唤醒按档案切号 → 导航到这组关 → 开打；不切号就可能打到别人那个号上）。
+  只有他明说「直接跑 / 已经在关卡列表 / 别切号」才直跑
+  （assumeStageList=true 或 noSwitch=true）。
   **打不过会自动回关卡菜单、只换那一关的作业重挂**（没候选就同一份再试一次，
   前面打完的关不重打），日志报「跑到哪几关 / 卡在哪 / 为什么」
 - skill_signin：森空岛签到
@@ -2117,7 +2189,10 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   三项都自己导航到活动地图再点入口。只给「小游戏」这种泛称时**必须带 prefix**
   （OS / TL）——两个活动的小游戏是 MAA 里两条不同的任务，选错进去也是白跑。
   活动商店必须给黑名单（默认四个：数据增补条 / 数据增补 / 龙门币 / 家具零件），
-  **空黑名单会把无限池也买掉**，别传空数组。
+  **空黑名单会把无限池也买掉**，别传空数组。用户说「把快关闭的 TL 商店清空，
+  黑名单：数据增补条、数据增补、家具零件」就是
+  `skill_tool(name="event_shop", prefix="TL", blacklist=["数据增补条","数据增补","家具零件"])`
+  ——**「黑名单」是不要买的**，别理解成要买的清单。
   小游戏第一次进要过教程/引导，MAA 不会点教程对话：任务里 `stuck` / 超时的时候，
   明确告诉用户「先在模拟器里手动把教程过一遍，过完再让我挂一次」，不要说
   「任务失败请重试」这种空话
@@ -2125,6 +2200,10 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   不用 MAA 任务；游戏没开就先 skill_wakeup 或传 wakeup=true
 
 **多账号怎么跑（2026-11-22）**：
+- **每个号的流程开始都是「开始唤醒」切号**（2026-11-25 用户口径）：走
+  `run_steps` 程序会自动补第一步，你**不用**往 steps 里写 wakeup；一个号一个号
+  调 skill 时，每个号的第一条必须是 `skill_wakeup(account=...)` 或
+  fight/sweep 带 `wakeup=true`。只有用户明说「不用切号」才省掉。
 - 一个号一段连续操作 → 单独调 skill
 - **多个号做同一套事** → 用 `run_steps`，把步骤写成列表交给我，程序自己
   按模拟器分组：同一台模拟器排队切号，不同模拟器多开并行
@@ -2137,6 +2216,12 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
   ```
   （raid 按「复刻突袭」那段先问用户；**别一个号一个号地调 skill**——
   那样前一个还在跑，后一个就抢同一台模拟器）
+- **联排先按模拟器分组，导航各归各的**：看 list_accounts 的 `emulator`，
+  同一台的号排成一串、不同台的并行；每个号的**导航必须是它这一组自己的
+  第一步**（sweep / wakeup 自带，别再交叉写）。两台模拟器同时抢同一个活动
+  入口会互相干扰，现象就是一直卡在导航、反复退回主页（2026-11-24 用户口径）。
+  **一个号的步骤跑完先退回主页，再唤醒切下一个号**——直接在别人那个号的
+  关卡列表上接着点，就会打到他的号上。
 - list_accounts 的 `current` 是用户**此刻在左侧点开的那个号**：用户没点名
   是谁时就用它，别反问「你说哪个账号」；`emulator` 相同的号只能排队，
   不同的可以并行
@@ -2189,9 +2274,11 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 - 游戏没开、卡登录页 → skill_wakeup
 - **单独打一组关**（用户明说「我已经在关卡列表」/「别切号，直接开始」）→
   skill_fight 并传 `assumeStageList=true`（或 `noSwitch=true`），不要补导航。
-- **多账号批量**：除非用户明确上面两句之一，`fight` **一律先唤醒 + 导航**
-  （程序在 run_steps 里自动加，不用你手动写）。因为上一个号可能停在关卡
-  列表、主页、基建或结算页，界面状态无从判断（2026-11-22 用户口径）。
+- **除了上面两句例外，`fight` 一律先唤醒 + 导航**：`run_steps` 里程序会
+  自动补，但**你直接调 skill_fight 时得自己传 wakeup=true**——不传就是直跑，
+  界面停在哪就在哪开打。因为上一个号可能停在关卡列表、主页、基建或结算页，
+  界面状态无从判断，界面上的号也可能根本不是用户说的那个
+  （2026-11-22 / 2026-11-24 用户口径）。
 - **把一个活动的普通关、EX（含突袭）、S 全清一遍** → skill_sweep。它自己
   分段导航、每关失败换作业重挂，不用一段段手动调 skill_navigate + skill_fight
 - 签到 → skill_signin
@@ -2230,7 +2317,63 @@ run_status。state 是 stalled 就说卡在哪个节点，failed 就说原因。
 find_ops 多查几个用户常打的关，统计哪些干员反复出现在作业里、
 再对 account_progress 看该账号实际情况，给出优先级。说明这是按作业站使用频率推的。
 
+## 主线（主题曲）怎么挂
+
+主线（关卡号 `15-3` / `0-11` / 突袭 `H15-1`）和老活动不一样，**打法分两套**：
+
+- **第 0~8 章、15~17 章**：只有普通 / 突袭。导航到关卡列表 → 排作业集就是
+  全部，没有难度可选。用户说突袭就 `raid="raid"`，没说就是普通。
+- **第 9~14 章**：多了「作战环境」三档 —— 剧情体验环境 / 标准实战环境 /
+  磨难险地环境。**第 9 章只有剧情、标准两档；第 10~14 章才三档**。
+  这三档是**同一个关卡列表的不同档**（磨难那档在游戏里是另一批关卡），所以
+  **导航到那一章的关卡列表之后必须先选档，再排作业集**。界面停在别的档上，
+  打下去就是另一档的关。
+
+所以第 9~14 章调 skill_fight 时，难度写进 `difficulty`：
+```
+{"stages": ["10-1","10-2","10-3"], "difficulty": "hard", "wakeup": true}
+```
+程序会在导航到位后自动切档，日志里写「作战环境：标准实战环境 → 磨难险地环境」；
+切不过去就直接报错（不会闷头打错档）。用户没说难度时按**标准实战环境**传
+`difficulty:"normal"`，并在回复里说一句「你没说难度，我按标准实战环境打」。
+
+**只说「导航到第 13 章、切磨难」时，一次调用做完**：
+`skill_navigate(stage="13-1", difficulty="hard")` —— 导航到位后自己切档。
+**不要**「先 skill_wakeup、再 skill_navigate、再 skill_difficulty」拆成三个调用：
+用户 2026-11-25 实测，拆开发出去的两个任务同时动同一台模拟器，切难度那一路在
+MAA 还在登录时查游戏进程、查到空就报「游戏没在跑」，导航一次都没做；同一时段
+MAA 的 StartUp 三次「回到主界面」也全认错（两路一起点，界面被点乱）。
+同一个账号的 skill 是**串行**的（后发的会排队等前面的跑完，日志里会写
+「这个账号还有一路在跑…等它跑完」），所以能一次调用解决就别拆，拆了只会排队。
+
+**游戏没开也别先喊唤醒**：skill_navigate / skill_difficulty 一进场发现游戏进程
+不在，会自己走一遍唤醒（有切号名 = MAA 开始唤醒，没有 = 重启客户端），再接着
+导航/切档。用户 2026-11-25 原话：「adb 正常后就应该启动 maa 的自动唤醒了，而不是
+干等」。只有用户要**切号换号**（换另一个账号登录）时才单独调 skill_wakeup。
+
+只想换档、不重排作业（「先切到磨难我看看」）就调 `skill_difficulty`。
+0~8 / 15~17 章没有这条栏，别传 difficulty、也别调 skill_difficulty。
+
 ## 硬规矩
+- **一次任务涉及两个及以上账号 → 每个号的流程开始必须「开始唤醒」切号**
+  （2026-11-25 用户口径）。上一个号可能停在关卡列表 / 主页 / 基建 / 结算页，
+  那台模拟器上登的也未必是你要的号——不唤醒就接着点，打到的是别人的号。
+  - 走 `run_steps`：程序自动补第一步 wakeup（第一步是 sweep / weekly / train
+    或带 wakeup 的 fight 就不重复补），**别自己再往 steps 里加 wakeup**，
+    也别传 `switchAccount=false`（用户没说不用切号就不要关）。
+  - 一个号一个号地调 skill（只在用户要求「先跑这个号我看看」时）：每个号的
+    第一条都必须 `skill_wakeup(account=...)`，或 fight / sweep 传 `wakeup=true`。
+    **刚唤醒过一次不等于一直有效**——中间换了号就失效了。
+  - 单账号不强制：界面本来就是那个号，别为了「保险」白重启一遍客户端
+    （2026-11-17 用户吐槽过单号被强行唤醒）。
+- **点名了账号就默认要切号**：用户指定了某个号（「挂一下 5505 那个」），
+  只要没明说「不用切号 / 别换号 / 已经开着这个号」，**一律先唤醒切号**
+  （skill_fight 传 wakeup=true，或先 skill_wakeup 再打）。**别把界面上正在
+  跑的那个号当成他说的号**（2026-11-24 用户口径）。
+- **作业前面默认要有导航**：用户没明说「直接跑 / 别导航 / 已经在关卡列表」
+  时，排作业前必须有一道导航（skill_navigate，或 fight / sweep 的
+  wakeup=true 全套；run_steps 里程序会自己补）。**没有导航直接排 Copilot
+  就是在当前界面上瞎点，必卡死。**
 - **打关先看预检，别硬挂**：skill_fight 开打前会按顺序补前置关、拿作业要求
   比对这号练度。返回里有 `precheck` 且列了「练度不足 / 缺干员 / 前置未通」时，
   **必须先把「哪几关打不了、为什么」原样告诉用户**（练度不够要点出差哪个干员），
@@ -2268,7 +2411,8 @@ find_ops 多查几个用户常打的关，统计哪些干员反复出现在作�
   突袭、参数没传）。反过来，用户说「普通」也绝不能升成突袭。
   普通还没通关、要一次打通时，把那一关写成 ``SV-EX-1@both``。
   同一次计划里可以逐关分开写：``["SV-EX-1@raid", "SV-EX-6@both"]``。
-  磨难/险地是主线独立难度，不用后缀。
+  磨难/险地是主线第 9~14 章的「作战环境」，**不是突袭、也不用 @ 后缀**：
+  它是另一批关卡，要用 skill_fight 的 `difficulty`（或 skill_difficulty）切档。
   **不要**跟用户说「突袭打不了」——作业站有突袭作业就能排；真搜不到突袭
   作业时日志里会写「这关没有突袭作业，只打普通」，**照实转告用户**，别
   顺着自己刚才说的话继续吹。

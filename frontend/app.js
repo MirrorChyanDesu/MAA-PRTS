@@ -91,6 +91,11 @@ function saveSettings(patch) {
     try {
       const d = await api('/api/settings', patch);
       S.settings = d.settings;
+      // 必须把响应交回去：有调用方写的是 `const d = await saveSettings(...)`
+      // 再读 d.settings（主题切换、MAA 目录）。这里原来不 return，d 是
+      // undefined，那两处每次都炸「Cannot read properties of undefined」，
+      // 表现成「点白色主题报错、界面又弹回原主题」（2026-11-25 用户反馈）。
+      return d;
     } catch (e) {
       try { S.settings = (await api('/api/settings', {})).settings; } catch (_) { }
       throw e;
@@ -129,6 +134,29 @@ async function copyText(text, label) {
     catch (err) { toast('复制失败，请手动复制：' + text, 'err'); }
     ta.remove();
   }
+}
+
+/* 二次确认（删主题这类动作）。不用原生 confirm：WebView2 里弹出来又丑又
+   可能被宿主拦，统一走自己的 modal。 */
+function askConfirm(title, text, okLabel = '确定') {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = v => { if (!settled) { settled = true; resolve(v); } };
+    modal(`<h3>${esc(title)}</h3>
+      <div class="sub">${esc(text)}</div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+        <button class="btn-plain" data-close>取消</button>
+        <button class="btn-solid" data-ask-ok>${esc(okLabel)}</button>
+      </div>`, {
+      onClose: () => done(false),
+      onMount(el, close) {
+        el.querySelector('[data-ask-ok]').addEventListener('click', () => {
+          done(true);
+          close();
+        });
+      },
+    });
+  });
 }
 
 /* ------------------------------------------------------------ 弹窗 */
@@ -184,6 +212,14 @@ async function boot() {
     // 左侧默认停在当前账号那一栏（上次用的是终末地就停在终末地）
     S.sideGame = gameOf(d.accounts.find(a => a.file === S.current) || d.accounts[0]);
     $('#basket-autostart').checked = S.settings.autoStartMaa !== false;   // 设置里的默认开关真正生效
+    // 主题：内置的立刻生效；第三方要等已装清单（本地就能读，远端失败也有）
+    const theme0 = String(S.settings.theme || 'dark').toLowerCase();
+    if (THEME_FIXED[theme0]) applyTheme(theme0);
+    loadThemes().then(() => {
+      // ?theme=xxx 只是预览（截图/分享用），不写进设置
+      const q = new URLSearchParams(location.search).get('theme');
+      applyTheme(q || theme0);
+    }).catch(() => applyTheme('dark'));
     renderAccounts();
     renderUpdate();
     renderQuick();
@@ -198,6 +234,10 @@ async function boot() {
     if (mod0 === 'gacha' || mod0 === 'signin' || mod0 === 'chat') setModule(mod0);
     startPing();
     setTimeout(scheduleWatch, 7000);
+    // ?open=settings 直接展开设置（截图自测 / 给用户发链接用）
+    if (new URLSearchParams(location.search).get('open') === 'settings') {
+      setTimeout(() => { try { openSettings(); } catch (e) { } }, 400);
+    }
     setInterval(scheduleWatch, 20000);
     // 资源包后台自动更新：晚几秒，别和首屏渲染抢网络
     setTimeout(packAutoSync, 2500);
@@ -2610,6 +2650,202 @@ async function pickFile(inputEl) {
   else if (r && r.error) toast('选择失败：' + r.error, 'err');
 }
 
+/* ------------------------------------------------------------ 主题
+   dark / light 内置（themes.css 覆盖 :root 变量），随 exe 打包；
+   其余主题（卫戍协议）要从 pack-data 分支下载主题包，解到
+   config/themes/<id>/，样式走 /themes/<id>/theme.css，桌宠视频走
+   /themes/<id>/pet/*.webm。用户 2026-11-25：exe 不能跟着主题一起涨。 */
+
+const THEME_BUILTIN = ['dark', 'light'];
+// 内置主题：跟着 exe 走，永远「已安装」。installed 必须给 true——
+// 少了它卡片会渲染成「下载」，点下去后端直接回「内置主题不能安装」。
+const THEME_FIXED = {
+  dark: { id: 'dark', name: '深色', desc: '默认主题，低亮度不刺眼', builtin: true, installed: true },
+  light: { id: 'light', name: '白色', desc: '浅色界面，白天看得清', builtin: true, installed: true },
+};
+const themeInstalled = {};     // id → { css, pet }（已装第三方主题的清单）
+let _petTimer = null;
+
+function themeInfoOf(id) {
+  if (THEME_FIXED[id]) return THEME_FIXED[id];
+  return themeInstalled[id] || null;
+}
+
+/* 桌宠：主题包在 theme.json 里声明 pet.video（待机循环）与
+   pet.actions（talk / happy / think 这些动作，随机播一个再回待机）。
+   素材是主题包自己的，下不到就只留配色，不报错。 */
+function stopPetLoop() {
+  if (_petTimer) { clearInterval(_petTimer); _petTimer = null; }
+}
+
+/* 桌宠开关（设置 → 常规）。存 localStorage：这是纯外观偏好，不值得写进
+   settings.json 跟账号配置混在一起，换台机器也不需要同步。 */
+function petEnabled() {
+  try { return localStorage.getItem('maaprts.pet') !== '0'; } catch (e) { return true; }
+}
+
+function syncThemePet(id) {
+  let el = document.getElementById('theme-pet');
+  const info = id && !THEME_FIXED[id] ? themeInstalled[id] : null;
+  const pet = info && info.pet;
+  if (!pet || !pet.video || !petEnabled()) {
+    if (el) { el.classList.remove('on'); el.innerHTML = ''; }
+    stopPetLoop();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'theme-pet';
+    document.body.appendChild(el);
+  }
+  const base = `/themes/${encodeURIComponent(id)}/`;
+  el.innerHTML = '<video id="theme-pet-v" src="' + esc(base + pet.video)
+    + '" autoplay muted loop playsinline></video>';
+  el.classList.add('on');
+  el.classList.toggle('float', pet.float !== false);
+  stopPetLoop();
+  const acts = Object.values(pet.actions || {}).filter(Boolean);
+  if (!acts.length || !(pet.every > 0)) return;
+  _petTimer = setInterval(() => {
+    const v = document.getElementById('theme-pet-v');
+    if (!v || document.hidden) return;
+    const pick = acts[Math.floor(Math.random() * acts.length)];
+    v.onended = () => {
+      v.onended = null;
+      v.loop = true;
+      v.src = base + pet.video;
+      v.play().catch(() => { });
+    };
+    v.loop = false;
+    v.src = base + pick;
+    v.play().catch(() => { });
+  }, Math.max(8000, Number(pet.every) * 1000));
+}
+
+function applyTheme(id) {
+  id = String(id || 'dark').toLowerCase();
+  if (!themeInfoOf(id)) id = 'dark';       // 包被删了：退回深色，别让页面裸着
+  document.documentElement.dataset.theme = id;
+  let link = document.getElementById('theme-pack');
+  if (THEME_FIXED[id]) {
+    if (link) link.remove();
+  } else {
+    if (!link) {
+      link = document.createElement('link');
+      link.id = 'theme-pack';
+      link.rel = 'stylesheet';
+      const base = document.getElementById('theme-base');
+      if (base) base.after(link); else document.head.appendChild(link);
+    }
+    const info = themeInstalled[id] || {};
+    link.href = info.css || `/themes/${encodeURIComponent(id)}/theme.css`;
+  }
+  syncThemePet(id);
+}
+
+async function switchTheme(id) {
+  id = String(id || '').toLowerCase();
+  const prev = (S.settings && S.settings.theme) || 'dark';
+  if (id === prev) return;
+  // 没下过 / 包被删了：明确说一句，别 applyTheme 悄悄退回深色
+  // （那样用户看到的是「点了白色，界面没变」）
+  if (!themeInfoOf(id)) { toast('这个主题还没下载，先点卡片上的「下载」', 'warn'); return; }
+  applyTheme(id);                          // 先切，界面立刻有反馈
+  try {
+    const d = await saveSettings({ theme: id });
+    S.settings = (d && d.settings) || S.settings;
+  } catch (e) {
+    applyTheme(prev);
+    toast('主题没存上：' + e.message, 'err');
+  }
+}
+
+/* 主题清单落地：S.themes 是全量视图，themeInstalled 只记第三方（内置走
+   THEME_FIXED，永远算「已安装」）。 */
+function markThemes(d) {
+  S.themes = d;
+  (d.themes || []).forEach(t => {
+    if (!t.builtin) themeInstalled[t.id] = { css: t.css, pet: t.pet || {} };
+  });
+  return d;
+}
+
+/* 卡片重绘：设置面板开着才有 #theme-grid，没开就跳过（下次生成 HTML 会带上） */
+function paintThemeGrid() {
+  const box = document.getElementById('theme-grid');
+  if (box) box.innerHTML = themeCards();
+}
+
+let _themesLoading = null;
+async function loadThemes(force) {
+  if (S.themes && !force) return S.themes;
+  if (_themesLoading) return _themesLoading;
+  _themesLoading = (async () => {
+    try {
+      // 先只读本机（不联网，毫秒级）：已装的主题立刻出现在卡片里。
+      // 远端清单慢的时候（超时 6~8 秒）不能连「卫戍协议」都画不出来——
+      // 那样用户会以为主题丢了，两张卡片的状态看着就像「混在一起」。
+      if (!S.themes) {
+        try { markThemes(await api('/api/themes?local=1')); paintThemeGrid(); }
+        catch (e) { /* 本地读不到不影响后面拉全量 */ }
+      }
+      markThemes(await api('/api/themes' + (force ? '?force=1' : '')));
+      paintThemeGrid();
+      return S.themes;
+    } finally { _themesLoading = null; }
+  })();
+  return _themesLoading;
+}
+
+/* 设置 → 常规里的主题卡片（内置两张 + 已装 + 远端可下载） */
+function themeCards() {
+  let cur = String((S.settings && S.settings.theme) || 'dark').toLowerCase();
+  // 设置里存的主题指向一个被删掉的包：界面已经退回深色，卡片也得跟着标
+  // 「使用中」在深色上，否则一张卡都不亮，看着像主题状态丢了。
+  // 只在清单已经拉过时判断——没拉之前 themeInstalled 是空的，会把正常的
+  // 第三方主题误判成「没有」。
+  if (S.themes && !themeInfoOf(cur)) cur = 'dark';
+  const d = S.themes || {};
+  const rows = [THEME_FIXED.dark, THEME_FIXED.light];
+  const seen = new Set(['dark', 'light']);
+  (d.themes || []).forEach(t => {
+    if (!t.builtin && !seen.has(t.id)) { rows.push(t); seen.add(t.id); }
+  });
+  (d.remote || []).forEach(t => {
+    if (!seen.has(t.id)) { rows.push(t); seen.add(t.id); }
+  });
+  return rows.map(t => {
+    const active = t.id === cur ? ' active' : '';
+    const mb = t.bytes ? (t.bytes / 1048576).toFixed(1) + ' MB' : '';
+    // 色块垫底、缩略图盖在上面：远端预览图拉不到（离线 / 图床被墙）时
+    // 只是露出主题自己的渐变，不会出现白框或裂图标。
+    const look = `<span class="theme-swatch ${esc(t.id)}"></span>`
+      + (t.preview ? `<img src="${esc(t.preview)}" alt="" loading="lazy">` : '');
+    let act;
+    if (!t.installed) {
+      act = `<button class="btn-solid mini" data-theme-dl="${esc(t.id)}">下载${mb ? '（' + mb + '）' : ''}</button>`;
+    } else if (t.id === cur) {
+      act = `<button class="btn-plain mini" disabled>使用中</button>`;
+    } else {
+      act = `<button class="btn-solid mini" data-theme-use="${esc(t.id)}">使用</button>`;
+    }
+    if (t.installed && !t.builtin) {
+      act += `<button class="btn-plain mini" data-theme-del="${esc(t.id)}">删除</button>`;
+    }
+    const sub = [t.desc || '', t.version ? 'v' + t.version : '',
+      t.license ? '' : ''].filter(Boolean).join(' · ');
+    const name = t.name || t.id;
+    return `<div class="theme-card${active}" data-theme="${esc(t.id)}">
+      <div class="theme-look">${look}</div>
+      <div class="theme-info"><b title="${esc(name)}">${esc(name)}</b>
+        <span title="${esc(sub)}">${esc(sub || (t.builtin ? '随程序自带' : '第三方主题包'))}</span></div>
+      <div class="theme-act">${act}</div>
+    </div>`;
+  }).join('') + ((S.themes && S.themes.remoteError)
+    ? `<div class="theme-warn">主题商店暂时连不上（${esc(String(S.themes.remoteError).slice(0, 60))}），
+       已下载的主题照常能用。</div>` : '');
+}
+
 /* ------------------------------------------------------------ 设置
    2026-11-18：一列到底改成「左侧 tab + 右侧内容」。
    原来账号 / MAA / 版本 / 助手 / 目录 / 黑名单全堆在一个 520px 的弹窗里，
@@ -2618,6 +2854,9 @@ async function pickFile(inputEl) {
    一个大「保存」——改了 MAA 又切到版本页，很容易把前一次保存漏掉。 */
 
 const SET_ICONS = {
+  general: '<circle cx="8" cy="8" r="2.35"/>'
+    + '<path d="M8 1.9v1.7M8 12.4v1.7M1.9 8h1.7M12.4 8h1.7"/>'
+    + '<path d="M3.7 3.7 4.9 4.9M11.1 11.1l1.2 1.2M12.3 3.7 11.1 4.9M4.9 11.1 3.7 12.3"/>',
   accounts: '<path d="M8 8.1a2.55 2.55 0 1 0 0-5.1 2.55 2.55 0 0 0 0 5.1Z"/>'
     + '<path d="M3.2 13.4c0-2.05 2.15-3.35 4.8-3.35s4.8 1.3 4.8 3.35"/>',
   maa: '<rect x="2.4" y="4.4" width="11.2" height="8.6" rx="1.4"/>'
@@ -2643,6 +2882,7 @@ function fmtSync(t) {
 }
 
 const SET_TABS = [
+  ['general', '常规设置'],
   ['accounts', '账号管理'],
   ['maa', 'MAA 路径'],
   ['schedule', '定时任务'],
@@ -2794,7 +3034,38 @@ function openSettings() {
       <section class="set-body">
         <div class="set-panes">
 
-          <div class="set-pane active" data-pane="accounts">
+          <div class="set-pane active" data-pane="general">
+            <div class="set-head">
+              <h3>常规设置</h3>
+              <p>界面主题和开机启动。主题只影响外观：<b>深色 / 白色</b>随程序自带；
+                <b>卫戍协议</b>这类第三方主题要在这里点一次「下载」，从我们的资源分支
+                拉到本机（<code>config/themes</code>），不塞进程序包里——这样 exe 不会
+                越做越大，不想要的主题也能随时删掉。</p>
+            </div>
+
+            <div class="set-sub-title">界面主题</div>
+            <div class="theme-grid" id="theme-grid">${themeCards()}</div>
+            <div class="set-tip" id="theme-tip">第三方主题第一次用要先下载（含配色、字体和桌宠动画），
+              下载完点「使用」立即切换；不适配的主题随时可以删掉。</div>
+            <label class="check-row" style="margin-top:4px">
+              <input type="checkbox" id="set-theme-pet" ${petEnabled() ? 'checked' : ''}>
+              <span>显示主题桌宠（右下角小人；只有带桌宠的主题才有，挡视线就关掉）</span>
+            </label>
+
+            <div class="set-sub-title">启动</div>
+            <div class="set-card">
+              <label class="check-row">
+                <input type="checkbox" id="set-launch-login">
+                <span>开机时自动启动 MAA-PRTS</span>
+              </label>
+              <div class="onb-hint" id="set-launch-state">正在读状态…</div>
+              <div class="set-tip">默认<b>关闭</b>。只有你在这里勾上，才会往当前用户的
+                启动项里写一条（任务管理器 → 启动 里能看见「MAA-PRTS」，随时可关）；
+                取消勾选就立刻删掉。</div>
+            </div>
+          </div>
+
+          <div class="set-pane" data-pane="accounts">
             <div class="set-head">
               <h3>账号管理</h3>
               <p><b>token</b> 是森空岛的账号凭证，签到、抽卡统计、后台同步都靠它——加密存在本机账号文件里
@@ -3321,7 +3592,7 @@ function openSettings() {
           saver.disabled = true;
           try {
             const d = await saveSettings({ [key]: dir });
-            S.settings = d.settings || S.settings;
+            S.settings = (d && d.settings) || S.settings;
             if (key === 'maaDir') { renderMaaState(); fillBasketProfiles(); }
             if (dir) {
               box.className = 'onb-hint ok';
@@ -3340,6 +3611,118 @@ function openSettings() {
         try { await saveSettings({ autoStartMaa: ev.target.checked }); }
         catch (e2) { ev.target.checked = !ev.target.checked; toast('保存失败：' + e2.message, 'err'); }
       });
+
+      /* ---------------- 常规：主题 + 开机自启 ---------------- */
+      const repaintThemes = () => {
+        const box = $('#theme-grid', el);
+        if (box) box.innerHTML = themeCards();
+      };
+      // 打开设置时还没拉过主题清单（或者之前网络失败了）：补一次
+      if (!S.themes) {
+        loadThemes().then(() => { repaintThemes(); }).catch(() => { });
+      }
+
+      el.addEventListener('click', async ev => {
+        const use = ev.target.closest('[data-theme-use]');        if (use) {
+          await switchTheme(use.dataset.themeUse);
+          repaintThemes();
+          return;
+        }
+        const dl = ev.target.closest('[data-theme-dl]');
+        if (dl) {
+          const id = dl.dataset.themeDl;
+          const name = (themeInfoOf(id) || {}).name || id;
+          dl.disabled = true;
+          const old = dl.textContent;
+          dl.textContent = '下载中…';
+          try {
+            const d = await api('/api/theme/install', { id });
+            await loadThemes(true);
+            themeInstalled[id] = { css: d.css, pet: d.pet || {} };
+            applyTheme(id);
+            await switchTheme(id);
+            repaintThemes();
+            const bad = (d.extraFailed || []).length;
+            toast(bad
+              ? '「' + (d.name || name) + '」已装好，但有 ' + bad + ' 个动画素材没下到（配色照常生效）'
+              : '「' + (d.name || name) + '」已装好，已切过去', bad ? 'warn' : 'ok', 4200);
+          } catch (e2) {
+            dl.disabled = false;
+            dl.textContent = old;
+            toast('下载失败：' + e2.message, 'err', 5200);
+          }
+          return;
+        }
+        const del = ev.target.closest('[data-theme-del]');
+        if (del) {
+          const id = del.dataset.themeDel;
+          const name = (themeInfoOf(id) || {}).name || id;
+          const ok = await askConfirm('删除主题包',
+            '删掉「' + name + '」的本地主题包？只删主题文件，不动 MAA、账号和挂机记录，'
+            + '以后想用可以重新下载。', '删除');
+          if (!ok) return;
+          try {
+            await api('/api/theme/remove', { id });
+            delete themeInstalled[id];
+            if (String((S.settings || {}).theme || '') === id) S.settings.theme = 'dark';
+            applyTheme('dark');
+            await loadThemes(true);
+            repaintThemes();
+            toast('已删除「' + name + '」', 'ok');
+          } catch (e2) { toast('删除失败：' + e2.message, 'err'); }
+        }
+      });
+
+      // 桌宠开关：只影响这一台机器的外观偏好
+      const petCb = $('#set-theme-pet', el);
+      if (petCb) {
+        petCb.addEventListener('change', ev => {
+          try { localStorage.setItem('maaprts.pet', ev.target.checked ? '1' : '0'); }
+          catch (e2) { }
+          syncThemePet(String((S.settings || {}).theme || 'dark'));
+        });
+      }
+
+      // 开机自启：只读状态、只在用户勾选时写注册表
+      const paintLaunch = async () => {
+        const cb = $('#set-launch-login', el);
+        const box = $('#set-launch-state', el);
+        if (!cb || !box) return;
+        try {
+          const st = await api('/api/autostart');
+          cb.checked = !!st.enabled;
+          cb.disabled = !st.supported;
+          box.className = 'onb-hint';
+          if (!st.supported) {
+            box.textContent = '当前是源码运行，没有开机自启；打包成 exe 后这一项才能用。';
+          } else if (st.enabled) {
+            box.textContent = '已开启（' + (st.target || '') + '）';
+          } else {
+            box.textContent = '当前关闭——勾上才会写入启动项';
+          }
+        } catch (e2) {
+          box.textContent = '读不到自启状态：' + e2.message;
+        }
+      };
+      const launchCb = $('#set-launch-login', el);
+      if (launchCb) {
+        launchCb.addEventListener('change', async ev => {
+          const want = ev.target.checked;
+          ev.target.disabled = true;
+          try {
+            const st = await api('/api/autostart', { enabled: want });
+            if (!!st.enabled !== want) throw new Error('系统没接受这次修改（看下面的状态）');
+            toast(want ? '已加入开机启动' : '已取消开机启动');
+          } catch (e2) {
+            ev.target.checked = !want;
+            toast('设置失败：' + e2.message, 'err');
+          } finally {
+            ev.target.disabled = false;
+            paintLaunch();
+          }
+        });
+        paintLaunch();
+      }
 
       /* ---------------- 每个账号的 MAA 绑定：配置文件 → 切号名 ----------------
          用户 2026-11-22 的要求：MAA 路径第一行，配置文件 + 切号名第二行。
@@ -5519,7 +5902,11 @@ const CHAT = {
    放第一条，新用户先看能力清单再动手。
 
    OS 现在值得打的就这几件（用户 2026-11-23 口径）：普通 OS1-10、EX1-8、
-   EX-8 补一次单关突袭、S1-5 普通。**S 关突袭没有奖励，别往引导里放**。 */
+   EX-8 补一次单关突袭、S1-5 普通。**S 关突袭没有奖励，别往引导里放**。
+
+   2026-11-25 用户加了一条「TL 商店清空」：TL（时间啊，向前！）关卡已关、
+   商店开到 11/29，属于**限时**入口，TL 商店下线后把这条删掉（别留在那儿
+   点出「活动不在了」）。黑名单按用户原话给三样，注意「黑名单」是**不要买的**。 */
 const CHAT_STARTERS = [
   ['你可以帮我干什么？',
    '你可以帮我干什么？'],
@@ -5535,6 +5922,8 @@ const CHAT_STARTERS = [
    '帮我挂雪山降临 OS-S-1 到 OS-S-5，普通难度'],
   ['活动商店清一遍（别买龙门币、固源岩）',
    '清一下雪山降临的商店，黑名单里加龙门币、固源岩、技巧概要、赤金'],
+  ['TL 商店清空（别买数据增补条/数据增补/家具零件）',
+   '帮我将快关闭的 TL 活动商店清空，黑名单：数据增补条、数据增补、家具零件'],
   ['所有账号森空岛签到',
    '帮我把所有账号的森空岛签到都签了'],
   ['现在跑到哪了？卡住了吗？',

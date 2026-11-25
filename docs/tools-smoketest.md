@@ -543,6 +543,24 @@ MaaCore 的 `ClickStageName` 只在关卡列表里 OCR，认不出。这条路�
   一份都不写**（绝不拿普通顶上）；两行都有作业时只写突袭那条，
   `difficulties` 回 `{关卡: '突袭'}`
 
+### B67 主线导航：章号 → 网格格子 → 点卡 → 「前往章节」（2026-11-24）
+
+用户标注的主线四步（终端 / 曲谱 / 乐章收录 / 默认进度）和活动卡导航共用，
+之后按章号在第 5 列网格里找 EPxx 卡、点开章节详情、再点右下「前往章节」。
+用例全用合成帧 + 假 Touch，不碰真机：
+
+- **代号解析**：`15-3`→15、`0-11`→0、`17-4`→17、突袭 `H15-1`→15；
+  `GT-1` / `MN-1-7` / `TR-1` / `EP-1` / `18-1` / 光秃秃的 `17` 都必须返回 `None`
+- **模板齐全**：18 张 `navtpl/mainstory/EP00~17.png` 都在，且都是 265×265
+- **格子定位**：合成帧里贴第 0/5/17 章，`_rows_of` 要认出 261 和 576 两行；
+  `_best_in` 用第 17 章模板命中 (862,708) 附近（±2）；换第 1 章模板打同一帧
+  必须 > 12 分（EP00/EP01 都是「黑暗时代」，实测 22.6，阈值放过去就会点错章）
+- **分派**：`goto_stage_list('17-3')` 必须走 `mainnav.run`；`GT-1` 必须仍走
+  老故事集那条路，不能被主线接管
+- **主页图标标定**：按 `pages._HOME_ICONS` 贴图 → 认主页；把邮件挪回 2026-11-22
+  那份错的坐标 (188,32) → 认不出。这条防的是「坐标跟真实 UI 脱节，所有回主页
+  的导航退化成一味按 ESC，最后把游戏按关」
+
 ## 什么时候跑
 
 - 改了 `vault.py` / `accounts.py` / `settings.py` / `main.py` 之后
@@ -552,3 +570,163 @@ MaaCore 的 `ClickStageName` 只在关卡列表里 OCR，认不出。这条路�
 依赖只用到程序自身的运行环境（B/C 不会联网调森空岛接口），用 `.venv` 的
 Python 跑即可；C 组会真实调用 Windows DPAPI，换电脑/换用户跑 B 组是
 「加密绑定本机」的活体验证。
+### B68 主线作战环境（剧情 / 标准 / 磨难）
+
+合成帧（把真机模板贴回原位）验识别，再用一个假界面验状态机：
+
+- 写法（剧情 / 标准 / 磨难 / story / hard）→ 内部 key；乱写的返回空；
+- 只有第 9 章（两档）和 10~14 章（三档）能切，0~8 / 15~17 一档都没有；
+- 三张难度模板尺寸 = 几何盒子尺寸（换模板必须同步改几何）；
+- 贴哪一档认哪一档（0 分），别的档不许认成它；空白页 / 展开态认不出；
+- 切档：收起点按钮 → 点 tab；已展开就直接点 tab（点按钮会选中第一个 tab）；
+  第 9 章切剧情要在弹窗里再点一次左边按钮；
+- 认不出那行字时明确报错、一下都不点；
+- 接线：`difficulty` skill 在册、`skill_fight` 带 `difficulty` 参数、
+  `DIFF_OF_MODE` 三档映射、提示词里有「9~14 章」和「作战环境」。
+
+### B69 同账号串行 + 导航带难度（2026-11-25）
+
+用户当天报的两个现场：说「导航到 13 章 + 切磨难」，助手拆成两个调用并发发出去，
+切难度那一路在 MAA 还在登录时报「游戏没在跑」，导航一次没做；第二次只调了导航，
+档没切。钉住：
+
+- `_wait_idle`：同账号有**更早开工**的任务在跑就等（日志「等它跑完」），等到了
+  接着跑；别的账号不等（多开该并行）；只有比自己晚开工的不等（互相等会死锁）；
+  没有 owner 的全局任务直接放行；**同一毫秒建的两个任务**（把 `startedAt` 强行
+  设成一样）靠创建序号仍要分出先后——这条防的是 2026-11-25 CI 上的
+  `AssertionError: []`（Windows 时钟粒度 15.6ms，本机偶尔能过、CI 必挂）；
+  等日志别写死 `sleep(0.3)`，轮询到出现为止（最多 8 秒）；
+- `_ensure_game`：游戏没在跑要**自己叫唤醒**（日志「开始唤醒（MAA 自动唤醒，
+  不干等）」），唤醒后进程起来了就放行，不干等满 90 秒；唤醒抛异常但进程起来
+  了照样放行（只是记一行「自动唤醒没成功」）；一直不起来才返回 False；所有
+  轮询都走 `game_alive(quiet=...)`（安静模式）；
+- `skill_navigate` 带 `difficulty`：第 13 章 + 磨难 = 导航完自己切（只调一次
+  `set_mode`）；不带就不切；第 5 章（没有这条栏）忽略而不是报错；写法认不出
+  报错；非主线关报错；切档失败要 `RuntimeError` 而不是静默成功；游戏进程不在
+  时导航入口真的把唤醒调到了（唤醒后继续导航）；
+- `set_mode` 两轮都切不过去时返回说明（以前这里引用未定义的 `last` → NameError）；
+- 接线：`skill_navigate` 工具带 `difficulty` 枚举、提示词里有
+  `skill_navigate(stage="13-1", difficulty="hard")` 和「同一个账号的 skill 是**串行**」。
+
+真机复验（5554，2026-11-25）：`goto_stage_list('13-1')` 54 秒到位，
+`set_mode('hard')` 9 秒切成（左下角变红字「磨难险地环境」），验完切回标准。
+
+### B70 游戏没跑就自己唤醒（2026-11-25）
+
+用户截图报：adb 已就绪（`adb: adb 正常（emulator-5554）`）之后，日志只剩一排
+「adb 返回 1：」和「游戏还没起来，等一会儿（最多 90 秒）…」，MAA 的自动唤醒
+一直没动。钉住：
+
+- `stagenav.Touch.game_alive(quiet=True)`：查不到进程（`pidof` 返回码 1）是正常
+  情况，**一行日志都不写**；不传 `quiet` 时仍然留证据（`adb 调用失败…`）；
+- `skill_navigate` / `skill_difficulty` 的源码里必须出现 `_ensure_game`、不能
+  再出现 `_wait_game`（防止以后又被改回「干等」）。
+
+真机复验（5554，2026-11-25）：游戏没跑时 `_ensure_game` 立刻开始唤醒，56 秒后
+客户端回到主界面、返回 True；安静模式下查询日志零条。
+
+
+### B71 结束活动的商店导航（2026-11-25）
+
+用户报「TL 商店导航失效」。活动结束后终端卡片被盖上「作战已结束」灰条、
+地图商店节点多了剩余时间横幅，模板全过期：entry 定点比 46.8 分（阈值 16）→
+判定终端页没这个活动，`_to_map` 直接失败；节点 14.1 分（阈值 12）→ 只走兜底
+坐标盲点。重抠模板之外，钉住「模板和 roi 不能脱钩」：
+
+- `TL` 的 `closed` 为真且 `zones` 为空（关卡导航确实关着）；
+- 模板尺寸 ≈ `roi` × 1.5（差超过 3 像素就当标定漂了）；
+- 按 `roi` 位置贴到合成图上，`_entry_here` 必须认到（≤8 分）且中心对得上；
+  **挪 20 像素必须认不到**（定点比对不接受整屏搜索兜底）；
+- 商店节点贴在自己的 `roi` 里 `_find` 认得到（≤8 分、中心落在 roi 内），
+  贴到别处（差 400 像素）必须认不到。
+
+真机复验（5554，2026-11-25）：`run_tool('shop', prefix='TL')` 12 秒进
+「炮火所掩埋的」商店（关闭时间 2026/11/29 03:59），日志「点活动提示条
+（3.0 分，(1145,540)）」→「图像识别到「炮火所掩埋的」（2.7 分）」。
+
+### B72 多账号每个号先唤醒切号（2026-11-25）
+
+用户第三次报「助手又没有加切号自动唤醒」，所以这条从提示词升级成程序兜底，
+用例把判定逻辑和接线一起钉住：
+
+- `_wakes_itself`：`wakeup` / `sweep` / `weekly` / `train` / `claim`（带
+  `wakeup=true`）/ `fight`（带 `wakeup` 且没有 `noSwitch` / `assumeStageList`）
+  算自己会唤醒；`sweep` 显式 `wakeup=false`、`fight` 不带 wakeup、
+  `tool` / `navigate` / 空步骤都算不会唤醒；
+- `_with_auto_wake`：多账号 + 不唤醒的步骤要在最前面补一步 `wakeup`；连跑两次
+  不能叠两个；单账号 / `switch=False` / 第一步是 `sweep` 都不补；**补的时候不许
+  改动传进来的原列表**（纯函数，调用方还要拿原表算 `nav_added`）；
+- 接线：`run_steps` 工具暴露 `switchAccount`、`_tool_run_steps` 源码里必须有
+  `switch=sw`（防「参数加了但没传下去」）、`SYSTEM` 里有「一次任务涉及两个及
+  以上账号」这句硬规矩；
+- 引导卡片：第一条仍是「你可以帮我干什么？」，并且有「TL 活动商店清空」那条，
+  黑名单正好三样（数据增补条 / 数据增补 / 家具零件），**不能混进龙门币**。
+
+### B73 主题包与开机自启（2026-11-25）
+
+用户这轮的两条需求：「主题要黑色/白色/第三方，第三方放 pack-data 点下载才能用」，
+「开机自启默认不勾选，我极度厌恶没同意就自启的软件」。用例把「默认关」和
+「按需下载」钉死：
+
+- **自启默认值**：`DEFAULTS['launchAtLogin'] is False`（真 `False`，不是 `'false'`）；
+  `'false'` / `'0'` / `'no'` / `0` / `None` / `''` 存进去读回来都必须是 `False`，
+  `'true'` / `True` 才是 `True`。
+- **源码模式不碰注册表**：`supported()` 为假、`exe_path()` 为空；`sync(True)`
+  返回 `skipped` 且 `why` 里有「源码」；`sync(False)` 同样 skipped；`enable()`
+  必须抛 `RuntimeError`。**关键一条**：这些调用前后 `_read()` 的返回值必须
+  一模一样——开发时跑一次就把用户打包版那条自启删掉，是这里最容易犯的错。
+- **主题 id 归一**：`' CLOSURE '` → `closure`，`''`/`None`/`'DARK'` → `dark`。
+- **安装链路（假网络，不真连 GitHub）**：内存里造一个 zip + manifest，`_get`
+  对 zip 返回字节、对 `extra` 里的 webm 一律抛错 → `install()` 必须成功、
+  `extraFailed` 非空、`extra` 为空（降级成纯配色，不报错也不回滚）；
+  `_read_meta` 读回来的 `pet.every` 要对得上。
+- **sha256 不对**：同一份 manifest 改掉 sha 再装必须抛错，而且**原来那份还能用**
+  （`usable()` 仍为真）——下歪了覆盖掉已经能用的主题是最差结果。
+- **内置主题不许装/删**：`dark` / `light` / `a/b` / `../x` / `''` 全部 `ValueError`。
+- **防穿越**：`file_of('demo', '../../settings.json')`、`'..\\..\\settings.json'`、
+  `'/settings.json'`、`''` 全返回 `None`；zip 里塞 `../evil.txt`，
+  `_safe_extract` 必须在解压前抛 `RuntimeError`。
+- **远端读不到不裸奔**：`fetch_manifest` 抛错时 `catalog()` 仍返回内置两套，
+  `remoteError` 带原因，`remote` 空列表（**这个键必须永远存在**，前端和用例都
+  直接取）。
+- **接线**：`/api/themes`、`/api/theme/install`、`/api/theme/remove`、
+  `/api/autostart` 四个路由都在 `ROUTES` 里；`main.py` 有 `/themes/` 前缀分支
+  且走 `themes.file_of`；启动时有 `_auto.sync`；`app.js` 里有色块垫底
+  （`theme-swatch`）、三个按钮的 data 属性、`syncThemePet`、`set-launch-login`，
+  `SET_TABS` 第一项是常规设置；**`THEME_FIXED` 两条都必须带 `installed: true`**
+  （少了卡片会渲染成「下载」，点下去后端回「内置主题不能安装」）；
+  `style.css` 里不许再出现 `rgba(255, 255, 255`，`#0e121a` 只许在 `--panel-3`
+  出现一次（写死就换不了浅色主题）。
+
+真机复验（2026-11-25）：`themes.install('closure')` 走真实镜像，70.4 秒装好
+（0.8 MB 包 + 四个 webm 共 10.5 MB），`extraFailed: []`；`/themes/closure/`
+下 `theme.css`（12 KB）、`preview.jpg`（23 KB）、`pet/idle.webm`（1.39 MB）都是 200；
+`/themes/closure/../../etc/passwd` 是 404。
+
+### B74 主题切换不报错（2026-11-25 用户反馈「点白色主题报错」）
+
+现场是两条独立故障叠在一起，看着像「白色和卫戍协议混了」：
+
+1. **`saveSettings()` 不返回响应**。调用方写的是
+   `const d = await saveSettings(...); S.settings = d.settings`，d 是
+   `undefined` → 每次抛 `Cannot read properties of undefined (reading
+   'settings')`。主题其实已经切换成功并写进 settings.json，但 catch 里
+   `applyTheme(prev)` 又回滚，用户看到的是「点了白色，闪一下还是原色，弹一句报错」。
+2. **卡片依赖全量清单**（要联网拉远端 manifest，超时 6~8 秒）。远端慢的时候
+   设置页只有深色/白色两张卡，已装的「卫戍协议」不出现，状态看着就错乱。
+
+用例钉住：
+
+- `saveSettings` 的函数体里必须有 `return d;`（否则 `d.settings` 必炸）；
+  两个调用点必须是 `(d && d.settings) || S.settings`。
+- `themes.catalog(local_only=True)` **不联网**：把 `fetch_manifest` 换成抛错，
+  仍然返回内置两套 + 已装主题，且 `partial == True`、`remote == []`、
+  `remoteError == ''`。
+- 全量 `catalog()` 断网时 `remoteError` 带原因，但本地主题一个都不能少。
+- `api_themes({'local': '1'})` 走本地快照；不带参数才联网。
+- 前端有 `paintThemeGrid()`、先请求 `/api/themes?local=1`、卡片在
+  「设置里的主题不可用」时高亮深色（`if (S.themes && !themeInfoOf(cur)) cur`），
+  切到未下载主题时明确提示「先点卡片上的『下载』」。
+
+真机复验：深色 → 白色 → 卫戍协议 → 白色 连续切换，无报错；刷新后仍是最后一次
+选的主题；切回白色时 `<link id="theme-pack">` 和桌宠 `<video>` 都正确移除。

@@ -886,7 +886,7 @@ def _seg_label(seg):
     return '%s %d 关（%s）' % (head, len(seg.get('rows') or []), span)
 
 
-def _navigate(conn, stage, log, client=None, strict=False):
+def _navigate(conn, stage, log, client=None, strict=False, mode=None):
     """把界面带到关卡列表，返回 ``(ok, 说明)``
 
     导航要连点好几下，而 MaaCore 的 ``AsstAsyncClick`` 一次连接只能点中第一下
@@ -910,6 +910,18 @@ def _navigate(conn, stage, log, client=None, strict=False):
             return False, detail
         ok, why = stagenav.goto_stage_list(touch, stage, log)
         log('导航%s：%s' % ('完成' if ok else '失败', why))
+        # 主线 9~14 章还有一层「作战环境」（剧情 / 标准 / 磨难）：导航只把界面
+        # 带到那一章的关卡列表，档位得在这儿切。**必须在导航之后**——那条栏只
+        # 在关卡列表上有；也必须在 Copilot 之前，不然打的不是用户点的那一档。
+        if ok and mode:
+            from . import mainnav
+            ep = mainnav.episode_of(stage)
+            if ep is not None and mainnav.modes_of(ep):
+                okm, whym = mainnav.set_mode(touch, mode, log)
+                log('作战环境%s：%s' % ('切换完成' if okm else '没切过去', whym))
+                if not okm:
+                    return False, ('到第 %02d 章了，但作战环境没切过去：%s'
+                                   % (ep, whym))
         if not ok:
             d = str(conn.get('maa_dir') or '')
             path = os.path.join(d or '.', 'debug',
@@ -1109,14 +1121,18 @@ def run_core(spec, tid=None, timeout=None):
                 log('MAA 已停下，开始我们的导航')
                 nav_ok, nav_why = _navigate(
                     conn, first, log, client=spec.get('clientType'),
-                    strict=bool(spec.get('profile') or spec.get('adbAddress')))
+                    strict=bool(spec.get('profile') or spec.get('adbAddress')),
+                    mode=spec.get('storyMode'))
                 if not nav_ok:
                     # 老故事集/自建模板的关卡，MAA 自己 100% 找不到（它的入口
-                    # 模板在当前 UI 上全失效，只会横向滑主线）。这种情况宁可
-                    # 明确报错，也别把作业排下去让它乱滑 30 秒再失败。
-                    from . import stagenav, eventnav
+                    # 模板在当前 UI 上全失效，只会横向滑主线）。主线章节也一样：
+                    # MAA 从主页出发滑不到第 15 章（章节切换是底部 EPISODE 分页
+                    # 点击，不是横向滑动）。这种情况宁可明确报错，也别把作业排
+                    # 下去让它乱滑 30 秒再失败。
+                    from . import stagenav, eventnav, mainnav
                     if (stagenav.tpl_path_of(first) or stagenav.event_of(first)[0]
-                            or eventnav.has(first)):
+                            or eventnav.has(first)
+                            or mainnav.episode_of(first) is not None):
                         raise RuntimeError('导航没到位（%s），不再把作业交给 MAA'
                                            % nav_why)
                     log('导航没成功，交给 MAA 自己试（当期活动它认得）')
@@ -1139,11 +1155,13 @@ def run_core(spec, tid=None, timeout=None):
             if first:
                 nav_ok, nav_why = _navigate(
                     conn, first, log, client=spec.get('clientType'),
-                    strict=bool(spec.get('profile') or spec.get('adbAddress')))
+                    strict=bool(spec.get('profile') or spec.get('adbAddress')),
+                    mode=spec.get('storyMode'))
                 if not nav_ok:
-                    from . import stagenav, eventnav
+                    from . import stagenav, eventnav, mainnav
                     if (stagenav.tpl_path_of(first) or stagenav.event_of(first)[0]
-                            or eventnav.has(first)):
+                            or eventnav.has(first)
+                            or mainnav.episode_of(first) is not None):
                         raise RuntimeError('导航没到位（%s），不再把作业交给 MAA'
                                            % nav_why)
             finished = _wait_run(eng, max(1.0, budget - time.time()), log, state)
@@ -1159,7 +1177,8 @@ def run_core(spec, tid=None, timeout=None):
             # 过车就交给 _retry_failed——里面没得换会同一份再试一次。
             swapped, chains_mark = _retry_failed(eng, spec, state, log, d, budget,
                                                  conn=conn)
-        if not finished and not state.get('pause'):
+        if not finished and not state.get('pause') \
+                and not getattr(eng, 'stopped_by_user', False):
             # 报**实际等了多久**，别拿时间预算当耗时：以前这里打 ``total // 60``，
             # 明明只跑了两分钟也会写「等了 60 分钟」/「等了 6 分钟」，用户看日志
             # 只会以为程序算错了时间（2026-11-23）。
@@ -2155,7 +2174,8 @@ def _run_tail(eng, tail, spec, state, log, conn, d, deadline, can_reuse_nav=Fals
                 finished = False
                 break
             nav_ok, nav_why = _navigate(conn, seg['from'], log,
-                                       client=spec.get('clientType'))
+                                       client=spec.get('clientType'),
+                                       mode=spec.get('storyMode'))
             log('切到新分区%s：%s' % ('完成' if nav_ok else '失败', nav_why))
             if not nav_ok:
                 # 前面几关已经打完了，这里 raise 会把整轮记成失败。照样排下去
@@ -2164,7 +2184,8 @@ def _run_tail(eng, tail, spec, state, log, conn, d, deadline, can_reuse_nav=Fals
                     % seg['from'])
         elif not can_reuse_nav:
             nav_ok, nav_why = _navigate(conn, seg['from'], log,
-                                       client=spec.get('clientType'))
+                                       client=spec.get('clientType'),
+                                       mode=spec.get('storyMode'))
             log('导航%s：%s' % ('完成' if nav_ok else '失败', nav_why))
 
         log('第 %d/%d 段：%s' % (i + 1, len(segs), _seg_label(seg)))
@@ -2352,7 +2373,8 @@ def _leave_result(conn, spec, stage, log):
         # 兜底：先回主页（认得基建确认框/剧情页，不会盲按返回），再走一遍
         # 完整导航。多花十几秒，换「一定在关卡菜单上」。
         pages.to_home(touch, log)
-        ok, why = _navigate(conn, stage, log, client=spec.get('clientType'))
+        ok, why = _navigate(conn, stage, log, client=spec.get('clientType'),
+                            mode=spec.get('storyMode'))
         log('重挂前重新导航%s：%s' % ('完成' if ok else '失败', why))
         return ok
     except Exception as e:              # noqa: BLE001 点结算页不能拖垮挂机
@@ -2386,6 +2408,11 @@ def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
     收尾判失败要从它往后看，否则第一轮的失败会把重试成功的结果盖掉。真的没
     进入重试时返回 ``([], None)``——0 是合法的分界，不能拿它当「没重试」。
     """
+    if getattr(eng, 'stopped', False):
+        # 用户点了「停止挂机」：别再换作业重挂，否则就是「按了停止还在动」
+        # （2026-11-24 用户报「账号我按了暂停，但流程和 maacore 不会停」）。
+        log('已停止（你按了停止），不再换作业重挂')
+        return [], None
     retry = spec.get('retry') or {}
     pool = retry.get('pool') or {}
     # 没有 retry（每关都只有一份作业、或上层没给候选池）也要走一轮：用户报的
@@ -2516,7 +2543,8 @@ def _retry_failed(eng, spec, state, log, d, deadline, conn=None):
                     log('重挂时没能离开结算页，剩下的段不跑了')
                     break
                 nav_ok, nav_why = _navigate(conn, seg['from'], log,
-                                           client=spec.get('clientType'))
+                                           client=spec.get('clientType'),
+                                           mode=spec.get('storyMode'))
                 log('重挂切到新分区%s：%s'
                     % ('完成' if nav_ok else '失败', nav_why))
                 if state.get('pause'):

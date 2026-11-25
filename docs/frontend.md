@@ -11,6 +11,7 @@
 |---|---|
 | `index.html` | 页面骨架：左侧账号栏、中间主区（账号信息 + 模块菜单 + 模块面板）、右侧作业集 |
 | `style.css` | 全部样式。深色玻璃拟态，颜色/圆角/字体集中在 `:root` 变量里 |
+| `themes.css` | 内置浅色主题的变量覆盖 + 桌宠容器（第三方主题的样式在各自的包里，不在这里） |
 | `app.js` | 全部交互逻辑，按功能分段注释 |
 
 ## 实现要点
@@ -224,6 +225,10 @@ MAA 导入建号），两种入口行为完全一致。
   **不能放 S 突袭**——用户明确说「太变态了，刷那个没有奖励」。OS 换期时把
   活动名和代号一起换，`placeholder` 也跟着改；卡片标题那句「现在的活动是…」
   在 `chatEmptyHtml()` 里，忘了改会出现「标题写着 A、按钮全是 B」。
+- **限时入口单独一条**（2026-11-25）：TL（时间啊，向前！）关卡已关、商店开到
+  11/29，加了一条「TL 商店清空（别买数据增补条/数据增补/家具零件）」。黑名单
+  按用户原话给三样——**「黑名单」是不要买的**，别写成要买的清单。
+  **TL 商店下线后把这条删掉**，留着就会点出「活动不在了」。
 - **事件按 `i` 索引 DOM**：`CHAT.nodes` 是 `Map<i, el>`，流式那条原地更新
   `textContent`，不重建节点（重建会掉滚动位置、闪）
 - **轮询节奏跟着状态走**：模型在吐字时 320ms，空闲 1600ms
@@ -353,6 +358,86 @@ MAA 自己重开是个 bug。
 ```
 
 改完直接重启程序即可，静态资源是 `Cache-Control: no-store`，不会读到旧缓存。
+
+**但别在这里写死颜色**（2026-11-25 起）：所有前景叠层、弹窗底色都必须走变量，
+否则换主题时会出现「浅色界面里一块黑板」。见下一节。
+
+## 主题系统（2026-11-25）
+
+需求是「默认黑色，再加白色和卫戍协议主题，第三方主题包点下载才能用」。
+做法分三层，**只有颜色是主题的事，布局和组件样式一律不跟着主题变**：
+
+| 层 | 文件 | 作用 |
+|---|---|---|
+| 内置变量 | `style.css` 的 `:root` | dark 的默认值 |
+| 内置浅色 | `themes.css` 的 `html[data-theme="light"]` | 只覆盖变量 |
+| 第三方 | `config/themes/<id>/theme.css` | 按需下载，只覆盖变量 + 少量装饰 |
+
+主题 id 挂在 `<html data-theme="...">` 上，切主题就是改这个属性 + 换一张
+`<link id="theme-pack">`（内置主题把这张 link 删掉）。
+
+**改造时踩过的坑，写下来免得再犯**：原来满篇 `rgba(255,255,255,.06)` 当加亮、
+`rgba(13,16,24,.85)` 当压暗、`linear-gradient(165deg,#161b26,#0e121a)` 当弹窗底色。
+浅色主题一上，这些全部原地不动 → 白主题里弹窗还是黑的。所以抽了三组变量：
+
+```css
+--tint: 255, 255, 255;   /* 「加亮」三元组，浅色主题翻成 17,24,39 就变成压暗 */
+--shade: 13, 16, 24;     /* 「压暗」三元组 */
+--panel-2 / --panel-3    /* 弹窗渐变的两端，别再写死 #161b26 */
+```
+
+用法：`background: rgba(var(--tint), .06)`。**新写样式请一律走这两个三元组**，
+`rgba(255,255,255,…)` 只在 `:root` 里出现一次。
+
+### 常规设置页（`SET_TABS` 第一项）
+
+- **主题卡片**：`themeCards()` 生成，竖版卡片（缩略图 74px + 名称/说明 + 按钮）。
+  内置两张永远 `installed: true`（少了它卡片会渲染成「下载」，点下去后端回
+  「内置主题不能安装」）。未下载的第三方主题显示「下载（大小）」。
+  缩略图**永远先垫一层色块**（`.theme-swatch.<id>`），`<img>` 盖在上面——
+  远端预览图拉不到时只是露出主题渐变，不会白框/裂图。
+- **先本地、再远端**：`loadThemes()` 第一次先打 `/api/themes?local=1`（只读盘，
+  毫秒级）把卡片画出来，再拉全量补「可下载」。远端清单要联网、超时 6~8 秒，
+  等它回来的话已装的第三方主题会短暂「消失」，用户以为主题丢了。
+  任何一次清单落地都走 `markThemes()` + `paintThemeGrid()`，面板没开时
+  `#theme-grid` 不存在，重绘自动跳过。
+- **切换前先看可用性**：`switchTheme(id)` 里 `themeInfoOf(id)` 为空说明包没下
+  或已被删，直接提示「先点卡片上的『下载』」，不要 `applyTheme` 悄悄退回深色
+  （否则观感是「点了白色没反应」）。`themeCards()` 在「设置里的主题不可用」时
+  把「使用中」标到深色上，避免一张卡都不亮。
+- **`saveSettings()` 必须 `return d`**：调用方写的是
+  `const d = await saveSettings(...)` 再读 `d.settings`，漏掉 return 就是
+  `Cannot read properties of undefined`（2026-11-25 的「点白色报错」就是这个）。
+  调用点还要用 `(d && d.settings) || S.settings` 兜一层。
+- **显示主题桌宠**：`#theme-pet` + `#set-theme-pet`，只在主题声明了 `pet` 时出现，
+  偏好存 `localStorage['maaprts.pet']`；关掉就整块不渲染（不是 `display:none`）。
+- **开机时自动启动**：调 `POST /api/autostart`，默认关；失败要把勾选回滚。
+
+两个调试用 query 参数（只影响这一次渲染，不落盘）：
+
+```
+/?theme=closure        预览某个主题，不改设置
+/?open=settings        直接展开设置弹窗
+```
+
+配合无头 Edge 截图就是三套主题的回归办法：
+
+```bash
+msedge --headless=new --no-sandbox --user-data-dir=debug/edgeprof \
+  --window-size=1500,950 --virtual-time-budget=6000 \
+  --screenshot=debug/set-light.png "http://127.0.0.1:8788/?theme=light&open=settings"
+```
+
+`--virtual-time-budget` 别省：省了会截到 JS 还没填完的空壳（账号列全是「+ 添加账号」）。
+
+### 桌宠（`syncThemePet`）
+
+主题在 `theme.json` 里声明 `pet.video`（待机循环）、`pet.actions`（随机动作）、
+`pet.every`（秒）与 `pet.float`。前端插一个 `<video>`：888×748 VP9-Alpha 透明
+webm、fixed 右下、`pointer-events: none`、`object-position: bottom right`、
+`max-height: 34vh`（34vh 是量出来的：再高就压住右栏底部那几行字了）。每
+`pet.every` 秒换一个动作播一遍，`onended` 回到待机。窄屏和
+`prefers-reduced-motion` 下直接不显示。
 
 ## 助手页两栏与 markdown（2026-11-17）
 
